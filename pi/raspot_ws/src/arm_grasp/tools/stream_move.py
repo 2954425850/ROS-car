@@ -120,8 +120,13 @@ def _stable_fb(io, timeout=6.0, tol=4.0):
 
     为什么必须：固件是**轮询**读那 5 个舵机的（读不到就是 0），2026-09-30 在 Pi 上连读 3 条
     就有 1 条 `p5=0` —— **三分之一**。把 0 当关节角用会算出荒唐的爪尖（实测 shoulder=0 ⇒
-    爪尖 z=22.6cm）而且**不报错**。判据：p3/p4/p5/p6 都非 0，且连续两帧抖动 ≤ tol count
-    （底座电位器本底噪 ±1）。与 `tools/servo_grasp.py` 的 `stable_fb` 同一套判据。
+    爪尖 z=22.6cm）而且**不报错**。判据：**p3/p4/p5 都非 0**，且连续两帧抖动 ≤ tol count
+    （底座电位器本底噪 ±1）。与 `ltrace._ok` / `ArmLink.fb()` 同一套判据。
+
+    ⚠️ 2026-10-01 修：原来这里还查了 **p6（底座）不能为 0** —— 错的。p3/p4/p5 的合法域是
+    [125,875]，0 一定"没读到"；但 **p6 的合法域是 ±1000，0 是合法位置**，而 ps2_teleop
+    **静止时发的底座指令正好就是 0**（`~/arm_recorder.log` 里是 `[240,498,178,128,468,0]`）
+    ⇒ 底座停在零点时，`stream_move`/`grasp_once` 的开场会直接判"读不到可信回读"、一步都不动。
     """
     t0, prev = time.time(), None
     while time.time() - t0 < timeout:
@@ -130,13 +135,13 @@ def _stable_fb(io, timeout=6.0, tol=4.0):
         if fbf is None:
             continue
         v = [float(x) for x in fbf]
-        if len(v) < 6 or any(v[i] == 0.0 for i in (2, 3, 4, 5)):
+        if len(v) < 6 or any(v[i] == 0.0 for i in (2, 3, 4)):   # 别查 p6：0 是它的合法值
             prev = None
             continue
         if prev is not None and all(abs(v[k] - prev[k]) <= tol for k in range(6)):
             return v
         prev = v
-    raise RuntimeError('读不到可信回读（p3/p4/p5/p6 有 0，或一直在跳）')
+    raise RuntimeError('读不到可信回读（p3/p4/p5 有 0，或一直在跳）')
 
 
 class ArmLink:
