@@ -316,3 +316,25 @@ def test_loop_tolerates_start_below_field_floor():
     assert not (rep['stopped'] or '').startswith('refuse'), rep['stopped']
     assert all(125.0 <= v <= 875.0 for f in link.pubs for v in f[2:5])  # **每一拍**都在界内
     assert rep['ticks'] >= 3
+
+
+def test_run_all_phases_closes_and_lifts():
+    """★ `'all'` = 四相一次走完（接近 → 下扎 → 合爪 → 抬升），**估计器/时间缓冲不重建**。
+
+    判据全是**物理量**，不看循环自己的说法：
+      ① `rep['phases']` 恰好四相且顺序对；
+      ② 最后发出去的 p1 ≥ close_field−20 ⇒ **夹爪真的合上了**（且没有过冲）；
+      ③ 最终沿轴留量 ≥ lift_m×0.8、且远大于 s_stop ⇒ **真的抬起来了**。
+
+    变异（实测过）：把 `advance_or_stop` 里的 `cur = seq[k]` 改成 `cur = seq[0]` ⇒
+    相序变成 ['aim','aim',…] ⇒ 第 ① 条红。
+    """
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900)
+    plant = Plant(_start_joints(s_m=0.10))
+    link = FakeLink(plant, CAP)
+    rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
+    assert [p[0] for p in rep['phases']] == ['aim', 'descend', 'close', 'lift'], rep['phases']
+    assert rep['ok'], rep['stopped']
+    assert cfg.close_field - 20.0 <= link.pub[0] <= cfg.close_field + 20.0, link.pub[0]
+    assert rep['s_ach_m'] >= cfg.lift_m * 0.8, rep['s_ach_m']
+    assert rep['s_ach_m'] > cfg.s_stop_m * 5.0, rep['s_ach_m']

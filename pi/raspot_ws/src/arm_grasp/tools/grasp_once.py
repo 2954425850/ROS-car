@@ -269,7 +269,7 @@ def main(argv=None):
                          % DEFAULT_H_M)
     ap.add_argument('--dry-run', action='store_true',
                     help='只读：锁框 → 读关节 → 算 O/S0 → 打印；不发 /arm/command、不停服务')
-    ap.add_argument('--phase', choices=('aim', 'descend', 'all'), default='aim',
+    ap.add_argument('--phase', choices=('aim', 'descend', 'close', 'lift', 'all'), default='aim',
                     help='aim=S1+S2 接近对准；descend=只下扎；all=先接近再下扎')
     ap.add_argument('--yes', action='store_true', help='跳过回车确认（真跑）')
     ap.add_argument('--max-step', type=float, default=6.0,
@@ -414,7 +414,9 @@ def main(argv=None):
             print('→ /arm/feedback 有了（fb_n=%d），开始流式' % io.fb_n)
 
             link = GraspLink(io, host, want, hz=cfg.hz)
-            phases = ['aim', 'descend'] if args.phase == 'all' else [args.phase]
+            # ★ 'all' 交给 grasp.run **一次**走完四相：分段调用会丢估计器与时间缓冲，
+            #   相位之间就"断流"了（而设计要求的正是连续流式）。
+            phases = [args.phase]
             rc_all = 0
             for ph in phases:
                 rep = grasp.run(cfg, link, phase=ph, log=print)

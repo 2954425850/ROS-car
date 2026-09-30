@@ -39,7 +39,7 @@ GraspConfig = namedtuple('GraspConfig',
     'max_step_deg hz max_seconds max_ticks '            # 流式
     'tol_m tol_px_err patience min_gain_m '             # 判据
     'z_plane_m latency_s k_ewma gate_m '                # 尺度 / 时间 / 估计器
-    'close_field lift_m obs_lost_s deadband_counts')
+    'close_field lift_m obs_lost_s deadband_counts close_ticks')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -62,7 +62,8 @@ GraspConfig.__new__.__defaults__ = (
     0.020, 0.040, 0.35, 0.03,
     # deadband_counts = 10：实测**带载**（臂自重）下位置环死区稳态误差 5.6~6.6 count，
     # 取 10 留一档余量（定 6.0 时刚好卡在门外 ⇒ 判据不满足 ⇒ 白嗡嗡 2.5 秒才被"卡住"接管）。
-    578.0, 0.04, 1.0, 10.0,
+    # close_ticks：合爪相最多走几拍（12 拍 @10Hz = 1.2s，兜底；正常靠 p1 读回到位就切）
+    578.0, 0.04, 1.0, 10.0, 12,
 )
 
 
@@ -261,21 +262,28 @@ class Link:
     """
 
 
+PHASES = ('aim', 'descend', 'close', 'lift')
+
+
 def run(cfg, link, phase='aim', log=print):
     """流式主循环：每拍只算一次目标并限速发一帧，**没有任何一处会阻塞在"等到位"**。
 
-    phase ∈ {'aim','descend','close','lift'}（本任务只实现 aim/descend 的判据，
-    close/lift 走同一套限速参考，判据留给 Task 10）。
+    phase ∈ {'aim','descend','close','lift','all'}。
+    **`'all'` = 四相依次走完，而且是一次调用** —— 估计器/时间缓冲不重建，相位切换只是换个
+    目标点，所以动作**不断流**（分段调用会在两次调用之间丢掉估计与连续性）。
+
+    每相结束由 `finish()` 记进 `rep['phases']` 并切下一相。
 
     返回 report dict（见下面 `rep` 的初始化；收敛判据一律用**回读算出来的实际量**）。
     """
-    assert phase in ('aim', 'descend', 'close', 'lift')
+    assert phase in PHASES + ('all',)
+    seq = list(PHASES) if phase == 'all' else [phase]
     trace = ltrace.Trace()
     est = Est(cfg.k_ewma, cfg.gate_m)
     rep = {'phase': phase, 'ticks': 0, 'stopped': None, 'ok': False,
            'O_last': None, 'obs_n': 0, 'obs_bad': 0, 'obs_lost': False,
            'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None,
-           'target': None, 's_ach_m': None, 'rows': []}
+           'target': None, 's_ach_m': None, 'rows': [], 'phases': []}
     dt = 1.0 / cfg.hz
     j_ref, cmd_sent, f_prev, near = None, None, None, 0
     prev_alpha = cfg.alpha0
@@ -283,6 +291,26 @@ def run(cfg, link, phase='aim', log=print):
     s_cmd = cfg.s_pre_m
     t0 = None
     obs_age = None
+    cur = seq[0]          # 当前相
+    hold_j = None         # 'close' 相：进相时冻住的四个关节
+    phase_ticks = 0       # 本相已走几拍
+
+    def advance_or_stop(reason):
+        """本相结束：有下一相就切过去（返回 True 继续），最后一相就定稿（返回 False）。
+
+        只在这里改 `cur` 和每相计数 ⇒ 五个停止点各两行，不会漏复位某一项。
+        """
+        nonlocal cur, near, stall, best, phase_ticks, hold_j, j_ref, s_cmd
+        rep['phases'].append((cur, reason))
+        k = seq.index(cur) + 1
+        if k >= len(seq):
+            rep['stopped'] = reason
+            return False
+        log('  [%s] 完成：%s  ⇒ 进入 [%s]' % (cur, reason, seq[k]))
+        cur = seq[k]
+        near, stall, best, phase_ticks = 0, 0, None, 0
+        hold_j, j_ref, s_cmd = None, None, cfg.s_pre_m
+        return True
 
     for it in range(cfg.max_ticks):
         link.spin(dt)                                   # ① 收消息
@@ -325,18 +353,35 @@ def run(cfg, link, phase='aim', log=print):
                 link.publish(cmd_sent)
             continue
 
-        # ③ 目标（按阶段）
-        if phase == 'descend':
-            tip = tip_open_m(from_fields(trace.at(link.now(), 'auto')))
-            s_ach = standoff_along_axis(tip, est.O, prev_alpha)
-            step = max(cfg.s_min_step, cfg.s_frac * max(s_ach, 0.0))
-            s_cmd = max(cfg.s_stop_m, s_ach - step)
+        # ③ 目标（按**当前相** `cur`）
+        j_cur_m = from_fields(trace.at(link.now(), 'auto'))
+        if cur == 'descend':
+            tip = tip_open_m(j_cur_m)
+            s_ach_now = standoff_along_axis(tip, est.O, prev_alpha)
+            step = max(cfg.s_min_step, cfg.s_frac * max(s_ach_now, 0.0))
+            s_cmd = max(cfg.s_stop_m, s_ach_now - step)
+        elif cur == 'lift':
+            # 抬起 = 沿 −ẑ 把留量从 s_stop 加到 s_stop+lift_m（目标点固定，不追）
+            s_cmd = cfg.s_stop_m + cfg.lift_m
         try:
-            tgt = pick_target(est.O, cfg, s_cmd, prev_alpha)
+            if cur == 'close':
+                # 合爪：四个关节**冻住**在进相时的位置，只把 p1 送到 close_field。
+                # 不调 pick_target：此时目标就在爪子里，O 会漂、IK 也会给出"换姿态"的解 ✗。
+                if hold_j is None:
+                    hold_j = dict(j_cur_m)
+                tgt = Target(prev_alpha, cfg.s_stop_m, dict(hold_j),
+                             to_fields(hold_j, cfg.close_field, cfg.wrist_roll),
+                             0.0, 0.0, True, 0.0, 0.0)
+            else:
+                tgt = pick_target(est.O, cfg, s_cmd, prev_alpha)
         except Refused as e:
             rep['stopped'] = 'refuse：%s' % e
             break
-        prev_alpha = tgt.alpha
+        if cur != 'close':
+            prev_alpha = tgt.alpha
+        # 合爪/抬起期间**夹爪保持闭合**（抬起时张开 = 把东西放回去 ✗）
+        grip_cmd = cfg.close_field if cur in ('close', 'lift') else cfg.gripper
+        phase_ticks += 1
 
         # ④ 限速参考 + 发
         # ★ 判据一律用**回读**算出来的实际量：`tgt.err_m` 是"目标姿态自己到 O 的距离"，
@@ -353,11 +398,11 @@ def run(cfg, link, phase='aim', log=print):
         #   界外的**指令**直接夹进 [125,875] 再发：固件本来就会夹，我们先夹一遍是为了
         #   让自己发出去的值与后续回读一致（否则白挨一次"目标 field 出界"）。
         # （`pick_target` 已保证候选 field 在界内 ⇒ 下面这条正常**永不触发**，留着当不变式断言）
-        f_tgt = to_fields(tgt.joints, cfg.gripper, cfg.wrist_roll)
+        f_tgt = to_fields(tgt.joints, grip_cmd, cfg.wrist_roll)
         if not all(FIELD_LO <= v <= FIELD_HI for v in f_tgt[2:5]):
             rep['stopped'] = 'refuse：目标 field 出界 %s' % ['%.0f' % v for v in f_tgt[2:5]]
             break
-        fields = to_fields(j_cmd, cfg.gripper, cfg.wrist_roll)
+        fields = to_fields(j_cmd, grip_cmd, cfg.wrist_roll)
         for i in (2, 3, 4):                    # 只夹 p3/p4/p5；p1/p2(夹爪/自转)、p6(底座 ±1000) 原样带过
             fields[i] = min(FIELD_HI, max(FIELD_LO, fields[i]))
         if j_ref is not None:
@@ -381,7 +426,7 @@ def run(cfg, link, phase='aim', log=print):
         #   一条弧线，**到目标点的距离反而从 27.8 → 30.2mm 涨** ⇒ 旧判据把它误报成"发散"、
         #   在第 25 拍停手（臂其实还在动）。多关节 + 每拍限速下"距离先增后减"是**正常**的。
         #   正确判据：**回读的 field 有没有超过 1 count 地变化**（= 臂还在不在跟）。
-        f_now = to_fields(j_cur, cfg.gripper, cfg.wrist_roll)
+        f_now = to_fields(j_cur, grip_cmd, cfg.wrist_roll)
         moved = (999.0 if f_prev is None
                  else max(abs(f_now[k] - f_prev[k]) for k in range(6)))
         f_prev = f_now
@@ -391,17 +436,19 @@ def run(cfg, link, phase='aim', log=print):
         #   白跑到超时（实测 40s）。正确判据：**回读落在目标的死区量级内连续 3 拍**。
         lag = max(abs(f_now[k] - f_tgt[k]) for k in range(2, 6))     # p3..p6 实际 vs 目标
         near = near + 1 if lag <= cfg.deadband_counts else 0
-        if moved >= 1.0:                      # 1 count = 回读的量化单位 ⇒ 任何真实运动都能清掉它
-            stall = 0
-            if best is None or err_act < best:
-                best = err_act
-        else:
-            stall += 1
-        if phase == 'aim' and (err_act <= cfg.tol_m or near >= 3):
-            rep['stopped'] = ('对准完成：爪尖离目标点 %.1fmm（余量 %.1fcm，α=%.1f°；'
-                              '回读与目标差 %d count ⇒ 已到舵机死区边界）'
-                              % (err_act * 1000, s_cmd * 100, tgt.alpha, round(lag)))
-            break
+        if cur in ('aim', 'descend'):     # 合爪/抬起时臂本来就该几乎不动 ⇒ 那两相不判"卡住"
+            if moved >= 1.0:              # 1 count = 回读的量化单位 ⇒ 任何真实运动都能清掉它
+                stall = 0
+                if best is None or err_act < best:
+                    best = err_act
+            else:
+                stall += 1
+        if cur == 'aim' and (err_act <= cfg.tol_m or near >= 3):
+            if not advance_or_stop('对准完成：爪尖离目标点 %.1fmm（余量 %.1fcm，α=%.1f°；'
+                                   '回读与目标差 %d count ⇒ 已到舵机死区边界）'
+                                   % (err_act * 1000, s_cmd * 100, tgt.alpha, round(lag))):
+                break
+            continue
         # ★ 判据带 `min_gain_m`(0.5mm) 容差，**不是**裸的 `s_ach <= cfg.s_stop_m`：
         #   上面的 `s_cmd = max(cfg.s_stop_m, ...)` 把**指令**地板钉死在 s_stop_m 上，而
         #   `s_ach` 是拿**当前**的 est.O 量的（观测随臂移动而变 ⇒ O 的 EWMA 一直在动）
@@ -409,20 +456,35 @@ def run(cfg, link, phase='aim', log=print):
         #   于是被 stall 判据误报成"发散"（爪尖其实就停在离目标 3mm 处）。
         #   容差用 `min_gain_m`（"小到算没进展"的那个尺度，0.5mm）：既覆盖 O 的抖动
         #   （几十微米，13 倍余量），又不会提前开闸（实测在 3.016mm 处断，不是 4.8mm）。
-        if phase == 'descend' and s_ach <= cfg.s_stop_m + cfg.min_gain_m:
-            rep['stopped'] = '扎到位：实际余量 %.1fmm（爪尖离目标 %.1fmm）' % (
-                s_ach * 1000, err_act * 1000)
-            break
+        if cur == 'descend' and s_ach <= cfg.s_stop_m + cfg.min_gain_m:
+            if not advance_or_stop('扎到位：实际余量 %.1fmm（爪尖离目标 %.1fmm）'
+                                   % (s_ach * 1000, err_act * 1000)):
+                break
+            continue
+        if cur == 'close' and (phase_ticks >= cfg.close_ticks
+                               or f_now[0] >= cfg.close_field - 20.0):
+            # 合爪完了：p1 到 close_field（读回 ±20 count 内算到），或走满 close_ticks 拍兜底
+            if not advance_or_stop('合爪完成：p1 读回 %.0f（目标 %.0f），走了 %d 拍'
+                                   % (f_now[0], cfg.close_field, phase_ticks)):
+                break
+            continue
+        if cur == 'lift' and s_ach >= cfg.lift_m * 0.8:
+            # 抬起来了：沿轴留量从 s_stop 涨到 lift_m 的 80%
+            if not advance_or_stop('抬升完成：沿轴留量 %.1fcm（目标 %.1fcm）'
+                                   % (s_ach * 100, cfg.lift_m * 100)):
+                break
+            continue
         if stall >= cfg.patience:
             rep['stopped'] = '卡住：连续 %d 拍**臂没动**（回读 field 变化 <1 count；现在 %.1fmm，最好 %.1fmm）' % (
                 stall, err_act * 1000, (best or 0.0) * 1000)
             break
-        if phase in ('aim', 'descend') and obs_age is not None \
+        if cur in ('aim', 'descend') and obs_age is not None \
                 and obs_age > cfg.obs_lost_s:
             rep['obs_lost'] = True
-            if phase == 'aim':
+            if cur == 'aim':
                 rep['stopped'] = '观测丢失 %.1fs（接近阶段丢了就停下）' % obs_age
                 break
 
-    rep['ok'] = bool(rep['stopped']) and rep['stopped'].startswith(('对准完成', '扎到位'))
+    rep['ok'] = bool(rep['stopped']) and rep['stopped'].startswith(
+        ('对准完成', '扎到位', '合爪完成', '抬升完成'))
     return rep
