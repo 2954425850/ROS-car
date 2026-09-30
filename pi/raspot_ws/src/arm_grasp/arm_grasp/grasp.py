@@ -43,7 +43,8 @@ GraspConfig = namedtuple('GraspConfig',
     'z_plane_m latency_s k_ewma gate_m '                # 尺度 / 时间 / 估计器
     'close_field lift_m obs_lost_s deadband_counts close_ticks '
     'min_step_deg close_step close_stall alpha_freeze_span bias_m '
-    'base_comp base_comp_max')
+    'base_comp base_comp_max '
+    'joint_comp joint_comp_max')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -66,7 +67,9 @@ GraspConfig.__new__.__defaults__ = (
     0.020, 0.040, 0.35, 0.03,
     # deadband_counts = 10：实测**带载**（臂自重）下位置环死区稳态误差 5.6~6.6 count，
     # 取 10 留一档余量（定 6.0 时刚好卡在门外 ⇒ 判据不满足 ⇒ 白嗡嗡 2.5 秒才被"卡住"接管）。
-    # close_ticks：合爪相最多走几拍（12 拍 @10Hz = 1.2s，兜底；正常靠读回冻结就切）
+    # close_ticks：合爪相最多走几拍（30 拍 @10Hz = 3s，兜底）。**不能是 12**：指令从 240 爬到
+    #   578 正好 12 拍，而读回滞后很大（实测 0.4s 还没起振）⇒ 12 拍时读回可能还没走完，
+    #   兜底会抢在"真的合到底"之前开闸（2026-10-01 第三跑就卡在这个边界上）。
     # min_step_deg：每个"要动"的关节每拍**至少**走多少度（=3.1 count，跨过舵机死区）
     # close_step  ：合爪每拍 p1 只走多少 count（**慢合**）—— 一次写到 578 是全力合，用户明确否决
     # close_stall ：合爪时"读回连续几拍几乎不动"算碰上东西 ⇒ 冻结不再加压
@@ -87,7 +90,11 @@ GraspConfig.__new__.__defaults__ = (
     # ⚠️ 2026-10-01 再抬到 **30s**：跟踪器在相机移动时**必丢**低纹理目标（瓶盖、白色细长条都试过），
     #   而目标是**静止**的、几何解算是**绝对量** ⇒ 开头一条干净观测就够了，之后靠"估计器保持"完全安全。
     #   前提：这期间**人不能碰目标物**。
-    578.0, 0.04, 30.0, 10.0, 12, 0.75, 30.0, 3, 3.0, (0.0, 0.0, 0.0), 0.5, 80.0,
+    578.0, 0.04, 30.0, 10.0, 30, 0.75, 30.0, 3, 3.0, (0.0, 0.0, 0.0), 0.5, 80.0,
+    # joint_comp：肩/肘/腕位置环下垂补偿增益（0 = 关）；joint_comp_max：单拍补多少 count 封顶。
+    #   实测下垂 +8.4/+6.0/+16.7 count（p3/p4/p5）⇒ 爪尖差 1.5~2.2cm。稳态残差 = 下垂/(1+增益)。
+    #   先取 1.0（砍一半）——**别一次性往大调**，底座那边有过"增益大会一起震荡"的教训。
+    1.0, 60.0,
 )
 
 
@@ -331,7 +338,7 @@ def run(cfg, link, phase='aim', log=print):
     est = Est(cfg.k_ewma, cfg.gate_m)
     rep = {'phase': phase, 'ticks': 0, 'stopped': None, 'ok': False,
            'O_last': None, 'obs_n': 0, 'obs_bad': 0, 'obs_lost': False,
-           'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None,
+           'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None, 'comp': None,
            'target': None, 's_ach_m': None, 'rows': [], 'phases': []}
     dt = 1.0 / cfg.hz
     j_ref, cmd_sent, f_prev, near = None, None, None, 0
@@ -346,6 +353,9 @@ def run(cfg, link, phase='aim', log=print):
     close_cmd = None      # 'close' 相：正在往 close_field 爬的 p1 指令
     close_stuck = 0       # 'close' 相：读回连续几拍没动的计数（= 碰上东西了）
     p1_prev = None        # 'close' 相：上一拍读回的 p1
+    comps = None             # 肩/肘/腕的位置环下垂（p3/p4/p5，count）—— 交接处量一次
+    p1_start = 0.0        # 'close' 相：进相时的 p1 回读（判"起振"的基准）
+    close_armed = False   # 'close' 相：读回"真的动过"了没有（见 close 相那段注释）
     phase_ticks = 0       # 本相已走几拍
 
     def advance_or_stop(reason):
@@ -354,17 +364,29 @@ def run(cfg, link, phase='aim', log=print):
         只在这里改 `cur` 和每相计数 ⇒ 五个停止点各两行，不会漏复位某一项。
         """
         nonlocal cur, near, stall, best, phase_ticks, hold_j, j_ref, s_cmd
-        nonlocal close_cmd, close_stuck, p1_prev
+        nonlocal close_cmd, close_stuck, p1_prev, p1_start, close_armed, comps
         rep['phases'].append((cur, reason))
         k = seq.index(cur) + 1
         if k >= len(seq):
             rep['stopped'] = reason
             return False
         log('  [%s] 完成：%s  ⇒ 进入 [%s]' % (cur, reason, seq[k]))
+        if (cur == 'aim' and seq[k] == 'descend' and cfg.joint_comp > 0.0
+                and f_now is not None and f_tgt is not None):
+            # 臂已经停稳（[aim] 刚报完到位）⇒ (纯目标 − 回读) 就是位置环下垂。量一次、带到底。
+            v = [max(-cfg.joint_comp_max,
+                     min(cfg.joint_comp_max, cfg.joint_comp * (f_tgt[i] - f_now[i])))
+                 for i in (2, 3, 4)]
+            comps = v
+            log('  [下垂补偿] 量到 (目标−回读) = %s count ⇒ 下扎/抬起带着走'
+                % ['%+.1f' % x for x in v])
         cur = seq[k]
         near, stall, best, phase_ticks = 0, 0, None, 0
         hold_j, j_ref, s_cmd = None, None, cfg.s_pre_m
         close_cmd, close_stuck, p1_prev = None, 0, None
+        # ⚠️ `comps` **不在这里复位**：它就是要在 aim→descend 量到之后一路带着走。
+        #    （第一版把这行写在这儿 ⇒ 量完立刻被清成 None，等于没补。）
+        p1_start, close_armed = 0.0, False
         return True
 
     for it in range(cfg.max_ticks):
@@ -438,6 +460,11 @@ def run(cfg, link, phase='aim', log=print):
                 #    （"不能这样"）。现在慢合 + 读回一停就冻结（见下面的停止判据）。
                 if hold_j is None:
                     hold_j = dict(j_cur_m)
+                    # ★ 判"碰上东西"之前必须先**起振**（2026-10-01 真机第三跑踩到）：
+                    #   这个固件的夹爪回读滞后很大（实测指令 240→354 走了 0.4s，读回还趴在
+                    #   234 不动）⇒ 一进 close 相就"读回不动 = 碰上东西"，其实它只是**还没开始动**。
+                    #   所以只有读回**真的动过**（离起点超过一个死区宽）之后，卡住计数才算数。
+                    p1_start, close_armed = p1_read, False
                 if close_cmd is None:
                     close_cmd = p1_read          # 起点 = **真回读**（不是上一拍的指令）
                 close_cmd = min(cfg.close_field, close_cmd + cfg.close_step)
@@ -494,6 +521,21 @@ def run(cfg, link, phase='aim', log=print):
             err6 = fields[5] - f_now[5]
             corr = max(-cfg.base_comp_max, min(cfg.base_comp_max, cfg.base_comp * err6))
             fields[5] = max(-1000.0, min(1000.0, fields[5] + corr))
+        # ★★ 肩/肘/腕的**位置环下垂补偿**（2026-10-01 第四跑查明）。
+        #   实测稳态下三关节的回读**一致地越过指令**：令 383.6/读 392.0、令 209.0/读 215.0、
+        #   令 796.3/读 813.0 ⇒ +8.4/+6.0/+16.7 count（p5 那 16.7 = 4.0°）。臂伸到桌面下方时
+        #   重力一直拽着，舵机位置环就停在"差一点"的地方 ⇒ **爪尖系统性差 1.5~2.2cm**，
+        #   用户看到的就是"总夹偏、还偏左"。**这不是手眼标定误差，别再去标手眼了。**
+        #   做法和"每拍跟"不一样：**只在 [aim]→[descend] 交接处量一次**（那时臂已经停稳、
+        #   目标也不动了，量到的就是纯下垂），之后当下扎/抬起的**常量**带着走。
+        #   为什么不做成每拍积分：第一版那么写，`test_loop_converges_to_the_object` 的爪尖
+        #   残差从 <10mm 变成 11.8mm —— 积分器和"回读落在死区内连 3 拍算到位"那条判据互相打架，
+        #   到位瞬间还在往前推。交接处一次量、全程常量，既没有这个耦合，也没有积分饱和。
+        #   ⚠️ 只补 p3/p4/p5：p1 是夹爪、p2 自转恒定、p6 底座已有 `base_comp`。
+        #   ⚠️ 单独的 `--phase descend` **学不到** comps（没走 aim），只有 `all`/`aim` 才学。
+        if comps is not None and cur in ('descend', 'lift'):
+            for _n, _i in enumerate((2, 3, 4)):
+                fields[_i] = min(FIELD_HI, max(FIELD_LO, fields[_i] + comps[_n]))
         if j_ref is not None:
             dmax = max(abs(fields[k] - j_ref[k]) for k in range(6))
             rep['max_step_deg_actual'] = max(rep['max_step_deg_actual'], dmax / 4.1667)
@@ -505,6 +547,7 @@ def run(cfg, link, phase='aim', log=print):
         rep['target'] = tgt
         rep['err_m'] = err_act
         rep['s_ach_m'] = s_ach
+        rep['comp'] = comps
         rep['rows'].append((now, err_act, s_ach, tgt.alpha, tgt.slack,
                             0.0 if obs is None else 1.0))
 
@@ -550,23 +593,26 @@ def run(cfg, link, phase='aim', log=print):
                                    % (s_ach * 1000, err_act * 1000)):
                 break
             continue
-        if cur == 'close' and close_cmd is not None and close_cmd >= cfg.close_field - 1.0:
-            # ★ 读回贴到指令 ⇒ **分不出**"夹空"和"夹着一个细物体"（2026-10-01 实测：白条
-            #   被夹住了、读回照样走到 578）。这里只报事实，**不许下"夹空了"的结论**；
-            #   要判到底有没有夹到，只能用抬升后回看（`--verify` 那一套）。
-            if not advance_or_stop('合爪完成：p1 令 %.0f / **读 %.0f**%s'
-                                   % (close_cmd, p1_read,
-                                      '（读回停在中途 ⇒ 爪里有东西、已冻结）'
-                                      if p1_read < cfg.close_field - cfg.deadband_counts else
-                                      '（读回贴到指令 ⇒ 爪里没东西 / 夹着一个细物体**都可能**，'
-                                      '本判据分不出来）')):
+        if cur == 'close' and close_cmd is not None and close_cmd >= cfg.close_field - 1.0 \
+                and p1_read >= cfg.close_field - cfg.deadband_counts:
+            # ★ **读回也到了底**才算"合到底"。判据必须查读回、不能只查指令：2026-10-01 第三跑
+            #   指令早就到 578，读回还停在 382（爪里有东西 / 卡住），拿指令收尾就会把这种情况
+            #   报成"夹空了"（上一次真抓就是这么被骗的）。而且**读回到底也推不出"夹空"**：
+            #   实测白条被夹住了、读回照样走到 578 ⇒ 这里只报事实，不下"夹空"的结论。
+            if not advance_or_stop('合爪完成：p1 令 %.0f / **读 %.0f**（读回也到底了 ⇒ '
+                                   '爪里没东西 / 夹着一个细物体**都可能**，本判据分不出来）'
+                                   % (close_cmd, p1_read)):
                 break
             continue
         if cur == 'close':
             # 读回连续 close_stall 拍几乎不动（每拍变化 <5 count）= 指尖碰上东西了 ⇒ **冻结**
             # ⚠️ 这里比的必须是 `p1_read`（真回读）。用 `f_now[0]`（= 每拍 +close_step 的指令）
             #    ⇒ 差值恒为 close_step ⇒ 永远数不到 close_stall ⇒ 冻结永不触发。
-            if p1_prev is not None and abs(p1_read - p1_prev) < 5.0:
+            # ⚠️ 而且要 `close_armed` 之后才算（见 `p1_start` 那段：回读滞后很大，
+            #    没起振就判"不动"是误触发）。
+            if not close_armed and abs(p1_read - p1_start) > cfg.deadband_counts:
+                close_armed = True          # ★ 读回真的动过了，卡住计数从这里才开始算
+            if close_armed and p1_prev is not None and abs(p1_read - p1_prev) < 5.0:
                 close_stuck += 1
             else:
                 close_stuck = 0
@@ -578,8 +624,9 @@ def run(cfg, link, phase='aim', log=print):
                     break
                 continue
         if phase_ticks >= cfg.close_ticks and cur == 'close':
-            if not advance_or_stop('合爪超时兜底：走了 %d 拍（p1 令 %.0f/读 %.0f）'
-                                   % (phase_ticks, close_cmd, f_now[0])):
+            if not advance_or_stop('合爪超时兜底：走了 %d 拍（p1 令 %.0f / **读 %.0f**）'
+                                   '—— 读回没到底 ⇒ 爪里有东西或舵机卡住，'
+                                   '**别当"夹空"**' % (phase_ticks, close_cmd, p1_read)):
                 break
             continue
         if cur == 'lift' and s_ach >= cfg.lift_m * 0.8:

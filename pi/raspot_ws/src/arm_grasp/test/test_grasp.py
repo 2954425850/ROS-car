@@ -137,14 +137,17 @@ from arm_grasp.servo import ik_open_m
 class Plant:
     """一台"真"臂：关节按速度上限追指令。模型即真值（模型误差另用参数注入）。"""
 
-    def __init__(self, j0, v_max_deg=20.0, tip_err_m=(0.0, 0.0, 0.0)):
+    def __init__(self, j0, v_max_deg=20.0, tip_err_m=(0.0, 0.0, 0.0), droop_deg=None):
         self.j = dict(j0)
         self.v = v_max_deg
         self.tip_err = tip_err_m
+        # `droop_deg` = 舵机**位置环下垂**：稳态下真实位置停在"指令 − 下垂"处。
+        # 2026-10-01 真机实测 p5/p4/p3 分别是 +16.7/+6.0/+8.4 count（= 4.0/1.5/2.0°）。
+        self.droop = dict(droop_deg or {})
 
     def step(self, j_cmd, dt):
         for k in self.j:
-            d = j_cmd[k] - self.j[k]
+            d = (j_cmd[k] - self.droop.get(k, 0.0)) - self.j[k]
             m = self.v * dt
             self.j[k] += max(-m, min(m, d))
 
@@ -153,7 +156,7 @@ class FakeLink:
     """实现 Link 协议：假臂 + 用 geom 当"真"相机。"""
 
     def __init__(self, plant, O_true, hz=10.0, noise_px=0.0, cut_after=None,
-                 seed=1, grip_block=None, grip_rate=300.0):
+                 seed=1, grip_block=None, grip_rate=300.0, grip_lag_s=0.0):
         self.p = plant
         self.O = O_true
         self.hz = hz
@@ -171,6 +174,22 @@ class FakeLink:
         self.grip = 240.0
         self.grip_block = grip_block
         self.grip_rate = grip_rate
+        # `grip_lag_s` = 回读**滞后**（真机实测：指令 240→354 走了 0.4s，读回还趴在 234）。
+        # 上报的是 `grip` 在 (t − lag) 时刻的值。
+        self.grip_lag_s = grip_lag_s
+        self._ghist = [(0.0, 240.0)]
+
+    def _fb_grip(self):
+        if self.grip_lag_s <= 0.0:
+            return self.grip
+        tt = self.t - self.grip_lag_s
+        g = self._ghist[0][1]
+        for t, v in self._ghist:
+            if t <= tt:
+                g = v
+            else:
+                break
+        return g
 
     def now(self):
         return self.t
@@ -179,7 +198,7 @@ class FakeLink:
         self.t += dt
 
     def fb(self):
-        return to_fields(self.p.j, self.grip, 496.0)
+        return to_fields(self.p.j, self._fb_grip(), 496.0)
 
     def obs(self):
         if self.cut_after is not None and self.pub_n > self.cut_after:
@@ -206,6 +225,7 @@ class FakeLink:
         self.grip += max(-step, min(step, d))
         if self.grip_block is not None:
             self.grip = min(self.grip, float(self.grip_block))
+        self._ghist.append((self.t, self.grip))
         self.p.j = from_fields(fields)                # 用 arm_kin 的，不要绕 grasp
         self.p.step(self.p.j, 1.0 / self.hz)
 
@@ -401,5 +421,79 @@ def test_close_full_travel_admits_it_cannot_tell_empty_from_thin():
     rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
     why = _close_reason(rep)
     assert '夹空' not in why, why
-    assert '读回贴到指令' in why, why
+    assert '读回也到底了' in why, why
     assert abs(link.grip - cfg.close_field) < 10.0, link.grip
+
+
+def test_close_does_not_freeze_before_the_readback_has_moved():
+    """夹爪回读**滞后**（真机实测 0.4s 还没起振）⇒ **不许**一进 close 相就判"碰上东西"。
+
+    变异（已实测）：把 `close_armed` 那道门去掉 ⇒ 这条立刻红。
+    """
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900)
+    plant = Plant(_start_joints(s_m=0.10))
+    link = FakeLink(plant, CAP, grip_lag_s=0.5)      # 回读滞后 5 拍
+    rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
+    why = _close_reason(rep)
+    assert '碰上东西' not in why, why
+    assert '读回也到底了' in why, why
+
+
+DROOP = {'shoulder': 2.0, 'elbow': 1.5, 'wrist_pitch': 1.5}   # 度（真机实测 4.0/1.5/2.0）
+
+
+def _aim_final_err(comp):
+    cfg = _cfg()._replace(hz=10.0, max_seconds=40.0, max_ticks=400, joint_comp=comp)
+    plant = Plant(_start_joints(s_m=0.10), droop_deg=DROOP)
+    link = FakeLink(plant, CAP)
+    rep = grasp.run(cfg, link, phase='aim', log=lambda *a: None)
+    return rep['err_m'], rep
+
+
+def _descend_err(rep):
+    """[descend] 收尾时"爪尖离目标"的 mm 数（从理由字符串里取，不另加字段）。"""
+    import re
+    for ph, why in rep['phases']:
+        if ph == 'descend':
+            return float(re.search(r'爪尖离目标 ([\d.]+)mm', why).group(1)) / 1000.0
+    raise AssertionError(rep['phases'])
+
+
+def _run_all(comp, droop=None):
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900, joint_comp=comp)
+    plant = Plant(_start_joints(s_m=0.10), droop_deg=(DROOP if droop is None else droop))
+    link = FakeLink(plant, CAP)
+    return grasp.run(cfg, link, phase='all', log=lambda *a: None)
+
+
+def test_joint_comp_reduces_the_tip_error_under_droop():
+    """★ 物理结局：有位置环下垂时，补偿必须让**下扎结束时爪尖离目标**明显变小。
+
+    判据取的是 `[descend]` 收尾那行理由里的实际量（回读算出来的），不是"循环说自己补过了"。
+    变异（已实测）：`joint_comp=0` ⇒ err_on == err_off ⇒ 这条立刻红。
+    """
+    e_off = _descend_err(_run_all(0.0))
+    e_on = _descend_err(_run_all(1.0))
+    assert e_off > 0.010, e_off                   # 前提：下垂确实造成可见误差
+    assert e_on < e_off * 0.5, (e_on, e_off)
+
+
+def test_joint_comp_measures_the_true_droop_at_the_handover():
+    """★ 交接处量到的 (纯目标 − 回读) 必须≈真实下垂（度 → count：×500/120）。
+
+    下垂是**稳态量**：交接那一刻臂刚报完到位、目标也不再动 ⇒ 量到的就是纯下垂，
+    不是滞后。变异（实测）：把 `f_tgt - f_now` 换成 `fields - f_now`（即算上已加的 comp）
+    ⇒ 恒等于下垂本身 ⇒ 每拍再加一次，数值无界 ⇒ 这条红。
+    """
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900, joint_comp=1.0)
+    plant = Plant(_start_joints(s_m=0.10), droop_deg=DROOP)
+    link = FakeLink(plant, CAP)
+    rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
+    got = rep['comp']
+    assert got is not None, rep['stopped']
+    # ⚠️ p5 是**反号映射**（`to_fields`: p5 = 500 + F·(90 − shoulder)）⇒ 肩下垂在 field 上是**负**的。
+    #    真机实测 `令 796.3 / 读 813.0` = −16.7 count，正是这个负号（= 肩下垂 4.0°）——对得上。
+    want = [DROOP['wrist_pitch'] * 500 / 120, DROOP['elbow'] * 500 / 120,
+            -DROOP['shoulder'] * 500 / 120]
+    for g, w in zip(got, want):
+        assert abs(g - w) < 3.0, (got, want)
