@@ -12,8 +12,10 @@
 发布:
   /battery_voltage  std_msgs/Float32    V（1Hz）
   /chassis_faults   std_msgs/Int32      固件 fault 位（变化即发并打日志）
-  /arm/feedback     sensor_msgs/JointState  0x56 实测回读（10Hz；0=该拍没读到）
-  /arm/online       std_msgs/Bool       机械臂 READY（10Hz）
+  /arm/feedback     sensor_msgs/JointState  0x56 实测回读（**25Hz**；0=该拍没读到）
+     ⚠️ 2026-10-01 之前这里写的是 10Hz —— 那是**发布定时器**的限制，不是固件的：
+     固件 `ARM_RATE_HZ=50`、0x56 每 2 拍发一次 = ~25Hz，被 10Hz 的定时器砍掉了 3/5 的帧。
+  /arm/online       std_msgs/Bool       机械臂 READY（25Hz，同上）
 
 0xAA 由本节点 25Hz 恒频发送（=链路保活，固件 200ms 看门狗兜底）。
 注意: 串口独占——旧 l150pro-driver / 云端驱动节点与本节点不可同时运行。
@@ -193,7 +195,15 @@ class L150ProDriverNode(Node):
         self.rx = RxWorker(path, baud, self.state)
         self.rx.start()
         self.create_timer(1.0 / 25.0, self.chassis_tick)
-        self.create_timer(0.1, self.feedback_tick)
+        # ★ 2026-10-01：**0.1 → 1/25**。
+        #   固件那边 `arm.h: ARM_RATE_HZ=50`、`arm.c: if(++arm_fb_div >= ARM_RATE_HZ/20) ros_send_arm_fb()`
+        #   ⇒ 0x56 是 **~25Hz（40ms）**推上来的；而这里原来用 10Hz 定时器去发 ⇒ **每 3 帧丢掉 2 帧**，
+        #   回读年龄被这个定时器顶到 100~160ms（固件 40ms + 每关节总线轮询 60ms + 这里 100ms）。
+        #   对照组：同一文件的 `chassis_tick` 本来就是 25Hz。
+        #   **只改发布频率，不动任何数据通路**（`feedback_tick` 只是把 RxWorker 解析好的最新状态发出去）。
+        #   两个订阅方都与速率无关，已核过：`ps2_teleop.on_fb`（镜像回读进目标 + 1s 操作守卫）、
+        #   `arm_recorder.on_fb`（阈值阶跃检测）。
+        self.create_timer(1.0 / 25.0, self.feedback_tick)
 
         self.tw = Twist()
         self.tw_time = 0.0
