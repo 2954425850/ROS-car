@@ -21,6 +21,8 @@ from .arm_kin import FIELD_HI, FIELD_LO, Unreachable, from_fields, to_fields
 from .servo import (ServoRefused as Refused, field_slack, fields_in_range,
                     ik_open_m, limit_step, tip_open_m)
 
+JOINT_KEYS = ('base', 'shoulder', 'elbow', 'wrist_pitch')
+
 
 def _refuse(msg):
     return Refused(msg)
@@ -39,7 +41,8 @@ GraspConfig = namedtuple('GraspConfig',
     'max_step_deg hz max_seconds max_ticks '            # 流式
     'tol_m tol_px_err patience min_gain_m '             # 判据
     'z_plane_m latency_s k_ewma gate_m '                # 尺度 / 时间 / 估计器
-    'close_field lift_m obs_lost_s deadband_counts close_ticks')
+    'close_field lift_m obs_lost_s deadband_counts close_ticks '
+    'min_step_deg close_step close_stall alpha_freeze_span')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -62,8 +65,14 @@ GraspConfig.__new__.__defaults__ = (
     0.020, 0.040, 0.35, 0.03,
     # deadband_counts = 10：实测**带载**（臂自重）下位置环死区稳态误差 5.6~6.6 count，
     # 取 10 留一档余量（定 6.0 时刚好卡在门外 ⇒ 判据不满足 ⇒ 白嗡嗡 2.5 秒才被"卡住"接管）。
-    # close_ticks：合爪相最多走几拍（12 拍 @10Hz = 1.2s，兜底；正常靠 p1 读回到位就切）
-    578.0, 0.04, 1.0, 10.0, 12,
+    # close_ticks：合爪相最多走几拍（12 拍 @10Hz = 1.2s，兜底；正常靠读回冻结就切）
+    # min_step_deg：每个"要动"的关节每拍**至少**走多少度（=3.1 count，跨过舵机死区）
+    # close_step  ：合爪每拍 p1 只走多少 count（**慢合**）—— 一次写到 578 是全力合，用户明确否决
+    # close_stall ：合爪时"读回连续几拍几乎不动"算碰上东西 ⇒ 冻结不再加压
+    # alpha_freeze_span：下扎/合爪/抬起时 α 只在 prefer±这个范围里搜（**冻住轴线**）。
+    #   不能真取 0：可行 α 区间随留量 s 移动，钉死单点会在半路"无可行姿态"⇒ refuse
+    #   （实测：s=3.2cm 时钉死 −59° 就解不出来了）。3° 的漂移只带 ~4mm 横向误差。
+    578.0, 0.04, 1.0, 10.0, 12, 0.75, 30.0, 3, 3.0,
 )
 
 
@@ -93,7 +102,7 @@ def visible(joints, O_m, vis):
     return (vis.u_lo <= u <= vis.u_hi and vis.v_lo <= v <= vis.v_hi), (u, v)
 
 
-def pick_target(O_m, cfg, s_m, prefer_alpha, vis=None):
+def pick_target(O_m, cfg, s_m, prefer_alpha, vis=None, span=None):
     """在 α 上搜一个把**张开态爪尖**放到 `axis_point(O, s, α)` 的可行姿态。
 
     硬门：p3/p4/p5 ∈ [125,875]。排序：余量最大 → α 最接近 prefer_alpha（连续性，避免每拍换解）。
@@ -109,9 +118,10 @@ def pick_target(O_m, cfg, s_m, prefer_alpha, vis=None):
     """
 
     vis = cfg.vis if vis is None else vis
+    span = cfg.alpha_span if span is None else span
     cands = []
     k = 0.0
-    while k <= cfg.alpha_span + 1e-9:
+    while k <= span + 1e-9:
         for a in ((prefer_alpha,) if k == 0.0
                   else (prefer_alpha - k, prefer_alpha + k)):
             if not (cfg.alpha_lo - 1e-9 <= a <= cfg.alpha_hi + 1e-9):
@@ -177,6 +187,30 @@ def plan_verdict(O_m, cfg, vis=None):
         return ('warn', t, '余量 %d count（< %d）——接近限位，成功率可能下降%s'
                 % (t.slack, cfg.min_slack, pix))
     return 'ok', t, '余量 %d count%s' % (t.slack, pix)
+
+
+def limit_step_floor(j_cur, j_des, max_step_deg, min_step_deg):
+    """等比限幅 + **每个"要动"的关节至少走 min_step_deg**。
+
+    为什么不能只用 `servo.limit_step` 的等比缩放：比例由**最大行程那个关节**定，
+    小行程关节的每拍步长 = max_step × (小行程 / 大行程)。2026-10-01 第一次真抓实测：
+    抬升阶段 p4 要 24 count、p5 要 39 count，按 2°/拍等比缩后 **p3 每拍只剩 0.12 count**
+    ⇒ 落进舵机死区 ⇒ 它一动不动、姿态永远到不了（trace 里"发"的 p4 在 191 附近抖、
+    "读"的 186 从头到尾不动）。
+    """
+    j_cmd, ratio, reached = limit_step(j_cur, j_des, max_step_deg)
+    if reached:
+        return j_cmd, ratio, True
+    out = dict(j_cmd)
+    for k in JOINT_KEYS:
+        d = j_des[k] - j_cur[k]
+        if abs(d) < 1e-12:
+            out[k] = j_cur[k]
+            continue
+        lo = min(min_step_deg, abs(d), max_step_deg)
+        if abs(out[k] - j_cur[k]) < lo:
+            out[k] = j_cur[k] + math.copysign(lo, d)
+    return out, ratio, False
 
 
 def standoff_along_axis(tip_m, O_m, alpha_deg):
@@ -293,6 +327,9 @@ def run(cfg, link, phase='aim', log=print):
     obs_age = None
     cur = seq[0]          # 当前相
     hold_j = None         # 'close' 相：进相时冻住的四个关节
+    close_cmd = None      # 'close' 相：正在往 close_field 爬的 p1 指令
+    close_stuck = 0       # 'close' 相：读回连续几拍没动的计数（= 碰上东西了）
+    p1_prev = None        # 'close' 相：上一拍读回的 p1
     phase_ticks = 0       # 本相已走几拍
 
     def advance_or_stop(reason):
@@ -301,6 +338,7 @@ def run(cfg, link, phase='aim', log=print):
         只在这里改 `cur` 和每相计数 ⇒ 五个停止点各两行，不会漏复位某一项。
         """
         nonlocal cur, near, stall, best, phase_ticks, hold_j, j_ref, s_cmd
+        nonlocal close_cmd, close_stuck, p1_prev
         rep['phases'].append((cur, reason))
         k = seq.index(cur) + 1
         if k >= len(seq):
@@ -310,6 +348,7 @@ def run(cfg, link, phase='aim', log=print):
         cur = seq[k]
         near, stall, best, phase_ticks = 0, 0, None, 0
         hold_j, j_ref, s_cmd = None, None, cfg.s_pre_m
+        close_cmd, close_stuck, p1_prev = None, 0, None
         return True
 
     for it in range(cfg.max_ticks):
@@ -365,22 +404,33 @@ def run(cfg, link, phase='aim', log=print):
             s_cmd = cfg.s_stop_m + cfg.lift_m
         try:
             if cur == 'close':
-                # 合爪：四个关节**冻住**在进相时的位置，只把 p1 送到 close_field。
-                # 不调 pick_target：此时目标就在爪子里，O 会漂、IK 也会给出"换姿态"的解 ✗。
+                # 合爪：四个关节**冻住**在进相时的位置；p1 **慢慢合**（每拍 close_step counts）。
+                # ⚠️ 2026-10-01 第一次真抓我把它一次写到 578 ⇒ 舵机**全力合到底**，用户明确否决
+                #    （"不能这样"）。现在慢合 + 读回一停就冻结（见下面的停止判据）。
                 if hold_j is None:
                     hold_j = dict(j_cur_m)
+                if close_cmd is None:
+                    close_cmd = float(f_now[0]) if f_now is not None else cfg.gripper
+                close_cmd = min(cfg.close_field, close_cmd + cfg.close_step)
                 tgt = Target(prev_alpha, cfg.s_stop_m, dict(hold_j),
-                             to_fields(hold_j, cfg.close_field, cfg.wrist_roll),
+                             to_fields(hold_j, close_cmd, cfg.wrist_roll),
                              0.0, 0.0, True, 0.0, 0.0)
             else:
-                tgt = pick_target(est.O, cfg, s_cmd, prev_alpha)
+                # ★ 一旦离开 aim 就把 α **冻住**（span=0）：下扎必须是一条**直线**。
+                #   实机实测（2026-10-01）：下扎中 α 自己从 −60° 漂到 −67° ⇒ 轴线转向 ⇒
+                #   爪尖沿旧轴走下去、横向偏出 4.6cm（比瓶盖还大）⇒ 夹在瓶盖**后面**。
+                tgt = pick_target(est.O, cfg, s_cmd, prev_alpha,
+                                  span=(None if cur == 'aim' else cfg.alpha_freeze_span))
         except Refused as e:
             rep['stopped'] = 'refuse：%s' % e
             break
         if cur != 'close':
             prev_alpha = tgt.alpha
         # 合爪/抬起期间**夹爪保持闭合**（抬起时张开 = 把东西放回去 ✗）
-        grip_cmd = cfg.close_field if cur in ('close', 'lift') else cfg.gripper
+        grip_cmd = close_cmd if cur in ('close', 'lift') and close_cmd is not None \
+            else (cfg.close_field if cur == 'lift' else cfg.gripper)
+        if cur == 'lift':
+            grip_cmd = cfg.close_field
         phase_ticks += 1
 
         # ④ 限速参考 + 发
@@ -391,7 +441,8 @@ def run(cfg, link, phase='aim', log=print):
         T_goal = axis_point(est.O, s_cmd, tgt.alpha)
         err_act = math.dist(tip_act, T_goal)
         s_ach = standoff_along_axis(tip_act, est.O, tgt.alpha)
-        j_cmd, ratio, reached = limit_step(j_cur, tgt.joints, cfg.max_step_deg)
+        j_cmd, ratio, reached = limit_step_floor(j_cur, tgt.joints,
+                                                 cfg.max_step_deg, cfg.min_step_deg)
         # ★★ 判据查的是**目标**的 field，不是这一拍的**指令**：
         #   实机开场姿态可能是"歇在机械限位上"的 —— 2026-09-30 实测开机 p4=121，**在固件下限 125 之下**，
         #   于是第一拍的限速指令必然也在界外。拿指令当判据 ⇒ 整条链在第一拍就 refuse（永远动不了）。
@@ -461,11 +512,27 @@ def run(cfg, link, phase='aim', log=print):
                                    % (s_ach * 1000, err_act * 1000)):
                 break
             continue
-        if cur == 'close' and (phase_ticks >= cfg.close_ticks
-                               or f_now[0] >= cfg.close_field - 20.0):
-            # 合爪完了：p1 到 close_field（读回 ±20 count 内算到），或走满 close_ticks 拍兜底
-            if not advance_or_stop('合爪完成：p1 读回 %.0f（目标 %.0f），走了 %d 拍'
-                                   % (f_now[0], cfg.close_field, phase_ticks)):
+        if cur == 'close' and close_cmd is not None and close_cmd >= cfg.close_field - 1.0:
+            if not advance_or_stop('合爪完成：p1 指令到 %.0f、读回 %.0f（**夹空了**——盖不在爪子里）'
+                                   % (close_cmd, f_now[0])):
+                break
+            continue
+        if cur == 'close':
+            # 读回连续 close_stall 拍几乎不动（每拍变化 <5 count）= 指尖碰上东西了 ⇒ **冻结**
+            if p1_prev is not None and abs(f_now[0] - p1_prev) < 5.0:
+                close_stuck += 1
+            else:
+                close_stuck = 0
+            p1_prev = f_now[0]
+            if close_stuck >= cfg.close_stall:
+                if not advance_or_stop('合爪完成：读回连续 %d 拍不动（p1 令 %.0f/读 %.0f）'
+                                       '⇒ 碰上东西、冻结不再加压'
+                                       % (close_stuck, close_cmd, f_now[0])):
+                    break
+                continue
+        if phase_ticks >= cfg.close_ticks and cur == 'close':
+            if not advance_or_stop('合爪超时兜底：走了 %d 拍（p1 令 %.0f/读 %.0f）'
+                                   % (phase_ticks, close_cmd, f_now[0])):
                 break
             continue
         if cur == 'lift' and s_ach >= cfg.lift_m * 0.8:
