@@ -262,7 +262,11 @@ def test_loop_holds_when_observation_dies():
       观测在第 5 拍断、丢失计时器在第 15 拍到期 ⇒ 分支真的被走到（留 10 拍余量）。
       物理上这也是更真实的一幕：**相机是在臂还在摆的中途掉的**，不是站定之后掉的。
     """
-    cfg = _cfg()._replace(max_seconds=10.0, max_ticks=100, max_step_deg=0.3)
+    # ⚠️ `obs_lost_s=1.0` 是**显式钉死**的：这条测的就是"观测丢失"分支，必须自己决定容忍度。
+    #    默认值 2026-10-01 从 1.0 改成 5.0（相机移动时跟踪器会跟丢低纹理目标），
+    #    沿用默认会让 aim 先把循环"正常完成"掉、这条分支根本走不到 ⇒ 假绿。
+    cfg = _cfg()._replace(max_seconds=10.0, max_ticks=100, max_step_deg=0.3,
+                          obs_lost_s=1.0)
     plant = Plant(_start_joints())
     link = FakeLink(plant, CAP, cut_after=3)
     rep = grasp.run(cfg, link, phase='aim', log=lambda *a: None)
