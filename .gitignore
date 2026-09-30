@@ -36,5 +36,12 @@ logs/
 #   k230-vision/*.png      <- fov_analyze.py / t_camcalib.py 画的图
 # 注意：同目录下的 *.md 是人写的文档，要入库；people.json 是配置，也要入库。
 pi/raspot_ws/src/**/docs/*.json
+# 例外：这两个是「已定论的实测数据，被后续工具当输入读」，要留档 ——
+#   samples-20260928-190746.json  <- tilt_grid/verify_tilt/offset_test/whats_missing/pin_t 都读它
+#   p3.json                       <- p3_backsolve.py 读它
+# 取消跟踪它们会让新克隆跑不了这些工具（2026-09-30 差点埋这个雷）。
+!pi/raspot_ws/src/arm_grasp/docs/samples-20260928-190746.json
+!pi/raspot_ws/src/arm_grasp/docs/samples-20260928-190746.meta.json
+!pi/raspot_ws/src/arm_grasp/docs/p3.json
 pi/raspot_ws/docs/shots/*.jpg
 pi/k230-vision/*.png
