@@ -422,6 +422,12 @@ def run(cfg, link, phase='aim', log=print):
                 #   `max_step_deg_actual` 抓不到"限速没生效"（变异自检真抓到过：
                 #   把上限改成 1000 后，第一拍直接跳到位、之后每拍步长 0，指标恒为 0）。
                 j_ref = to_fields(from_fields(fbf), cfg.gripper, cfg.wrist_roll)
+        # ★ 还没读到**任何**可用回读就先别往下算：`trace.at()` 撞上空缓冲会抛
+        #   `ValueError('Trace 是空的')`，而 `run()` 只接了 `Refused` ⇒ **整轮直接崩**。
+        #   2026-10-01 踩到：跟踪器给框比串口反馈快，观测先到、回读还没到。
+        #   （老隐患，只是今天才撞上；上面 `fbf is None` 时 `trace.add` 不会执行。）
+        if not trace.buf:
+            continue
         # ② 观测 → 估计
         obs = link.obs()
         if obs is not None:

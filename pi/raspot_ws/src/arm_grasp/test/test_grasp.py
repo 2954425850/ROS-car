@@ -159,7 +159,8 @@ class FakeLink:
     """实现 Link 协议：假臂 + 用 geom 当"真"相机。"""
 
     def __init__(self, plant, O_true, hz=10.0, noise_px=0.0, cut_after=None,
-                 seed=1, grip_block=None, grip_rate=300.0, grip_lag_s=0.0):
+                 seed=1, grip_block=None, grip_rate=300.0, grip_lag_s=0.0,
+                 fb_none=0):
         self.p = plant
         self.O = O_true
         self.hz = hz
@@ -180,6 +181,7 @@ class FakeLink:
         # `grip_lag_s` = 回读**滞后**（真机实测：指令 240→354 走了 0.4s，读回还趴在 234）。
         # 上报的是 `grip` 在 (t − lag) 时刻的值。
         self.grip_lag_s = grip_lag_s
+        self.fb_none = fb_none
         self._ghist = [(0.0, 240.0)]
 
     def _fb_grip(self):
@@ -201,6 +203,9 @@ class FakeLink:
         self.t += dt
 
     def fb(self):
+        # `fb_none` 拍之内假装还没读到回读（真机：跟踪器给框比串口反馈快）
+        if self.t < self.fb_none / self.hz:      # 按**时间**算，不依赖发没发过指令
+            return None
         return to_fields(self.p.j, self._fb_grip(), 496.0)
 
     def obs(self):
@@ -545,3 +550,19 @@ def test_descend_accepts_the_servo_deadband_instead_of_stalling():
     why = rep['phases'][0][1]
     assert why.startswith('扎到位'), rep['stopped']
     assert '死区极限' in why, why                          # 必须走的是第二条判据
+
+
+def test_run_survives_observations_arriving_before_any_feedback():
+    """★ 观测（K230 框）比串口回读**先到**时，`run()` 不许崩。
+
+    真机 2026-10-01 踩到：`trace.at()` 撞上空缓冲抛 `ValueError('Trace 是空的')`，
+    而 `run()` 只接 `Refused` ⇒ 整轮直接崩（"❌ 出错了：Trace 是空的"）。
+    变异（实测）：把 `if not trace.buf: continue` 去掉 ⇒ 这条抛 ValueError、红。
+    """
+    cfg = _cfg()._replace(hz=10.0, max_seconds=20.0, max_ticks=300)
+    plant = Plant(_start_joints(s_m=0.10))
+    link = FakeLink(plant, CAP, fb_none=4)      # 前 4 拍没有回读，但观测照来
+    rep = grasp.run(cfg, link, phase='aim', log=lambda *a: None)
+    # 变异（已实测）：去掉那道闸 ⇒ `ltrace.at` 抛 ValueError、**测试直接红**（异常本身就是判据）。
+    assert rep['stopped'], rep['stopped']        # 跑完了，没崩
+    assert rep['ticks'] >= 1, rep['ticks']       # 回读一到就正常发指令
