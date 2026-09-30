@@ -520,7 +520,7 @@ def main(argv=None):
                      '-' if rep['target'] is None else '%.0f' % rep['target'].slack))
         # 验收（Task 6 Step 4 的 1/2/4 条，在这里直接判给人看）
         if rep['ok']:
-            print('✅ 走到位（≤2mm）')
+            print('✅ 到位（判据 = 回读落在舵机死区量级内连续 3 拍，见上面的"回读与目标差"）')
         else:
             print('❌ 没走到位：%s' % rep['stopped'])
         if dmax > cfg.max_step_deg + 1e-6:
