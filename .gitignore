@@ -1,6 +1,9 @@
 # ---- 密钥/凭据：绝不入库 ----
-config.yaml
-config.yaml.*
+**/config.yaml
+**/config.yaml.bak-*
+**/config.yaml.orig
+# 模板要入库（里面是 REPLACE_ME 占位符）
+!**/config.yaml.example
 *.pem
 *.key
 *.env

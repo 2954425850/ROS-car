@@ -1,0 +1,164 @@
+# JARVIS 语音助手配置模板
+#
+# 用法：复制成 config.yaml，再把下面所有 REPLACE_ME 换成真值。
+# config.yaml 已被 .gitignore 排除 —— 里面有真密钥，绝不要提交。
+# （对应真文件见 Pi 上 /home/cy/voice-chatbot/config.yaml）
+
+# ---- 音频 ----
+audio:
+  sample_rate: 16000
+  channels: 1
+  chunk_size: 480        # 30ms at 16kHz = 480 frames
+  device_index: null     # 走系统默认(PipeWire)，与原设计/09.AI_Big_Model 一致
+  wake_sound: "sounds/ding.wav"  # 唤醒提示音（16kHz/mono/int16），留空则不播
+
+# ---- VAD ----
+vad:
+  mode: 1                # 0-3, 3 最激进（放宽以适配本机麦克风，2026-09-13 试）
+  silence_threshold_ms: 800   # 1200→800 (2026-09-13)：尾静音少等 0.4s，直接省在首次出声上
+  max_duration_sec: 60
+  no_speech_timeout_sec: 8   # 唤醒后一直没人说话，超过此时长就放弃本轮（返回空录音）
+  preroll_ms: 150            # 裁前导静音时保留的预卷，避免咬掉第一个字
+  speech_start_frames: 3     # 连续多少帧(30ms/帧)判为语音才算开口，抗提示音误触发
+
+# ---- 唤醒词（硬件串口模块）----
+# 模块通过 USB 转串口接入，协议 AA 55 <CMD> 00 FB
+wakeword:
+  port: "/dev/myspeech"      # 或 /dev/ttyUSB0；建议用 udev 规则固定成 /dev/myspeech
+  baudrate: 115200
+  serial_timeout_sec: 0.1    # 串口读超时，决定无数据时的循环间隔
+  cooldown_sec: 2.0          # 触发后冷却，防止重复触发
+  reconnect_initial_sec: 0.5 # 串口掉线后首次重连的等待；之后每次失败翻倍
+  reconnect_max_sec: 5.0     # 退避上限。别调太小 —— 那是热循环，不是恢复快
+
+# ---- ASR (阿里云 DashScope) ----
+asr:
+  api_key: "REPLACE_ME"
+  model: "paraformer-realtime-v2"
+  sample_rate: 16000
+
+# ---- TTS (阿里云 DashScope) ----
+# 使用双向流式 API (dashscope.audio.tts_v2.SpeechSynthesizer)
+# 音频通过回调 on_data() 到达，格式为 PCM 16kHz mono int16
+tts:
+  api_key: "REPLACE_ME"
+  model: "cosyvoice-v3-flash"
+  voice: "longze_v3"             # 龙泽 · 温暖元气男(流畅) 
+  format: "pcm"             # pcm / mp3 / wav
+  sample_rate: 16000
+
+# ---- LLM (DeepSeek) ----
+# 注意：llm.model 必须支持 function calling（tools 参数），否则工具不会被调用。
+# 若不支持，把 tools_enabled 设为 false 会退化成纯对话（也就没有自动追问了）。
+llm:
+  api_key: "REPLACE_ME"
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-v4-flash"
+  max_tokens: 2048
+  temperature: 0.7
+  tools_enabled: true
+  max_tool_iterations: 5    # 单轮最多连续执行几次工具，防止模型陷入循环
+                            # 3→5 (2026-09-13)：接了 MCP 后工具变多，
+                            # 「先查再答」这类链式调用需要多一轮余量
+  system_prompt: |
+    你是 JARVIS，一个语音助手。回答简洁自然，用口语化中文，控制在 2-3 句话以内。
+    如果需要用户补充信息、确认或澄清，必须调用 ask_user 工具提问，不要只在正文里问 ——
+    只有调用该工具，麦克风才会自动重新打开等待用户回答。
+    需要知道当前时间时，调用 get_current_time 工具，不要凭空猜测。
+    调用工具之前，先用一句口语化的短话告诉用户你打算做什么，例如「我查一下」。
+    不需要追问时，正常回答即可。
+
+# ---- MCP 服务器 ----
+# 每个 server 会被拉成子进程，走 stdio 传输（换行分隔的 JSON-RPC 2.0）。
+# 工具以 mcp__<prefix>__<工具名> 注册；resources / prompts 会各自再暴露成工具。
+# 详细设计见 mcp_host/__init__.py。
+#
+# ⚠️ mcp 这个包必须钉在 <2：qq-music-mcp 在 mcp 2.x 上 import 就会崩
+#    （FastMCP 被改名成 MCPServer）。见 requirements.txt。
+mcp_servers:
+  weather:
+    command: ["python3", "-m", "mcp_servers.weather_server"]
+    cwd: "."                  # 相对项目根
+    prefix: "weather"
+    enabled: true
+    # 以下非保留字段会以 JSON 形式经 MCP_SERVER_CONFIG 环境变量传给 server
+    city: "大庆"              # 用户没说出城市时的默认值
+    qweather_key: "REPLACE_ME"
+    # 只暴露给模型的工具。留空/不写 = 全部暴露。
+    expose_tools: ["get_current_weather", "get_forecast"]
+    # resources/prompts 是否合成成工具发给模型。语音场景用不上，默认关。
+    expose_capabilities: false
+
+  qqmusic:
+    command: ["qq-music-mcp"] # 装在 ~/.local/bin
+    prefix: "qqmusic"
+    enabled: true
+    # 只暴露给模型的工具。QQ音乐共 10 个，但语音场景只用到这 3 个；
+    # 其余（封面 URL、批量取链接、歌单详情…）模型看得到也用不上，纯占 context。
+    # 注意：不在白名单里 ≠ 不能用 —— play_music 内部仍会调 get_song_url。
+    expose_tools: ["search_music", "get_lyric", "get_song_detail"]
+    env:
+      # 2026-09-13 填入。没它的话 get_song_url 对所有音质都返回空链接，
+      # 一首歌都放不了（实测过）。凭证到期后（下面注释的日期）要重新取。
+      # 到期: 2026-09-23
+      QQ_MUSIC_COOKIE: "REPLACE_ME"
+    read_timeout_sec: 30
+
+# ---- 放歌 ----
+music:
+  max_minutes: 10            # 单次播放上限（兜底，防止忘了关）
+  qualities: ["320", "128", "m4a"]   # 依次尝试的播放音质；拿不到就降级到下一个
+
+# ---- 小车（L150Pro）----
+# 限幅与默认值放这里而不是写死在代码里 —— 将来标定完成或供电改善，
+# 只改这个文件即可，不用改代码重部署。
+# 驱动侧的真实限幅：max_vx=0.5 / max_wz=1.5（l150pro_driver 默认参数）。
+car:
+  default_speed: 0.3          # m/s，car_move 未指定 speed 时用
+  max_speed: 0.5              # m/s，与驱动 max_vx 一致
+  default_turn_speed_dps: 60  # 度/秒，car_turn 未指定 speed 时用
+  max_turn_speed_dps: 120     # 度/秒
+  camera_step_deg: 15         # car_camera 未指定 degrees 时的步进
+  camera_min_us: 800          # 云台行程下限（teleop 的保守值，防堵转扫齿）
+  camera_max_us: 2200
+  camera_center_us: 1500
+  cmd_rate_hz: 25             # 发帧频率（驱动 cmd_rate_hz=20，留余量）
+
+# ---- 视觉（K230 拍照上云）----
+# 「看一眼」这个工具（look）的配置。工具本身在 tools/vision.py，客户端在 vision/。
+# ---- 跟随（让 K230 追踪「跟着某个人」）----
+# `follow_person` / `follow_stop` 两个工具用。走的是 8557 那条**命令**通路，
+# 和 vision（拍照上云）完全不是一回事，所以单独一段。
+# 名字 -> id 的映射在**板子那一侧**的 pi/people.json（板子上文件名只能 ASCII）。
+follow:
+  enabled: true
+  cmd: "/home/cy/k230-vision/pi/k230ctl"
+  timeout_sec: 15          # ⚠️ 必须 > 板子的 FOLLOW_TIMEOUT_MS(8s)：follow 是锁上之后才回话
+
+vision:
+  enabled: true              # false = 根本不注册 look 工具（不进发给模型的 tools= 数组）
+  model: "deepseek-flash"    # deepseek-v4-flash-vision-exp 是它的别名，两个 ID 真身相同
+  # ★ --attempts 1 是**刻意的，不是笔误**：重试策略已收到客户端那一层统一负责
+  #   （vision/k230_look.py）。k230ctl 自己再重试就变成内外两层各算各的，
+  #   最坏等待时间没法算。
+  snap_cmd: "/home/cy/k230-vision/pi/k230ctl snap --attempts 1"
+  # ★ 语义是「整个 snap（**含客户端自己的重试**）的总预算」，**不是单次调用超时**。
+  #   别按「单次超时」理解它，否则会把最坏等待时间算成 N 倍。
+  snap_timeout_sec: 25
+  request_timeout_sec: 30
+  # ★ 为什么是 1500：deepseek-flash 是**推理模型**，先吐 reasoning_content 再吐
+  #   content。给小了（实测 200）正文直接是空的 —— 表现是「工具返回空字符串」，
+  #   看着像工具坏了，其实是预算被思考过程吃光。别往下调。
+  max_tokens: 1500
+  detail: "low"              # low 已够认物且便宜（≈180 tokens/张 720p）
+  instruction: "用一到两句口语化中文回答，直接说结论，不要罗列。"
+
+# ---- 对话管理 ----
+conversation:
+  max_history_rounds: 20        # 跨唤醒保留的对话轮数（一轮 = 一问一答）
+  max_continue_rounds: 5        # 单次唤醒后最多连续追问几轮
+  session_reset_idle_sec: 1800  # 闲置超过此时长再唤醒，视为新会话并清空历史；0 = 从不自动清空
+  # 调工具前的兜底开场白。实测 deepseek-v4-flash 默认在调工具前
+  # 一个字都不说，光靠 system_prompt 里那句要求不保证 100% 触发，所以代码里
+  # 还要有一句保底。留空 = 模型不说就不出声（退回改动前的全静默行为）。
+  pre_tool_filler: "稍等一下"
