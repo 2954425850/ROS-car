@@ -39,7 +39,7 @@ GraspConfig = namedtuple('GraspConfig',
     'max_step_deg hz max_seconds max_ticks '            # 流式
     'tol_m tol_px_err patience min_gain_m '             # 判据
     'z_plane_m latency_s k_ewma gate_m '                # 尺度 / 时间 / 估计器
-    'close_field lift_m obs_lost_s')
+    'close_field lift_m obs_lost_s deadband_counts')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -54,10 +54,14 @@ GraspConfig.__new__.__defaults__ = (
     #     5cm → slack 77 但 v=153（可锁带只剩 8px）；8cm → slack 58、v=145（16px）；10cm → slack 35。
     #   取 8cm：跟踪余量够，且 slack 仍在 min_slack(40) 之上。
     0.08, 0.003, 0.002, 0.30,
-    1.5, 10.0, 40.0, 400,
+    # ⚠️ max_step_deg = **6.0**（不是 1.5）：`limit_step` 按最大行程关节等比缩放，小行程关节的
+    #    每拍步长 = max_step × (小行程/大行程)。实测肩/腕行程比 ~3.5:1，1.5°/拍时腕只有 ~2 count、
+    #    落进舵机死区**一动不动** ⇒ 姿态永远到不了（2026-09-30 真跑两次都栽在这）。6.0 ⇒ 最慢 ~7 count。
+    6.0, 10.0, 40.0, 400,
     0.002, 10.0, 4, 0.0005,
     0.020, 0.040, 0.35, 0.03,
-    578.0, 0.04, 1.0,
+    # deadband_counts = 6：实测**带载**（臂自重）下位置环死区稳态误差 ~5 count ⇒ 判"到位"的量级
+    578.0, 0.04, 1.0, 6.0,
 )
 
 
@@ -272,7 +276,7 @@ def run(cfg, link, phase='aim', log=print):
            'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None,
            'target': None, 's_ach_m': None, 'rows': []}
     dt = 1.0 / cfg.hz
-    j_ref, cmd_sent, f_prev = None, None, None
+    j_ref, cmd_sent, f_prev, near = None, None, None, 0
     prev_alpha = cfg.alpha0
     stall, best = 0, None
     s_cmd = cfg.s_pre_m
@@ -380,15 +384,22 @@ def run(cfg, link, phase='aim', log=print):
         moved = (999.0 if f_prev is None
                  else max(abs(f_now[k] - f_prev[k]) for k in range(6)))
         f_prev = f_now
+        # ★★ 到位判据要**认硬件的死区**：2026-09-30 实测，命令收敛到目标之后，
+        #   **回读稳定地差 ~5 count（≈1.2°/关节）**就再也不动了 —— 那是 LX 舵机带载（臂自重）
+        #   下的位置环死区稳态误差，是硬件极限。拿"tip 误差 ≤ 2mm"当判据 ⇒ 永远不满足、
+        #   白跑到超时（实测 40s）。正确判据：**回读落在目标的死区量级内连续 3 拍**。
+        lag = max(abs(f_now[k] - f_tgt[k]) for k in range(2, 6))     # p3..p6 实际 vs 目标
+        near = near + 1 if lag <= cfg.deadband_counts else 0
         if moved >= 1.0:                      # 1 count = 回读的量化单位 ⇒ 任何真实运动都能清掉它
             stall = 0
             if best is None or err_act < best:
                 best = err_act
         else:
             stall += 1
-        if phase == 'aim' and err_act <= cfg.tol_m:
-            rep['stopped'] = '对准完成：爪尖离目标点 %.1fmm（余量 %.1fcm，α=%.1f°）' % (
-                err_act * 1000, s_cmd * 100, tgt.alpha)
+        if phase == 'aim' and (err_act <= cfg.tol_m or near >= 3):
+            rep['stopped'] = ('对准完成：爪尖离目标点 %.1fmm（余量 %.1fcm，α=%.1f°；'
+                              '回读与目标差 %d count ⇒ 已到舵机死区边界）'
+                              % (err_act * 1000, s_cmd * 100, tgt.alpha, round(lag)))
             break
         # ★ 判据带 `min_gain_m`(0.5mm) 容差，**不是**裸的 `s_ach <= cfg.s_stop_m`：
         #   上面的 `s_cmd = max(cfg.s_stop_m, ...)` 把**指令**地板钉死在 s_stop_m 上，而
