@@ -95,7 +95,7 @@ def parse_box(s):
 
 
 def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
-              joint_comp=None, hz=None):
+              joint_comp=None, hz=None, bias_r=None):
     """把 CLI 参数装进 `GraspConfig`。**`--h` 必须真的进 `z_plane_m`**（自检里有闸）。"""
     kw = {'z_plane_m': float(h_m)}
     if max_step is not None:
@@ -106,6 +106,8 @@ def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
         kw['alpha0'] = float(alpha0)
     if joint_comp is not None:
         kw['joint_comp'] = float(joint_comp)
+    if bias_r is not None:
+        kw['bias_r_m'] = float(bias_r) / 100.0      # CLI 用 cm，内部用米
     cfg = grasp.GraspConfig(**kw)
     if hz is not None:
         # ★ 提频时**必须把"按拍数"的判据一起折算**，否则它们在**墙上时间**上被砍短：
@@ -338,6 +340,10 @@ def main(argv=None):
                     help='控制频率（默认 10）。真机可到 ~20——**硬上限是回读滞后 ~0.4s**，'
                          '再快就是拿过期数据发指令。会按 hz/10 同比折算 patience/close_ticks/'
                          'max_ticks，保证各判据的**秒数**不变。')
+    ap.add_argument('--bias-r', type=float, default=None,
+                    help='**沿半径**的静态偏置（cm，+ = 目标向外/远离车）。'
+                         '实测爪尖几乎每次偏后 ~1cm（= 舵机死区稳态残差），'
+                         '要消掉就填 **-1**。')
     ap.add_argument('--joint-comp', type=float, default=None,
                     help='肩/肘/腕位置环下垂补偿增益（默认 1.0；**0 = 关掉**）。'
                          'A/B 用：第 2 跑（无它）下扎通、第 4~6 跑（有它）下扎卡住。')
@@ -357,6 +363,7 @@ def main(argv=None):
 
     cfg = build_cfg(args.h, max_step=args.max_step, patience=args.patience,
                     alpha0=args.alpha0, joint_comp=args.joint_comp, hz=args.hz,
+                    bias_r=args.bias_r,
                     max_seconds=args.max_seconds)
     print('框 box=%s（归一化）  目标面高 h=%.4f m（%.1f mm）→ cfg.z_plane_m'
           % (want, args.h, args.h * 1000))

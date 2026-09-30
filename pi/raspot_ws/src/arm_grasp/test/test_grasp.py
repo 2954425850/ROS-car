@@ -566,3 +566,26 @@ def test_run_survives_observations_arriving_before_any_feedback():
     # 变异（已实测）：去掉那道闸 ⇒ `ltrace.at` 抛 ValueError、**测试直接红**（异常本身就是判据）。
     assert rep['stopped'], rep['stopped']        # 跑完了，没崩
     assert rep['ticks'] >= 1, rep['ticks']       # 回读一到就正常发指令
+
+
+def test_apply_bias_radial_moves_along_the_radius_not_a_fixed_vector():
+    """★ 径向偏置：目标挪的方向必须**跟着物体方位角转**（固定向量做不到）。
+
+    实测"爪尖几乎每次都偏后 ~1cm"是径向的（换方位角还是偏后）⇒ 必须按半径给。
+    变异（实测）：把 `bias_r_m * ux` 的符号反过来 ⇒ 这一条红。
+    """
+    for (x, y) in ((0.20, -0.02), (-0.15, 0.10), (0.0, 0.18)):
+        r = (x * x + y * y) ** 0.5
+        out = grasp.apply_bias((x, y, -0.1), bias_r_m=0.01)      # 向外 1cm
+        d = ((out[0] - x) ** 2 + (out[1] - y) ** 2) ** 0.5
+        assert abs(d - 0.01) < 1e-9, (x, y, d)
+        assert abs(out[0] - (x + 0.01 * x / r)) < 1e-9, (x, y, out)
+        assert out[2] == -0.1                                   # z 不该被动
+        inward = grasp.apply_bias((x, y, -0.1), bias_r_m=-0.01)
+        din = ((inward[0] - x) ** 2 + (inward[1] - y) ** 2) ** 0.5
+        assert abs(din - 0.01) < 1e-9
+        # 向内必须是**反方向**
+        assert (inward[0] - x) * (out[0] - x) <= 0.0
+    # 零偏置 = 原样
+    assert grasp.apply_bias((0.1, 0.2, 0.3)) == (0.1, 0.2, 0.3)
+    assert grasp.apply_bias((0.1, 0.2, 0.3), (0.01, 0.0, 0.0)) == (0.11, 0.2, 0.3)

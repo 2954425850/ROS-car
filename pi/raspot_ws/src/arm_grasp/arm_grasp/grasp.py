@@ -44,7 +44,8 @@ GraspConfig = namedtuple('GraspConfig',
     'close_field lift_m obs_lost_s deadband_counts close_ticks '
     'min_step_deg close_step close_stall alpha_freeze_span bias_m '
     'base_comp base_comp_max '
-    'joint_comp joint_comp_max')
+    'joint_comp joint_comp_max '
+    'bias_r_m')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -98,12 +99,36 @@ GraspConfig.__new__.__defaults__ = (
     #   实测下垂 +8.4/+6.0/+16.7 count（p3/p4/p5）⇒ 爪尖差 1.5~2.2cm。稳态残差 = 下垂/(1+增益)。
     #   先取 1.0（砍一半）——**别一次性往大调**，底座那边有过"增益大会一起震荡"的教训。
     1.0, 60.0,
+    # bias_r_m：**沿半径**的静态偏置（米，+|向外/远离底座）。实测爪尖**几乎每次都偏后 ~1cm**
+    #   = 舵机死区稳态残差 + 臂自重沉向那边；换方位角它还是径向 ⇒ 用径向的、不用固定向量。
+    0.0,
 )
 
 
 # --------------------------------------------------------------------------
 # 目标 / 姿态
 # --------------------------------------------------------------------------
+
+def apply_bias(O_m, bias_m=(0.0, 0.0, 0.0), bias_r_m=0.0):
+    """目标点的**静态偏置**。两种：
+
+    * `bias_m`：固定向量（基座系，米）。换个方位角就不对了 —— 只适合"偏差方向不变"的场合。
+    * `bias_r_m`：**沿半径方向**（+|向外/远离底座）。实测"几乎每次都偏后 ~1cm"是**径向**的
+      （舵机死区稳态残差 + 臂自重往那边沉），换物体的方位角它还是径向 ⇒ 用这个才对。
+
+    ★ 为什么要人给：这 1cm 是**硬件死区**留下的稳态残差，闭环自己收不掉（判据本来就在死区上）；
+      要真收掉得给每个关节加**积分**补偿，那是另一件事（今晚试过、和到位判据打架，已回退）。
+    """
+    x, y, z = O_m
+    r = math.hypot(x, y)
+    if r < 1e-9:
+        ux = uy = 0.0
+    else:
+        ux, uy = x / r, y / r
+    return (x + bias_m[0] + bias_r_m * ux,
+            y + bias_m[1] + bias_r_m * uy,
+            z + bias_m[2])
+
 
 def axis_point(O_m, s_m, alpha_deg):
     """过 O、沿下扎轴 ẑ_T(α) 退 s 的那一点（米）。s=0 就是 O 本身。
@@ -459,7 +484,7 @@ def run(cfg, link, phase='aim', log=print):
             continue
         # ★ 目标点 + **静态偏置**：实测指尖总落在目标左边 1cm ⇒ 目标往右挪 1cm 抵掉。
         #   下面所有几何（目标姿态/残差/沿轴留量）**一律用 `O_u`**，别混用 est.O。
-        O_u = tuple(est.O[i] + cfg.bias_m[i] for i in range(3))
+        O_u = apply_bias(est.O, cfg.bias_m, cfg.bias_r_m)
 
         # ③ 目标（按**当前相** `cur`）
         # ★★ `f_raw` = 这一拍时间对齐后的 6 个 field（回读优先）。**p1 的真值只在 `f_raw[0]`**：
