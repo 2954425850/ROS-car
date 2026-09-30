@@ -41,3 +41,29 @@ cd /home/cy/ROS-car && git pull
 
 ROS 工作区需要用 `rosdep`/`colcon` 在 `raspot_ws` / `l150pro_ws` 下构建后再起服务。
 运行中的服务：`l150pro-driver`、`ps2-teleop`、`voice-chatbot`、`k230-resultd`、`rosbridge`。
+
+## 什么入库、什么不入库
+
+**入库**：代码、人写的文档（`docs/*.md`）、配置、素材、systemd 单元、测试。
+
+**不入库**（见 `.gitignore`）：**工具跑出来的东西** ——
+- `arm_grasp/docs/*.json` —— `collect.py` / `geom_probe.py` / `jacobian.py` 的实测数据
+- `raspot_ws/docs/shots/*.jpg` —— `rec_sample.py` 拍的照
+- `k230-vision/*.png` —— `fov_analyze.py` / `t_camcalib.py` 画的分析图
+- 日志、`build/`、`install/`、`*.tar.gz`、`*.raw`、`*.bin`
+- `voice-chatbot/config.yaml`（含 `api_key` 等密钥，只入库 `config.yaml.example`）
+
+**判据**：这文件是脚本「写」的，还是人「写」的？脚本写的就不入库。
+（`people.json` 虽是 .json，但它是人脸库配置、由人维护，**入库**。）
+
+**这样做的两个好处**：跑采集/标定**不会弄脏工作区**；而且
+`git checkout -- .` / `git stash` **永远不会冲掉你的测量数据**（untracked 文件 git 不碰）。
+
+### 想固化某次测量结果
+
+产物默认不进库。要留住某一次结果，**显式**加进去（`-f` 是必须的，文件被 .gitignore 挡着）：
+
+```bash
+git add -f pi/raspot_ws/src/arm_grasp/docs/samples-2026xxxx-xxxxxx.json
+git commit -m "data: <这次测了什么>"
+```
