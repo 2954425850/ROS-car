@@ -115,6 +115,30 @@ def vis_report(joints, O_m, vis):
                         % (u, v, vis.u_lo, vis.u_hi, vis.v_lo, vis.v_hi))
 
 
+def _stable_fb(io, timeout=6.0, tol=4.0):
+    """读一帧**可信**的回读。
+
+    为什么必须：固件是**轮询**读那 5 个舵机的（读不到就是 0），2026-09-30 在 Pi 上连读 3 条
+    就有 1 条 `p5=0` —— **三分之一**。把 0 当关节角用会算出荒唐的爪尖（实测 shoulder=0 ⇒
+    爪尖 z=22.6cm）而且**不报错**。判据：p3/p4/p5/p6 都非 0，且连续两帧抖动 ≤ tol count
+    （底座电位器本底噪 ±1）。与 `tools/servo_grasp.py` 的 `stable_fb` 同一套判据。
+    """
+    t0, prev = time.time(), None
+    while time.time() - t0 < timeout:
+        io.spin(0.05)
+        fbf = io.fb
+        if fbf is None:
+            continue
+        v = [float(x) for x in fbf]
+        if len(v) < 6 or any(v[i] == 0.0 for i in (2, 3, 4, 5)):
+            prev = None
+            continue
+        if prev is not None and all(abs(v[k] - prev[k]) <= tol for k in range(6)):
+            return v
+        prev = v
+    raise RuntimeError('读不到可信回读（p3/p4/p5/p6 有 0，或一直在跳）')
+
+
 class ArmLink:
     """把 `ArmIO` 包成 `grasp.Link`：**每一次 spin 都必须很轻**，绝不等臂到位。"""
 
@@ -124,6 +148,7 @@ class ArmLink:
         self.hz = hz
         self.n = 0                   # 已发观测条数
         self.miss = 0                # 投影失败（点跑到相机后面）的拍数
+        self._last = None            # 上一拍**可信**的回读（见 fb() 的闩锁）
 
     def now(self):
         return time.monotonic()
@@ -137,11 +162,19 @@ class ArmLink:
             time.sleep(rest)
 
     def fb(self):
-        return self.io.fb
+        """本拍回读；**该拍没读到（p3/p4/p5 有 0）就用上一拍好的**。
+
+        不这么做的话：实测 1/3 的帧会把 0 当关节角喂给几何（算出爪尖 z=22.6cm，且不报错）。
+        闩锁只让姿态陈旧一点点（10Hz 下最坏 100ms），比喂垃圾安全得多。
+        """
+        fbf = self.io.fb
+        if fbf is not None and len(fbf) >= 6 and all(fbf[i] != 0.0 for i in (2, 3, 4)):
+            self._last = [float(v) for v in fbf]
+        return self._last
 
     def obs(self):
         """模型相机这一刻的观测；`None` = 这拍没有观测（`run()` 按丢观测处理）。"""
-        fbf = self.io.fb
+        fbf = self.fb()
         if fbf is None:
             return None
         try:
@@ -370,7 +403,7 @@ def main(argv=None):
     try:
         io = collect.ArmIO()
         io.wait_feedback()
-        fb = list(io.fb)
+        fb = _stable_fb(io)      # 起手必须读**可信**的一帧（实测 1/3 概率有 0）
         j = from_fields(fb)
         print('\n当前回读 field=[%s]' % _fmt_fields(fb))
         print('当前爪尖 (%.4f, %.4f, %.4f) m' % grasp.tip_open_m(j))
