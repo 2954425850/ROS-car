@@ -384,12 +384,15 @@ def run(cfg, link, phase='aim', log=print):
         """
         nonlocal cur, near, stall, best, phase_ticks, hold_j, j_ref, s_cmd
         nonlocal close_cmd, close_stuck, p1_prev, p1_start, close_armed, comps
-        rep['phases'].append((cur, reason))
+        # 第三项 = 本相走了几拍。**量"时间花在哪一相"全靠它**（47s 里到底是接近慢、
+        # 下扎慢、还是合爪慢，不量就只能猜）。放最后一位，读 `p[0]/p[1]` 的调用方不受影响。
+        rep['phases'].append((cur, reason, phase_ticks))
         k = seq.index(cur) + 1
         if k >= len(seq):
             rep['stopped'] = reason
             return False
-        log('  [%s] 完成：%s  ⇒ 进入 [%s]' % (cur, reason, seq[k]))
+        log('  [%s] 完成：%s  （本相 %d 拍 = %.1fs） ⇒ 进入 [%s]'
+            % (cur, reason, phase_ticks, phase_ticks / cfg.hz, seq[k]))
         if (cur == 'aim' and seq[k] == 'descend' and cfg.joint_comp > 0.0
                 and f_now is not None and f_tgt is not None):
             # 臂已经停稳（[aim] 刚报完到位）⇒ (纯目标 − 回读) 就是位置环下垂。量一次、带到底。

@@ -461,7 +461,7 @@ def _aim_final_err(comp):
 def _descend_err(rep):
     """[descend] 收尾时"爪尖离目标"的 mm 数（从理由字符串里取，不另加字段）。"""
     import re
-    for ph, why in rep['phases']:
+    for ph, why, _n in rep['phases']:
         if ph == 'descend':
             return float(re.search(r'爪尖离目标 ([\d.]+)mm', why).group(1)) / 1000.0
     raise AssertionError(rep['phases'])
