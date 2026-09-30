@@ -67,3 +67,26 @@ ROS 工作区需要用 `rosdep`/`colcon` 在 `raspot_ws` / `l150pro_ws` 下构�
 git add -f pi/raspot_ws/src/arm_grasp/docs/samples-2026xxxx-xxxxxx.json
 git commit -m "data: <这次测了什么>"
 ```
+
+## Pi 上的目录其实是软链（2026-09-30 起）
+
+Pi 的 `~` 下这些**是指向本仓库的符号链接**，不是独立副本：
+
+```
+~/raspot_ws      -> ~/ROS-car/pi/raspot_ws
+~/l150pro_ws     -> ~/ROS-car/pi/l150pro_ws
+~/k230-vision    -> ~/ROS-car/pi/k230-vision
+~/voice-chatbot  -> ~/ROS-car/pi/voice-chatbot
+teleop_l150pro.py / servo_ctl.py / acc_driver.py / joint_traj.py /
+_arm_probe.py / l150pro_start_*.sh / k230_camera.sh
+                 -> ~/ROS-car/pi/scripts/<同名>
+```
+
+**为什么**：`.bashrc`、约 19 个 `arm_grasp/tools/*.py`、26 个 `k230-vision/pi/*.py`、
+语音助手配置里的 `k230ctl` 路径……加起来约 60 处硬编码了老路径。改名 + 软链一次全保住。
+
+所以 `cd ~/raspot_ws` 和 `cd ~/ROS-car/pi/raspot_ws` **是同一个地方**，改哪个都一样。
+
+`~/old-20260930/` 是一次改名归档的旧副本，**没有任何东西引用它，不要编辑**。
+
+回退（任一目录）：`rm ~/raspot_ws && mv ~/old-20260930/raspot_ws ~/raspot_ws`
