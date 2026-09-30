@@ -94,7 +94,8 @@ def parse_box(s):
     return parts
 
 
-def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None):
+def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
+              joint_comp=None):
     """把 CLI 参数装进 `GraspConfig`。**`--h` 必须真的进 `z_plane_m`**（自检里有闸）。"""
     kw = {'z_plane_m': float(h_m)}
     if max_step is not None:
@@ -103,6 +104,8 @@ def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None):
         kw['patience'] = int(patience)
     if alpha0 is not None:
         kw['alpha0'] = float(alpha0)
+    if joint_comp is not None:
+        kw['joint_comp'] = float(joint_comp)
     cfg = grasp.GraspConfig(**kw)
     if max_seconds is not None:
         cfg = cfg._replace(max_seconds=float(max_seconds))
@@ -301,6 +304,9 @@ def main(argv=None):
                          '中心、`span` 当半径去搜，第一拍的中心就是 α0 ⇒ α0 错了、'
                          '真解又在窗外，第一拍就 refuse（臂一步不动）。'
                          '目标越低越远，需要的 α 越陡：桌面(−12.6cm)、半径 17.8cm 时要 −73°…−88°。')
+    ap.add_argument('--joint-comp', type=float, default=None,
+                    help='肩/肘/腕位置环下垂补偿增益（默认 1.0；**0 = 关掉**）。'
+                         'A/B 用：第 2 跑（无它）下扎通、第 4~6 跑（有它）下扎卡住。')
     args = ap.parse_args(argv)
 
     if args.selftest:
@@ -316,7 +322,7 @@ def main(argv=None):
         return 2
 
     cfg = build_cfg(args.h, max_step=args.max_step, patience=args.patience,
-                    alpha0=args.alpha0,
+                    alpha0=args.alpha0, joint_comp=args.joint_comp,
                     max_seconds=args.max_seconds)
     print('框 box=%s（归一化）  目标面高 h=%.4f m（%.1f mm）→ cfg.z_plane_m'
           % (want, args.h, args.h * 1000))
