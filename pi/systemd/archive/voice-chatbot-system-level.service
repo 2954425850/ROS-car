@@ -1,0 +1,26 @@
+[Unit]
+Description=JARVIS Voice Chatbot (语音助手)
+Documentation=file:///home/cy/voice-chatbot/README.md
+# 需要网络（ASR/LLM/TTS 都是云服务）和声卡就绪
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cy
+WorkingDirectory=/home/cy/voice-chatbot
+ExecStart=/usr/bin/python3 main.py
+
+# 崩溃自动重启。串口没插/权限不对时 main.py 会 exit 1，这里会每 10 秒重试一次，
+# 日志里能看到具体原因（journalctl -u voice-chatbot -e）。
+Restart=on-failure
+RestartSec=10
+
+# 让 Python 输出不经过缓冲，journalctl 才能实时看到日志
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
