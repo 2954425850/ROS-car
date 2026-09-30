@@ -290,3 +290,23 @@ def test_loop_rejects_noisy_observations():
     assert rep['obs_bad'] > 0, rep['obs_bad']
     assert rep['O_last'] is not None                    # 仍然锁在目标附近，不是崩
     assert math.dist(rep['O_last'], CAP) < 0.10
+
+
+def test_loop_tolerates_start_below_field_floor():
+    """★ 实机开场姿态**就在界外**：判据必须查"目标"，指令夹到界内。
+
+    2026-09-30 在 Pi 上只读读到的开机姿态：
+        feedback = [240, 497, 175, **121**, 409, -11]   ← p4=121 **在固件下限 125 之下**
+    （肘关节歇在机械限位上）。这时第一拍的限速指令（p4≈123）必然也在界外 ——
+    若判据查的是**这一拍的指令**，整条链会在第一拍就 `refuse：目标 field 出界`，**臂永远动不了**。
+    假臂测试里的起手姿态永远是合法的，所以抓不到这件事；这条用例就是补这个缺口。
+    判据改成查**目标**的 field + 指令夹进 [125,875] 之后：能正常起步、且发出去的值永远在界内。
+    """
+    cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300)
+    FB_REST = [240.0, 497.0, 175.0, 121.0, 409.0, -11.0]   # 实机开机读数
+    plant = Plant(from_fields(FB_REST))
+    link = FakeLink(plant, CAP)
+    rep = grasp.run(cfg, link, phase='aim', log=lambda *a: None)
+    assert not (rep['stopped'] or '').startswith('refuse'), rep['stopped']
+    assert all(125.0 <= v <= 875.0 for v in link.pub[2:5])  # 发出去的值永远在界内
+    assert rep['ticks'] >= 3

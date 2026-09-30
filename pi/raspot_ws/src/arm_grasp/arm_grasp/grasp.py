@@ -342,10 +342,18 @@ def run(cfg, link, phase='aim', log=print):
         err_act = math.dist(tip_act, T_goal)
         s_ach = standoff_along_axis(tip_act, est.O, tgt.alpha)
         j_cmd, ratio, reached = limit_step(j_cur, tgt.joints, cfg.max_step_deg)
-        fields = to_fields(j_cmd, cfg.gripper, cfg.wrist_roll)
-        if not all(FIELD_LO <= v <= FIELD_HI for v in fields[2:5]):
-            rep['stopped'] = 'refuse：目标 field 出界 %s' % ['%.0f' % v for v in fields[2:5]]
+        # ★★ 判据查的是**目标**的 field，不是这一拍的**指令**：
+        #   实机开场姿态可能是"歇在机械限位上"的 —— 2026-09-30 实测开机 p4=121，**在固件下限 125 之下**，
+        #   于是第一拍的限速指令必然也在界外。拿指令当判据 ⇒ 整条链在第一拍就 refuse（永远动不了）。
+        #   界外的**指令**直接夹进 [125,875] 再发：固件本来就会夹，我们先夹一遍是为了
+        #   让自己发出去的值与后续回读一致（否则白挨一次"目标 field 出界"）。
+        f_tgt = to_fields(tgt.joints, cfg.gripper, cfg.wrist_roll)
+        if not all(FIELD_LO <= v <= FIELD_HI for v in f_tgt[2:5]):
+            rep['stopped'] = 'refuse：目标 field 出界 %s' % ['%.0f' % v for v in f_tgt[2:5]]
             break
+        fields = to_fields(j_cmd, cfg.gripper, cfg.wrist_roll)
+        for i in (2, 3, 4):                    # 只夹 p3/p4/p5；p1/p2(夹爪/自转)、p6(底座 ±1000) 原样带过
+            fields[i] = min(FIELD_HI, max(FIELD_LO, fields[i]))
         if j_ref is not None:
             dmax = max(abs(fields[k] - j_ref[k]) for k in range(6))
             rep['max_step_deg_actual'] = max(rep['max_step_deg_actual'], dmax / 4.1667)
