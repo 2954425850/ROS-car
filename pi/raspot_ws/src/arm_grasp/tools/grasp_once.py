@@ -94,13 +94,15 @@ def parse_box(s):
     return parts
 
 
-def build_cfg(h_m, max_step=None, patience=None, max_seconds=None):
+def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None):
     """把 CLI 参数装进 `GraspConfig`。**`--h` 必须真的进 `z_plane_m`**（自检里有闸）。"""
     kw = {'z_plane_m': float(h_m)}
     if max_step is not None:
         kw['max_step_deg'] = float(max_step)
     if patience is not None:
         kw['patience'] = int(patience)
+    if alpha0 is not None:
+        kw['alpha0'] = float(alpha0)
     cfg = grasp.GraspConfig(**kw)
     if max_seconds is not None:
         cfg = cfg._replace(max_seconds=float(max_seconds))
@@ -205,6 +207,19 @@ def selftest():
         print('  ✗ 默认高度没进 cfg')
         ok = False
 
+    # ②b ★ 变异闸：--alpha0 必须真的进 cfg.alpha0（把它从 kw 里删掉 ⇒ 这一条立刻变红）
+    #     ⚠️ 不传时必须**原样保留 GraspConfig 的默认**（别顺手写成硬编码的 −84）。
+    print('\n②b --alpha0 → cfg.alpha0（不传 = 保留默认，这一条会红）：')
+    for a in (-84.0, -70.0, -88.0):
+        c = build_cfg(DEFAULT_H_M, alpha0=a)
+        tag = '✓' if c.alpha0 == a else '✗'
+        if tag == '✗':
+            ok = False
+        print('  %s build_cfg(alpha0=%.0f).alpha0 = %.1f' % (tag, a, c.alpha0))
+    if build_cfg(DEFAULT_H_M).alpha0 != grasp.GraspConfig().alpha0:
+        print('  ✗ 不传 --alpha0 时没有保留 GraspConfig 的默认值')
+        ok = False
+
     # ③ 名义点上跑 S0（打印**原文**，断言不抛异常）
     print('\n③ 名义点 S0（grasp.plan_verdict 原文）：')
     cfg = build_cfg(DEFAULT_H_M)
@@ -280,6 +295,12 @@ def main(argv=None):
                     help='arm_t_ms：每条 0xAC 的移动时长（默认 100 ≈ 10Hz 一拍）')
     ap.add_argument('--max-seconds', type=float, default=None,
                     help='覆盖 cfg.max_seconds（默认 40）')
+    ap.add_argument('--alpha0', type=float, default=None,
+                    help='覆盖 cfg.alpha0（下扎轴角的**搜索种子**，默认 −58°）。'
+                         '**α0 不是"选哪个 α"，是"从哪开始搜"**：每拍每相位都拿 `prev_alpha` 当'
+                         '中心、`span` 当半径去搜，第一拍的中心就是 α0 ⇒ α0 错了、'
+                         '真解又在窗外，第一拍就 refuse（臂一步不动）。'
+                         '目标越低越远，需要的 α 越陡：桌面(−12.6cm)、半径 17.8cm 时要 −73°…−88°。')
     args = ap.parse_args(argv)
 
     if args.selftest:
@@ -295,6 +316,7 @@ def main(argv=None):
         return 2
 
     cfg = build_cfg(args.h, max_step=args.max_step, patience=args.patience,
+                    alpha0=args.alpha0,
                     max_seconds=args.max_seconds)
     print('框 box=%s（归一化）  目标面高 h=%.4f m（%.1f mm）→ cfg.z_plane_m'
           % (want, args.h, args.h * 1000))
