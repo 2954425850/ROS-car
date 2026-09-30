@@ -160,6 +160,7 @@ class FakeLink:
         self.t = 0.0
         self.pub = None
         self.pub_n = 0
+        self.pubs = []      # 每一拍发出去的 field 都记下来（变异自检要查**全部**，不是最后一条）
         self.noise = noise_px
         self.cut_after = cut_after
         self.rng = __import__('random').Random(seed)
@@ -190,6 +191,7 @@ class FakeLink:
 
     def publish(self, fields):
         self.pub = list(fields)
+        self.pubs.append(list(fields))
         self.pub_n += 1
         self.p.j = from_fields(fields)                # 用 arm_kin 的，不要绕 grasp
         self.p.step(self.p.j, 1.0 / self.hz)
@@ -302,11 +304,15 @@ def test_loop_tolerates_start_below_field_floor():
     假臂测试里的起手姿态永远是合法的，所以抓不到这件事；这条用例就是补这个缺口。
     判据改成查**目标**的 field + 指令夹进 [125,875] 之后：能正常起步、且发出去的值永远在界内。
     """
-    cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300)
+    # ⚠️ `max_step_deg=0.5` 是**必须的**，不是为了慢：肘关节离目标 27°，每拍 1.5°(6.25 count) 时
+    #   第一拍 p4 就已经 127 > 125（界内）⇒ 夹取那条路根本走不到，**变异也不会红**
+    #   （第一版就是 1.5，实测变异照绿）。用 0.5°/拍（2.08 count，与 T6 慢速真跑一致）
+    #   第一拍 p4≈123.08 < 125 ⇒ 才真的覆盖到夹取。
+    cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300, max_step_deg=0.5)
     FB_REST = [240.0, 497.0, 175.0, 121.0, 409.0, -11.0]   # 实机开机读数
     plant = Plant(from_fields(FB_REST))
     link = FakeLink(plant, CAP)
     rep = grasp.run(cfg, link, phase='aim', log=lambda *a: None)
     assert not (rep['stopped'] or '').startswith('refuse'), rep['stopped']
-    assert all(125.0 <= v <= 875.0 for v in link.pub[2:5])  # 发出去的值永远在界内
+    assert all(125.0 <= v <= 875.0 for f in link.pubs for v in f[2:5])  # **每一拍**都在界内
     assert rep['ticks'] >= 3

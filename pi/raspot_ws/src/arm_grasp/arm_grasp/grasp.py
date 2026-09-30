@@ -347,6 +347,7 @@ def run(cfg, link, phase='aim', log=print):
         #   于是第一拍的限速指令必然也在界外。拿指令当判据 ⇒ 整条链在第一拍就 refuse（永远动不了）。
         #   界外的**指令**直接夹进 [125,875] 再发：固件本来就会夹，我们先夹一遍是为了
         #   让自己发出去的值与后续回读一致（否则白挨一次"目标 field 出界"）。
+        # （`pick_target` 已保证候选 field 在界内 ⇒ 下面这条正常**永不触发**，留着当不变式断言）
         f_tgt = to_fields(tgt.joints, cfg.gripper, cfg.wrist_roll)
         if not all(FIELD_LO <= v <= FIELD_HI for v in f_tgt[2:5]):
             rep['stopped'] = 'refuse：目标 field 出界 %s' % ['%.0f' % v for v in f_tgt[2:5]]
