@@ -86,16 +86,45 @@ class Camera:
         self.width = ALIGN_UP(width, 16)
         self.height = height
         self.sensor = None
-        self._chans = {}          # chn -> {"enc": Encoder, "link": ..., "bitrate": int}
+        self._chans = {}          # chn -> {"enc", "link", "bitrate", "gop"}
         self._started = False
         self._ai = None           # (w, h) 或 None：chn2 给 KPU 的 AI 帧
 
     # ---- 配置 ----
-    def add_channel(self, chn, bitrate_kbps=2048):
-        """登记一个编码通道。必须在 start() 之前调用。"""
+    def add_channel(self, chn, bitrate_kbps=2048, gop=None):
+        """登记一个编码通道。必须在 start() 之前调用。
+
+        chn          VENC 通道号（本平台共 4 个，`VENC_MAX_CHN_NUMS=4`）
+        bitrate_kbps 每帧码率预算，**不是硬上限**（总码率 ≈ bit_rate × 实际fps / SENSOR_FPS）
+        gop          IDR 间隔（帧）。None = 跟 `config.GOP`。
+
+        `gop` 管的是**"出画时间"，不是稳态延迟**：新客户端接入、或丢包之后要重新出画，
+        最坏等一个 GOP（25@30fps ⇒ 833 ms；5 ⇒ 167 ms）。实测首帧耗时 ≈ 0.34~0.61 s，
+        与 GOP=25 的预期（833 ms 内随机接入）相符 —— 2026-10-01 在板上量的。
+        **稳态端到端延迟与它无关**，那由客户端缓冲决定。
+
+        ⚠️ **这里没有 width/height 参数 —— 是有意的，不是漏了。**
+
+        现在**所有 VENC 通道都挂在 sensor 根上**（`bind_info()["src"]`），
+        所以它们**必然同分辨率**（= `Camera(width, height)`）。想给某一路单独降分辨率，
+        缺的不是一个参数，而是一条**本平台从未验证过的链接路径**：
+
+            1. 在 sensor 的**子通道**上单独 `set_framesize`（如 `chn=CAM_CHN_ID_1`）
+            2. 拿**那个子通道**的 src（**不是根**的），再把 VENC 挂上去
+
+        全仓库（含所有 `t_*.py` 探针）**没有一处**这么做过：一直是 `bind_info()["src"]`
+        取根。而媒体层配错的代价是**卡死到必须断电**（见 README §7.4），所以这条路径
+        **要单独在板子上验过再写进来**，不能顺手塞进生产路径。
+
+        资源上其实有空间（2026-10-01 核对）：**sensor 侧根+chn2 只用了 2 个**
+        （chn1 一直没配过、空着），**VENC 侧 0/1 用了 2 个、2 和 3 空着**。
+        —— 规划书里"Sensor 通道已满 3/3"那句是**按 3 个 VENC 通道算的，不对**。
+        """
         if self._started:
             raise RuntimeError("add_channel 必须在 start() 之前调用")
-        self._chans[chn] = {"enc": None, "link": None, "bitrate": bitrate_kbps}
+        self._chans[chn] = {"enc": None, "link": None,
+                            "bitrate": bitrate_kbps,
+                            "gop": config.GOP if gop is None else gop}
 
     def add_ai_channel(self, width, height):
         """登记 chn2（RGBP888）给 KPU 做 AI 帧。必须在 start() 之前调用。
@@ -164,9 +193,9 @@ class Camera:
             # src 必须等于 sensor 真实档位：它既是丢帧判据，也是码率预算的除数。
             attr.src_frame_rate = config.SENSOR_FPS
             attr.dst_frame_rate = config.FPS
-            attr.gop_len = config.GOP
+            attr.gop_len = c["gop"]        # 逐通道（默认取自 config.GOP，见 add_channel）
             print("VENC chn=%s src=%s dst=%s gop=%s bitrate=%s kbps"
-                  % (chn, config.SENSOR_FPS, config.FPS, config.GOP, c["bitrate"]))
+                  % (chn, config.SENSOR_FPS, config.FPS, c["gop"], c["bitrate"]))
             enc.Create(chn, attr)
             c["enc"] = enc
 

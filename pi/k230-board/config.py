@@ -22,7 +22,9 @@
 WIFI_SSID = "REPLACE_ME"
 WIFI_PASS = "REPLACE_ME"
 
-# 云端推流目标（先用 Pi 做验证，云端就绪后改成云端公网 IP）
+# 主动推流目标（裸 H.264 over TCP）。
+# ⚠️ 这条注释里的"云端"是**历史遗留** —— 它其实一直推给局域网里的一台机器，
+#    **从没真的上过公网**。2026-10-01 核对过，没改名是为了不动配置键。
 PUSH_HOST = "REPLACE_ME"
 PUSH_PORT = 8555
 
@@ -30,10 +32,60 @@ PUSH_PORT = 8555
 RESULT_HOST = "REPLACE_ME"
 RESULT_PORT = 8556
 
-# 云端结果上报目标。**云端未就绪，留空串表示不启用**。
-# 主循环里用 `if config.CLOUD_RESULT_HOST:` 判断 —— 绝不让本地（Pi）路径因此失败。
-CLOUD_RESULT_HOST = ""
-CLOUD_RESULT_PORT = 8556
+# ---- 云端结果上报：**整条路已删除**（2026-10-01）----
+# 原来这里有一对 CLOUD_RESULT_HOST / CLOUD_RESULT_PORT，走"结果也往公网发一份"。
+# 删掉的理由（决策见 `规划` 文档"不建议的方向"第 1 条）：
+#   1. 小车没有远程操作需求，公网那一路**实际没人在用**；
+#   2. **连不上会拖主循环** —— 2026-09-28 就是因此把它设成空串关掉的，
+#      留着"能开但一开就卡"的开关，比删掉更危险；
+#   3. 省一个常驻 socket。
+# 8556（本地 Pi）现在是**唯一**的结果上报路径。
+# 将来真要恢复云端：`reporter.Reporter` 本身是通用的 NDJSON TCP 客户端，
+# 在主循环里再造一个实例 + `if not r.ok: r.connect()` 就行（照抄 r_obs 那段）。
+
+# ---- 避障数据（8559）：**视觉给雷达补盲区** ----
+#
+# 10 Hz 把检测结果编成「障碍物列表 + 可通行区间」推给 Pi。
+# **与视频通道完全无关** —— 数据全部来自 chn2 的 KPU 推理结果（`objs`），
+# 所以通道怎么分工（RTSP 几路、多少分辨率）都不影响这一路。
+#
+# 为什么单独开一个端口，而不是并进 8556：
+# 8556 是**通用**检测结果（谁都能用，语义就是"这一帧有什么"）；
+# 8559 是**避障语义**（远近档、优先级、可通行区间），只有路径规划关心。
+# 两者演进节奏不同，混在一起以后互相牵扯。
+OBSTACLE_ENABLE = True
+OBSTACLE_HOST = None        # None = 与 RESULT_HOST 同一台（Pi）。通常不用改。
+OBSTACLE_PORT = 8559
+
+# 远近粗估：**单目没有真实距离**，这里只用「框高占画面的比例」粗分三档。
+# ⚠️ 摄像头是**眼在手上**（机械臂末端），换算成米没有意义 ——
+#    所以这里刻意**不给米**，只给 near/mid/far。真距离由 Pi 侧的雷达给，
+#    视觉负责的是"那是个什么东西"和"它挡在哪"（雷达扫不清的正是这些）。
+#
+# 判据 = 框高比（box 高 ÷ 画面高）：
+#     h_ratio >= NEAR_HI -> "near" ;  >= MID_HI -> "mid" ; 否则 "far"
+# 这两个数是**暂定的**，得用实车数据调 —— 先别当成标定过的阈值用。
+OBSTACLE_NEAR_HI = 0.45
+OBSTACLE_MID_HI = 0.18
+
+# 优先级：**安全相关的类别不能只按"框大不大"排。**
+#   high = 人 —— 无论远近都先避开（它随时会动）
+#   low  = 可以试着推开的软目标（椅子/箱子这类）
+#   其余 = mid
+OBSTACLE_PRIO_HIGH = ("person",)
+OBSTACLE_PRIO_LOW = ("chair", "couch", "potted plant", "suitcase", "backpack",
+                     "bench", "bottle", "cup", "vase", "teddy bear")
+
+# 「可通行区间」free_zones：把画面横向等分成 OBSTACLE_ZONES 格，
+# 只把 **框底压到画面下部**（= 挡在近处地面上）的障碍物算作占格，
+# 剩下的连续空格合并成区间发出去。
+# ⚠️ 这是个**粗糙的代理量**，不是"可通行区域"的真值：
+#    远处的地面在画面里是"上边那一半"，框底压不到下部 ⇒ 会被当成不挡路。
+#    Pi 侧**不要把 free_zones 当结论用**，它只是个便宜的初筛。
+OBSTACLE_ZONES = 10
+OBSTACLE_ZONE_BOTTOM_MIN = 0.80   # 框底 b >= 这个值才算"挡在近处"
+OBSTACLE_ZONE_H_MIN = 0.10        # 框高比低于此 = 远处小目标，不占格
+
 
 # 视频规格
 WIDTH = 1280
@@ -47,9 +99,13 @@ FPS = 25                 # 目标帧率，走 VENC 的 dst_frame_rate
 # 所以实际输出帧率就等于 sensor 档位，25fps 拿不到。
 SENSOR_FPS = 30
 BITRATE_KBPS = 2048      # 每帧预算，非硬上限；总码率 ≈ bit_rate × 实际fps / SENSOR_FPS
-GOP = 25                 # 1 秒，任何损伤 1 秒内自愈
-PUSH_CHN = 0             # chn0 -> 推云端
-RTSP_CHN = 1             # chn1 -> 局域网给 Pi
+GOP = 25                 # 1 秒，任何损伤 1 秒内自愈。**逐通道可覆盖**：cam.add_channel(gop=)
+# ⚠️ 下面两个是 **VENC 通道号**，**不是 sensor 通道号**（这两套编号是独立的）。
+#    现在两条都挂在 sensor **根**上，所以分辨率**必然相同**（= WIDTH×HEIGHT）。
+#    想单独降某一路的分辨率，缺的不是参数而是一条未验证的链接路径 ——
+#    见 cam.py 的 add_channel() 文档，别照着"加个 width"想当然。
+PUSH_CHN = 0             # VENC0 -> 主动推到 PUSH_HOST
+RTSP_CHN = 1             # VENC1 -> 局域网 RTSP，任何设备可直拉
 RTSP_PORT = 8554
 RTSP_SESSION = "k230"
 

@@ -80,7 +80,32 @@ MicroPython 的 _thread 在这块板子上与 MPP 的配合没验证过，**不�
 那是 K230 自己的事。
 
 **任一条外部命令都会关掉"检测器自动锁定"**（`det_auto = False`）：人来指定就是命令，
-不能被下一帧的检测器覆盖掉。目前**没有"切回检测器驱动"的命令**，要回去只能重启。
+不能被下一帧的检测器覆盖掉。`{"cmd": "auto"}` 可以切回检测器驱动
+（2026-09-19 加的；在那之前只能重启，这句注释当时写的就是"没有切回来的命令"，已过期）。
+
+## 避障数据：给雷达补盲区（8559）
+
+`obstacles.py` 每 10 Hz 把**这一帧的检测结果**编成「障碍物语义」推给 Pi：
+
+    {"ts": <epoch_ms>, "frame": <n>,
+     "obstacles": [{"type":"chair", "score":0.71, "box":[l,t,r,b],
+                    "h_ratio":0.32, "depth_zone":"mid", "priority":"low"}, ...],
+     "free_zones": [[0.0, 0.2], [0.6, 1.0]]}
+
+**只发雷达给不了的三样**：是什么（`type`）、挡在哪（`box`）、有多挡路
+（`depth_zone` / `priority` / `free_zones`）。**刻意不发距离** —— 单目没有距离，
+而且相机是**眼在手上**（机械臂末端），换算成米在本架构下没有意义。
+真距离由 Pi 侧的雷达给，两边在 Pi 上融合。
+
+三个必须记住的边界（理由详见 `obstacles.py` 文件头）：
+  1. `depth_zone` 是"框占画面多大"的粗分档，**不是测距**；
+  2. `free_zones` 是**粗糙代理量**不是可通行区域真值 —— 远处地面障碍会被当成不挡路，
+     Pi 侧不要拿它当结论；
+  3. **喂进去的是 `objs`，不含跟踪目标 `t_objs`** —— 跟踪目标是要抓/要跟的**目的物**，
+     不是要避开的障碍物，混进去会把规划器带偏。
+
+**云端结果上报那条路已整条删除**（2026-10-01）—— 理由见 `config.py` 里那段注释。
+8556（本地 Pi）是唯一的结果上报路径。
 
 ## 人脸：谁在场
 
@@ -146,6 +171,7 @@ from pusher import Pusher
 from rtsp_srv import RtspOut
 from results import encode, normalize
 from reporter import Reporter
+import obstacles
 from vision import Detector
 from tracker import Tracker
 from targets import (TargetRx, template_crop_side as tside,
@@ -155,6 +181,24 @@ from watchdog import Watchdog
 
 INFER_HZ = 10.0                 # 推理 + 上报节拍（计划两块都是 0.1 s）
 STATS_MS = 30000                # 30 s 一行 STATS，给长稳测试留证据
+
+
+def _obstacles_payload(objs, frame_no, ts_ms):
+    """检测结果 -> 8559 那一行 JSON。
+
+    组装放在这里（不放进 obstacles.py）是为了让那边**保持纯函数、不依赖 config** ——
+    纯函数才能脱离网络和硬件单独测（同 targets.py 的分法）。阈值全部从 config 传进去。
+    """
+    near_hi = config.OBSTACLE_NEAR_HI
+    mid_hi = config.OBSTACLE_MID_HI
+    zones = config.OBSTACLE_ZONES
+    bottom_min = config.OBSTACLE_ZONE_BOTTOM_MIN
+    h_min = config.OBSTACLE_ZONE_H_MIN
+    obs = obstacles.build(objs, near_hi, mid_hi,
+                          config.OBSTACLE_PRIO_HIGH, config.OBSTACLE_PRIO_LOW,
+                          zones, bottom_min, h_min)
+    free = obstacles.free_zones(objs, zones, bottom_min, h_min)
+    return obstacles.encode(obs, free, frame_no, ts_ms)
 
 
 def main():
@@ -252,15 +296,17 @@ def main():
     print("REPORTER connect=%s %s:%s" % (r_pi.connect(),
                                          config.RESULT_HOST, config.RESULT_PORT))
 
-    # 云端未就绪（CLOUD_RESULT_HOST 为空串）=> 不启用，**本地路径不因此失败**
-    r_cloud = None
-    if config.CLOUD_RESULT_HOST:
-        r_cloud = Reporter(config.CLOUD_RESULT_HOST, config.CLOUD_RESULT_PORT)
-        print("CLOUD connect=%s %s:%s" % (r_cloud.connect(),
-                                          config.CLOUD_RESULT_HOST,
-                                          config.CLOUD_RESULT_PORT))
+    # 避障数据（8559）：给 Pi 侧的"视觉补雷达盲区"。默认与 RESULT_HOST 同一台。
+    # ⚠️ 连不上**不能拖主循环** —— Reporter 本身是非阻塞的（发不出去就丢掉这一条，
+    #    绝不排队），所以和 8556 一样：对面不在，只是丢数据，推理节拍不受影响。
+    r_obs = None
+    if config.OBSTACLE_ENABLE:
+        obs_host = config.OBSTACLE_HOST or config.RESULT_HOST
+        r_obs = Reporter(obs_host, config.OBSTACLE_PORT)
+        print("OBSTACLE connect=%s %s:%s" % (r_obs.connect(),
+                                             obs_host, config.OBSTACLE_PORT))
     else:
-        print("CLOUD disabled (CLOUD_RESULT_HOST empty) - local path unaffected")
+        print("OBSTACLE disabled (config.OBSTACLE_ENABLE=False)")
 
     wd = Watchdog(config.PUSH_STALL_WARN_MS)
     # 用回调而不是每轮 print：停滞期每轮打一行会把 30 min 的日志刷爆
@@ -525,16 +571,22 @@ def main():
                     # **连续性现在交给跟踪器**，不再靠"保持上一帧"——那是两回事，不能混。
                     #
                     # w/h 用**推流**分辨率：前端拿归一化坐标 × 自己的显示尺寸
+                    ts_ms = int(time.time() * 1000)   # 平台限制：只有秒级精度（见文件头第 3 条）
                     payload = encode(objs + t_objs, config.WIDTH, config.HEIGHT,
-                                     frame_no, int(time.time() * 1000),
-                                     faces=fobjs)
+                                     frame_no, ts_ms, faces=fobjs)
                     if not r_pi.ok:
                         r_pi.connect()
                     r_pi.send(payload)
-                    if r_cloud is not None:
-                        if not r_cloud.ok:
-                            r_cloud.connect()
-                        r_cloud.send(payload)
+
+                    # ---- 避障数据（8559）：视觉给雷达补盲区 ----
+                    # ⚠️ 喂进去的是 **objs**，不是 `objs + t_objs`：
+                    #    跟踪器跟的是"人指定的那个目标"（要抓的桃、要跟随的人）——
+                    #    那是**目的物**，不是要避开的障碍物。混进障碍列表会把规划器带偏。
+                    #    理由见 obstacles.py 文件头第 3 条。
+                    if r_obs is not None:
+                        if not r_obs.ok:
+                            r_obs.connect()
+                        r_obs.send(_obstacles_payload(objs, frame_no, ts_ms))
                 else:
                     print("SNAPSHOT None")
                 gc.collect()
@@ -544,6 +596,7 @@ def main():
                 t_stats = now
                 print("STATS t=%ds frame=%d obj=%d sent=%d dropped=%d lost=%d "
                       "conns=%d rtsp=%d rtsp_empty=%d stall=%d report=%d/%d "
+                      "obs=%d/%d "
                       "trk=%d lock=%d rel=%d iou=%.2f tgt=%d/%d auto=%d "
                       "face=%d ok=%d known=%d add=%d err=%d mem=%d"
                       % (time.ticks_diff(now, t_start) // 1000, frame_no, obj_frames,
@@ -551,6 +604,8 @@ def main():
                          pusher.lost_events, pusher.connects,
                          rtsp.frames, rtsp.empty, wd.stalls,
                          r_pi.sent, r_pi.dropped,
+                         r_obs.sent if r_obs is not None else -1,
+                         r_obs.dropped if r_obs is not None else -1,
                          trk_frames, trk_locks, trk_releases, trk_iou,
                          rx.recv_ok, rx.recv_bad, 1 if det_auto else 0,
                          face_seen, face_ok, face_known, face_added, face_err,
@@ -569,6 +624,11 @@ def main():
             rtsp.stop()
         except Exception as e:
             print("app: rtsp.stop EXC", e)
+        try:
+            if r_obs is not None:
+                r_obs.close()
+        except Exception as e:
+            print("app: r_obs.close EXC", e)
         try:
             rx.close()
         except Exception as e:
