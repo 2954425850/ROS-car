@@ -28,3 +28,13 @@ logs/
 # ---- 大块原始数据 ----
 *.raw
 *.bin
+
+# ---- 工具产出：跑一次就变，不入库（否则工作区永远脏）----
+# 判据：这些目录是脚本"写"的，不是人"写"的。
+#   arm_grasp/docs/*.json  <- collect.py / geom_probe.py / jacobian.py 的实测数据
+#   raspot_ws/docs/shots/  <- rec_sample.py 拍的照
+#   k230-vision/*.png      <- fov_analyze.py / t_camcalib.py 画的图
+# 注意：同目录下的 *.md 是人写的文档，要入库；people.json 是配置，也要入库。
+pi/raspot_ws/src/**/docs/*.json
+pi/raspot_ws/docs/shots/*.jpg
+pi/k230-vision/*.png
