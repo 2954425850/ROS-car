@@ -125,3 +125,168 @@ def test_pick_target_breaks_slack_ties_toward_prefer_alpha():
     # —— 为了"每拍不换解"的连续性主动放弃 50 点余量（故意的：那条排序规则就是这么用的）。
     assert t.alpha == pytest.approx(-61.0)
     assert t.slack == pytest.approx(27.406628, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Task 5：流式主循环 + 估计器（M2）
+# ---------------------------------------------------------------------------
+from arm_grasp.arm_kin import from_fields, to_fields
+from arm_grasp.servo import ik_open_m
+
+
+class Plant:
+    """一台"真"臂：关节按速度上限追指令。模型即真值（模型误差另用参数注入）。"""
+
+    def __init__(self, j0, v_max_deg=20.0, tip_err_m=(0.0, 0.0, 0.0)):
+        self.j = dict(j0)
+        self.v = v_max_deg
+        self.tip_err = tip_err_m
+
+    def step(self, j_cmd, dt):
+        for k in self.j:
+            d = j_cmd[k] - self.j[k]
+            m = self.v * dt
+            self.j[k] += max(-m, min(m, d))
+
+
+class FakeLink:
+    """实现 Link 协议：假臂 + 用 geom 当"真"相机。"""
+
+    def __init__(self, plant, O_true, hz=10.0, noise_px=0.0, cut_after=None,
+                 seed=1):
+        self.p = plant
+        self.O = O_true
+        self.hz = hz
+        self.t = 0.0
+        self.pub = None
+        self.pub_n = 0
+        self.noise = noise_px
+        self.cut_after = cut_after
+        self.rng = __import__('random').Random(seed)
+
+    def now(self):
+        return self.t
+
+    def spin(self, dt):
+        self.t += dt
+
+    def fb(self):
+        return to_fields(self.p.j, 240.0, 496.0)
+
+    def obs(self):
+        if self.cut_after is not None and self.pub_n > self.cut_after:
+            return None
+        try:
+            u, v = geom.project(self.p.j, self.O)
+        except ValueError:
+            # ★ 相对计划原文补的一层：目标在**相机平面之后**时 `geom.project` 抛
+            #   ValueError，计划原文会让它从 `run()` 里直接冒出来（而不是"这一拍没观测"）。
+            #   真链路里"看不到"就是没有框 ⇒ 这里返回 None 才是对的语义。
+            return None
+        if self.noise:
+            u += self.rng.gauss(0, self.noise)
+            v += self.rng.gauss(0, self.noise)
+        return grasp.Obs(self.t, u, v, self.pub_n, 'track', None)
+
+    def publish(self, fields):
+        self.pub = list(fields)
+        self.pub_n += 1
+        self.p.j = from_fields(fields)                # 用 arm_kin 的，不要绕 grasp
+        self.p.step(self.p.j, 1.0 / self.hz)
+
+
+def _start_joints(s_m=0.10):
+    """起步姿态：**用几何反推**（目标上方 s），别手写坐标——手写的很可能不可达。"""
+    return grasp.pick_target(CAP, _cfg(), s_m, -58.0, _cfg().vis).joints
+
+
+# 「够不着」用的假目标点：计划原文写的是 `(0.0, 0.0, 3.0)`（车体上方 3m），
+# 但**这条和链路自相矛盾**，实测两点都对不上（2026-09-30 逐条跑出来）：
+#   ① `geom.project` 对它在起步姿态抛 `点在相机平面之后（Z = -2.3934）` ——
+#      相机是朝**下**看的，臂上方的点在光轴负侧 ⇒ 假相机根本生成不出这条观测；
+#   ② 更深一层：`estimate_point` 是**射线∩z_plane_m 平面**求 O 的，"平面之上"的点
+#      连 O 都产不出来（射线朝上 ⇒ 被 `d_z > -0.3` 挡掉），永远走不到 `pick_target` 的
+#      refuse 分支。**"够不着"必须是一个相机看得见（在相机下方、射线朝下）但臂解不出的点。**
+# 换成同一个平面 z=0.020 上、r=40cm 的点：project 正常（像素 (334, 12)）、
+# 射线 d_z=-0.546 够陡、`pick_target` 实测 refuse（r≥40cm 超出臂展）。
+UNREACHABLE = (0.0, -0.40, 0.020)
+
+
+def test_loop_converges_to_the_object():
+    """★ 物理判据（不是"循环自己说收敛了"）：**回读**关节算出的真爪尖到目标姿态点的距离。"""
+    cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300)
+    plant = Plant(_start_joints())
+    link = FakeLink(plant, CAP)
+    rep = grasp.run(cfg, link, phase='aim', log=lambda *a: None)
+    assert rep['stopped'], rep['stopped']
+    # ★ 相对计划原文加的一行（变异自检要求的）：**必须由"对准完成"这条判据退出**。
+    #   只断言"爪尖恰好停在目标附近"是不够的——把收敛判据的 tol 改成 −1（变异 3）之后，
+    #   循环会一直发到 stall/超时才退出，而**臂最后还是停在同一个地方** ⇒ 计划原文那几条
+    #   断言全绿（实测：变异 3 下仍然 13 passed）。判据坏没坏，只有它能自己说出来。
+    assert rep['ok'], rep['stopped']
+    T_want = grasp.axis_point(CAP, cfg.s_pre_m, rep['alpha'])
+    tip = grasp.tip_open_m(plant.j)
+    assert math.dist(tip, T_want) < 0.01                           # ≤1cm
+    assert grasp.standoff_along_axis(tip, CAP, rep['alpha']) == pytest.approx(
+        cfg.s_pre_m, abs=0.01)                                     # 确实停在目标上方 s
+    assert rep['max_step_deg_actual'] <= cfg.max_step_deg + 1e-6    # 限速真的生效
+
+
+def test_loop_descends_and_stops_shallow():
+    """下扎：实际余量必须压到 s_stop 以内（**按实际余量限速**压下去，不是按指令）。"""
+    cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300)
+    plant = Plant(_start_joints(s_m=0.05))
+    link = FakeLink(plant, CAP)
+    rep = grasp.run(cfg, link, phase='descend', log=lambda *a: None)
+    assert rep['ok'], rep['stopped']
+    # ★ 下界是相对计划原文加的：`s_ach` 是"爪尖**在目标上方**还有多远"，**必须是正的**
+    #   （= `standoff_along_axis` 那道符号）。计划原文只钉了上界 ⇒ 符号反了的时候
+    #   爪尖在目标**下方** 46mm 也能满足 `<= 0.004`，而且循环会在**第一拍**就报"扎到位"
+    #   ——这条测试照样绿。实测过：把 `standoff_along_axis` 的负号去掉后，只有加上这个
+    #   下界这条才会红。
+    assert 0.0 <= rep['s_ach_m'] <= cfg.s_stop_m + 0.001
+    assert grasp.tip_open_m(plant.j)[2] > CAP[2]        # 爪尖确实停在瓶盖**上方**
+    assert rep['ticks'] >= 5                            # 是"压下去"的，不是一拍就宣布到位
+
+
+def test_loop_holds_when_observation_dies():
+    """观测断了：必须**明确报出来**并保持住估计，而不是崩/继续乱走。
+
+    ★ `max_step_deg=0.3` 是相对计划原文加的一个覆盖，理由（实测出的，不是猜的）：
+      计划原文用默认 1.5°/拍、起手姿态 `_start_joints()`（离目标只有 2cm）⇒ 循环在
+      **第 5 拍**就"对准完成"退出，而观测正好在第 5 拍断掉、`obs_lost_s=1.0` 要 10 拍
+      才到期 ⇒ **"观测丢失"这条分支在默认参数下根本不可达**（这条测试当时红着，
+      `obs_lost=False`）。把接近速度放慢到 0.3°/拍（≈3°/s）后，走完这段要 ~25 拍，
+      观测在第 5 拍断、丢失计时器在第 15 拍到期 ⇒ 分支真的被走到（留 10 拍余量）。
+      物理上这也是更真实的一幕：**相机是在臂还在摆的中途掉的**，不是站定之后掉的。
+    """
+    cfg = _cfg()._replace(max_seconds=10.0, max_ticks=100, max_step_deg=0.3)
+    plant = Plant(_start_joints())
+    link = FakeLink(plant, CAP, cut_after=3)
+    rep = grasp.run(cfg, link, phase='aim', log=lambda *a: None)
+    assert rep['obs_lost'] is True                      # 明确报出来
+    assert rep['O_last'] is not None                    # 保持住估计，不是崩
+    assert '观测丢失' in rep['stopped']
+
+
+def test_loop_refuses_when_target_unreachable():
+    cfg = _cfg()._replace(max_seconds=5.0, max_ticks=50)
+    link = FakeLink(Plant(_start_joints()), UNREACHABLE)
+    rep = grasp.run(cfg, link, phase='aim', log=lambda *a: None)
+    assert rep['ok'] is False and 'refuse' in rep['stopped']
+
+
+def test_loop_rejects_noisy_observations():
+    """★ Step 4 变异 2 需要的用例（计划自己在变异列表里要求"把 noise_px 加到 20 再断言
+    `obs_bad > 0`"，但 Step 1 的代码块里**没有**这条测试）——门限必须真的在挡东西。
+
+    判据是 `obs_bad > 0`：20px 的噪声折到平面上 ≈ 2~3cm，超过 `gate_m=0.03` 的
+    抖动会被 `Est.update` 整条丢掉。把门限改成 `1e6` ⇒ 什么都不丢 ⇒ 这条红。
+    """
+    cfg = _cfg()._replace(hz=10.0, max_seconds=5.0, max_ticks=50)
+    plant = Plant(_start_joints())
+    link = FakeLink(plant, CAP, noise_px=20.0)
+    rep = grasp.run(cfg, link, phase='aim', log=lambda *a: None)
+    assert rep['obs_bad'] > 0, rep['obs_bad']
+    assert rep['O_last'] is not None                    # 仍然锁在目标附近，不是崩
+    assert math.dist(rep['O_last'], CAP) < 0.10
