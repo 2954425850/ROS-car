@@ -79,9 +79,11 @@ def main(argv=None):
             widths.append(w)
             classes.append(b.get('cls'))
             srcs.append(b.get('src'))
-            print('#%-5d %-12s src=%-5s box=[%.3f %.3f %.3f %.3f]  中心AI=(%5.1f,%5.1f)  宽%5.1fpx'
+            print('#%-5d %-12s src=%-5s box=[%.3f %.3f %.3f %.3f]  中心AI=(%5.1f,%5.1f)  '
+                  '宽%.2f(=AI %.0fpx / 根 %.0fpx)'
                   % (r['frame'], b.get('cls'), b.get('src'),
-                     b['box'][0], b['box'][1], b['box'][2], b['box'][3], u, v, w))
+                     b['box'][0], b['box'][1], b['box'][2], b['box'][3], u, v, w,
+                     w * 320.0, w * 1280.0))
             time.sleep(0.05)
     finally:
         pass
