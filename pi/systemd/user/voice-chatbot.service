@@ -1,0 +1,36 @@
+[Unit]
+Description=JARVIS Voice Chatbot (语音助手)
+Documentation=file:///home/cy/ROS-car/pi/voice-chatbot/README.md
+# 走 PipeWire（device_index: null → 系统默认设备），所以等 PipeWire 起来。
+# 用户级服务天然继承会话的 XDG_RUNTIME_DIR，不需要任何额外环境变量。
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/cy/ROS-car/pi/voice-chatbot
+# 用 run.sh 而不是直接跑 python3 —— 它会先 source ROS 2 的 setup.bash。
+# systemd 不加载 ROS 环境，而 CarController 需要 rclpy。
+ExecStart=/home/cy/ROS-car/pi/voice-chatbot/run.sh
+
+# 崩溃自动重启。走 PipeWire 后不再有独占冲突，所以这里的重试能自愈——
+# 不像直连 ALSA 那版，一旦被别的进程占住就永远起不来。
+Restart=on-failure
+RestartSec=10
+
+# 让 Python 输出不经过缓冲，journalctl 才能实时看到日志
+Environment=PYTHONUNBUFFERED=1
+
+# systemd 的默认 PATH 不含 ~/.local/bin，而 MCP server 装在
+# 那里（pip install --user）。不补这一行，qq-music-mcp 会
+# 「启动失败」并被静默跳过。
+Environment=PATH=/home/cy/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# ROS 2 的环境由 run.sh 负责 source，不在这里写 Environment=
+# （setup.bash 是 shell 脚本，Environment= 没法 source 它）。
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
