@@ -1,0 +1,767 @@
+"""Conversation manager — orchestrates the full voice chatbot pipeline.
+
+整条流水线仍然是**同步串行**的 —— 但**不再跑在唤醒监听线程上**。
+
+唤醒模块是硬件串口设备，它的监听线程读到唤醒帧就**内联**调回调。所以一次唤醒被
+`core/wake_handoff.py` 的 `WakeHandoff` 劈成两段：
+
+  快动作 `_wake_fast_action()`（停音乐、急停小车，几十~320ms）
+      留在监听线程上同步跑完 —— 「喊了就停」不经过 ASR / LLM，随时可用，
+      流水线正忙时也照样进得来。
+  慢流水线 `_run_pipeline()`（提示音 → LISTENING → THINKING → SPEAKING）
+      丢到 WakeHandoff 起的后台线程上，同一时刻最多一条。
+
+**为什么必须这样**：唤醒词走硬件串口。内联跑整条流水线 = 流水线期间唤醒词失灵 =
+急停失效（2026-09-17 实车踩过：「他在往前走的时候，喊他没用」），
+而 `look` 工具一次要 4~10 秒，绕不过去。
+
+**不变量（改动时请勿破坏）**：`WakeHandoff` 保证同一时刻只有一条流水线，所以状态机
+仍然只被**一条**线程驱动，`_on_enter_*` 回调不会并发；ASR / LLM / TTS 之间也依然
+没有并发，各阶段之间仍然不需要锁 —— 「同步串行」这条不变量**保住了**，
+被换掉的只是它**跑在哪条线程上**。
+
+一个例外：调工具前那句开场白（_say_before_tools）会在 THINKING 阶段
+就出声，不等 SPEAKING。串行性没有被破坏（仍然全部在那条流水线线程上同步执行），
+但「THINKING 阶段不出声」这个隐含前提不再成立 —— 之后改动 TTS / 音频链路时，
+要把「这段时间 Speaker 是忙的」算进去。
+"""
+
+import concurrent.futures
+import re
+import threading
+import time
+import wave
+from pathlib import Path
+from typing import Any
+
+from loguru import logger
+
+from audio.mic import Microphone
+from audio.speaker import Speaker
+from vad.recorder import VADRecorder
+from wakeword.engine import WakeWordEngine
+from speech.asr import ASRClient
+from speech.tts import TTSClient
+from llm.client import LLMClient, ToolCall
+from llm.context import ConversationContext
+from core.state_machine import StateMachine, ConversationState
+from core.wake_handoff import WakeHandoff
+from tools import ToolOutcome, build_default_registry
+from tools.music import MusicController, register_music_tools
+from tools.car import register_car_tools
+from car.controller import CarController
+from utils.config import Config
+from mcp_host import HostBridge, MCPHost
+
+# 项目根目录 —— 用来把 config 里的相对路径（提示音等）解析成绝对路径，
+# 这样从任何工作目录启动都不会找不到文件。
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# elicitation 取值失败的哨兵（用 object() 而不是 None —— None 是合法的用户答案）
+_ELICIT_INVALID = object()
+
+# 布尔值的口语判定。注意「否」的判据必须**先**匹配：中文里「不要」包含「要」，
+# 顺序反了会把「不要」读成 True。
+_ELICIT_YES = ("是", "对", "好", "要", "可以", "确定", "嗯", "yes", "ok")
+_ELICIT_NO = ("不", "否", "别", "取消", "no")
+
+# 中文数字。语音助手拿到的就是口语，用户会说「三天」「二十度」而不是「3」「20」——
+# ASR 有时做 ITN（把口语数字转成阿拉伯数字）有时不做，两条路都得能走。
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNITS = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+
+
+def _cn_to_int(text: str) -> int | None:
+    """把中文数字串转成整数：十五 → 15，二十三 → 23，一百 → 100。
+
+    整串必须都是中文数字/单位，否则返回 None（避免把「一个人」这种误判成数字）。
+    """
+    if not text:
+        return None
+    total = section = 0
+    current: int | None = None
+    for ch in text:
+        if ch in _CN_DIGITS:
+            current = _CN_DIGITS[ch]
+        elif ch in _CN_UNITS:
+            unit = _CN_UNITS[ch]
+            if current is None:
+                current = 1  # 「十五」= 15：十前面省了 1
+            if unit == 10000:
+                section = (section + current) * unit
+                total += section
+                section = 0
+            else:
+                section += current * unit
+            current = None
+        else:
+            return None
+    return total + section + (current or 0)
+
+
+def _first_cn_number(text: str) -> int | None:
+    """从一句话里挑出第一段连续的中文数字：「大概三天吧」→ 3。"""
+    run = ""
+    for ch in text:
+        if ch in _CN_DIGITS or ch in _CN_UNITS:
+            run += ch
+        elif run:
+            break
+    return _cn_to_int(run) if run else None
+
+
+# ask_user 的 speak_text 按定义是个问句。判据只认问号和「吗/呢」——
+# 不够聪明，但方向是安全的：判成「没问过」只会多念一句；判成「问过了」
+# 会让用户面对一个开着的麦克风、却不知道被问了什么。
+_ASKED_MARKS = ("？", "?", "吗", "呢")
+
+
+def _asks_a_question(text: str) -> bool:
+    """正文里是不是已经把话问出来了 —— 用来避免和 ask_user 的播报重复。"""
+    return any(mark in text for mark in _ASKED_MARKS)
+
+
+class ConversationManager:
+    """Top-level orchestrator for the voice chatbot.
+
+    Usage:
+        config = Config("config.yaml")
+        manager = ConversationManager(config)
+        manager.run()  # blocks forever
+    """
+
+    def __init__(self, config: Config):
+        self._config = config
+        self._state = StateMachine()
+
+        # Create shared audio devices
+        self._mic = Microphone(config)
+        self._speaker = Speaker(config)
+
+        # Create subsystems
+        self._vad_recorder = VADRecorder(self._mic, config)
+        self._wakeword = WakeWordEngine(config)
+        self._asr = ASRClient(config)
+        self._tts = TTSClient(config)
+        self._registry = build_default_registry()
+        self._llm_context = ConversationContext(config)
+
+        # MCP host。放在其他子系统之后 —— 它会拉起子进程，而 elicitation 回调要用到
+        # 上面的 TTS/录音/ASR。起不来也不影响原生功能（MCPHost 内部逐 server 降级）。
+        self._tool_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mcp-tool"
+        )
+        self._mcp = MCPHost(
+            config, bridge=self._build_mcp_bridge(config), project_root=_PROJECT_ROOT
+        )
+        self._mcp.start()
+
+        # 放歌。播放跑在**独立线程**上 —— 唤醒线程必须留空，否则喊唤醒词停不下来
+        # （唤醒回调本身就在唤醒线程上）。详见 tools/music.py 的模块文档。
+        self._music = MusicController(speaker=self._speaker, mcp_host=self._mcp, config=config)
+        register_music_tools(self._registry, self._music)
+        # 小车。放置位置同 music —— 它也会起线程，也要在 _on_wake_word 里被叫停。
+        # ROS 起不来**不该**拖垮语音助手（天气、音乐、闲聊都还得能用），
+        # 所以 start() 只记错误不抛；工具调用时会再试一次，
+        # 「先起助手、后起驱动」也能自己恢复。
+        self._car = CarController(config)
+        register_car_tools(self._registry, self._car)
+        self._car.start()
+
+        # 唤醒握手：一次唤醒劈成「快动作」（留在监听线程上急停，随时可用）
+        # +「慢流水线」（丢到后台线程，同一时刻最多一条）。位置放在 _car.start()
+        # 之后 —— 两个回调一个要用 _music / _car，一个要用 _llm_context / _state。
+        self._handoff = WakeHandoff(
+            fast_action=self._wake_fast_action,
+            pipeline=self._run_pipeline,
+            name="conversation",
+        )
+
+        # MCP 工具不塞进 _registry（会丢掉 server 归属和 annotations），
+        # 而是以 extra_schemas 的形式合并进发给 LLM 的 tools= 数组。
+        self._llm = LLMClient(
+            config, self._llm_context, self._registry, extra_schemas=self._mcp.tool_schemas
+        )
+
+        # Tracking
+        self._continue_round = 0
+        self._max_continue = config.get("conversation.max_continue_rounds", 5)
+        self._max_tool_iterations = config.get("llm.max_tool_iterations", 3)
+        # 调工具前那句兜底开场白。实测模型默认在调工具前一个字都不说，
+        # 见 _say_before_tools()。留空 = 模型不说就不出声（退回改动前的全静默）。
+        self._pre_tool_filler = str(
+            config.get("conversation.pre_tool_filler", "稍等一下")
+        ).strip()
+        self._session_reset_idle = config.get("conversation.session_reset_idle_sec", 1800)
+        self._last_activity = time.monotonic()
+        self._stop_event = threading.Event()
+
+        # Per-turn scratch state (set in THINKING, consumed in SPEAKING)
+        self._pending_wav: bytes = b""
+        self._pending_response: str = ""
+        self._should_listen: bool = False
+        self._spoke_pre_tool: bool = False   # 本轮是否已出过声（由 _say_before_tools 置位）
+
+        # 唤醒提示音：听到「叮」一声用户才知道可以说话了。留空则不播。
+        self._wake_sound = self._resolve_sound(config.get("audio.wake_sound", "sounds/ding.wav"))
+
+        # Wire state machine callbacks
+        self._state.on_enter(ConversationState.LISTENING, self._on_enter_listening)
+        self._state.on_enter(ConversationState.THINKING, self._on_enter_thinking)
+        self._state.on_enter(ConversationState.SPEAKING, self._on_enter_speaking)
+        # 进 IDLE 才开播待放的歌 —— 此时 TTS 已经说完，不会抢音频流
+        self._state.on_enter(ConversationState.IDLE, self._on_enter_idle)
+
+    # ---- Public API ----
+
+    def run(self) -> None:
+        """Start the main loop. Blocks until shutdown() is called."""
+        logger.info("=" * 40)
+        logger.info("JARVIS Voice Chatbot — Starting")
+        logger.info("=" * 40)
+
+        self._state.transition(ConversationState.IDLE)
+
+        # Start wake word detection
+        self._wakeword.start(on_detected=self._on_wake_word)
+
+        # Block until shutdown
+        try:
+            while not self._stop_event.is_set():
+                self._stop_event.wait(timeout=1.0)
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received")
+        finally:
+            self.shutdown()
+
+    def shutdown(self) -> None:
+        """Graceful shutdown."""
+        logger.info("Shutting down...")
+        self._stop_event.set()
+        # ★ 先收流水线、再停监听线程（设计 §3.5）：顺序反了的话，监听线程可能正卡在
+        #   on_wake() 里起新流水线，就收不干净了。
+        #   本方法会被调用两次（main.py 的 signal handler + run() 的 finally），
+        #   WakeHandoff.shutdown() 自身幂等（第二次进来 _closed 已置、_thread 已 None，
+        #   提前返回），所以重复调用安全。
+        #
+        # 5 秒是默认值，**故意不调大**：流水线可能正卡在一张 4~10 秒的拍照上
+        # （look 工具），join 超时后我们不再等它 —— 线程是 daemon，进程本来就要走了。
+        # 调大到 55 秒只会让每次重启白等一分钟，换来的只是「优雅地放弃这张拍到一半的照片」，
+        # 代价和收益不成比例。**in-flight 的拍照会被放弃，这是有意的。**
+        self._handoff.shutdown()
+        self._wakeword.stop()
+        self._music.stop()
+        self._car.close()
+        self._mcp.close()  # 关 portal + 终止 MCP server 子进程，防僵尸
+        self._tool_executor.shutdown(wait=False)
+        self._mic.close()
+        self._speaker.close()
+        logger.info("JARVIS Voice Chatbot — Stopped")
+
+    # ---- State handlers ----
+
+    def _on_wake_word(self) -> None:
+        """监听线程调。**必须立刻返回** —— 见 core/wake_handoff.py 的契约。
+
+        真正的唤醒流程在 `_run_pipeline()`（跑在 WakeHandoff 起的后台线程上）。
+        注意：唤醒这里**不**清空对话历史 —— 短期记忆跨唤醒保留（见 config
+        conversation.max_history_rounds），唤醒只重置「追问轮次」计数；
+        唯一的例外是闲置太久（session_reset_idle_sec）时的重置，那件事在
+        `_run_pipeline()` 里做。
+        """
+        self._handoff.on_wake()
+
+    def _wake_fast_action(self) -> None:
+        """急停路径 —— 跑在**串口监听线程**上，必须几十~320ms 内返回。**别往这里加东西。**
+
+        唤醒词不经过 ASR / LLM，「喊了就停」靠的就是这两行在监听线程上同步跑完；
+        把它们挪进流水线 = 让急停排在流水线后面，那正是本次重构要消灭的东西
+        （见 core/wake_handoff.py 与模块 docstring）。
+        """
+        # 喊唤醒词就是「停」的开关：先停音乐并等它真正放开 Speaker，再开麦。
+        # 小车同理 —— 这条路径不经过 ASR / LLM，几十毫秒就能停住，是急停。
+        # 两者都必须在开麦之前做完。
+        self._music.stop()
+        self._car.stop_all()
+
+    def _run_pipeline(self) -> None:
+        """整条对话流水线 —— 跑在 WakeHandoff 起的后台线程上，**不在监听线程上**。
+
+        监听线程只跑 `_wake_fast_action()` 那两行急停，唤醒的其余部分全在这里。
+        WakeHandoff 保证同一时刻只有一条流水线，所以状态机仍只被一条线程驱动，
+        `_on_enter_*` 不会并发（见模块 docstring）。
+
+        注意：这里**不**清空对话历史 —— 短期记忆跨唤醒保留（见 config
+        conversation.max_history_rounds）。唤醒只重置「追问轮次」计数。
+        唯一的例外是闲置太久（session_reset_idle_sec）：隔了半小时再唤醒，
+        前一轮的话题已经过期，留着反而会让模型答非所问。
+        """
+        now = time.monotonic()
+        idle = now - self._last_activity
+        if self._session_reset_idle > 0 and idle > self._session_reset_idle:
+            logger.info(f"→ 闲置 {idle:.0f}s 超过阈值，清空对话历史")
+            self._llm_context.reset()
+        self._last_activity = now
+
+        logger.info("→ Wake word detected!")
+        self._continue_round = 0
+        self._play_sound(self._wake_sound)
+        # 等提示音在空气中散掉再开麦，否则会被 VAD 当成用户开口，
+        # 让「无语音超时」失效。0.5s 是实测值：0.2s 时提示音尾音仍会被采到。
+        time.sleep(0.5)
+        self._state.transition(ConversationState.LISTENING)
+
+    def _on_enter_listening(self) -> None:
+        """Start recording user speech."""
+        logger.info(f"→ State: LISTENING (round {self._continue_round + 1})")
+
+        # 追问轮也要「叮」一声。唤醒轮已经在 _run_pipeline() 里响过了，
+        # 但追问轮如果静悄悄重开麦克风，用户根本不知道该接话 —— 这是实测踩到的坑。
+        if self._continue_round > 0:
+            self._play_sound(self._wake_sound)
+            time.sleep(0.5)  # 等提示音散掉，别被 VAD 当成开口
+
+        try:
+            wav_bytes = self._vad_recorder.record()
+            if len(wav_bytes) < 1000:
+                logger.warning("Recording too short or no speech, ignoring")
+                self._transition_to_idle()
+                return
+            self._pending_wav = wav_bytes
+            self._state.transition(ConversationState.THINKING)
+        except Exception as e:
+            logger.error(f"Recording failed: {e}")
+            self._transition_to_idle()
+
+    def _on_enter_thinking(self) -> None:
+        """ASR → LLM(+工具调用循环) pipeline."""
+        logger.info("→ State: THINKING")
+        if not self._pending_wav:
+            self._transition_to_idle()
+            return
+
+        # Step 1: ASR
+        user_text = self._asr.recognize(self._pending_wav)
+        self._pending_wav = b""
+        if not user_text:
+            logger.warning("ASR returned empty — no speech recognized")
+            self._transition_to_idle()
+            return
+
+        # Step 2: LLM with tool loop
+        self._pending_response = ""
+        self._should_listen = False
+        self._spoke_pre_tool = False
+        self._run_agent_loop(user_text)
+
+        if not self._pending_response.strip():
+            # 出过开场白但工具之后模型没再说话 → 走 IDLE 是对的（用户已经听到声了），
+            # 别用 warning 把正常情况标成异常。
+            if self._spoke_pre_tool:
+                logger.info("→ 本轮只出了工具前的开场白，之后模型没再说话")
+            else:
+                logger.warning("LLM produced nothing to speak")
+            self._transition_to_idle()
+            return
+
+        self._state.transition(ConversationState.SPEAKING)
+
+    def _on_enter_idle(self) -> None:
+        """进 IDLE 后才开播待放的音乐。
+
+        顺序很关键：TTS 说「好，给你放《晴天》」→ 播放完毕 → 进 IDLE → 音乐才起。
+        反过来（工具一返回就播）会让人声和音乐同时写同一条音频流。
+        """
+        self._music.start_pending()
+
+    def _on_enter_speaking(self) -> None:
+        """TTS playback."""
+        logger.info("→ State: SPEAKING")
+        self._last_activity = time.monotonic()
+
+        try:
+            for pcm_chunk in self._tts.synthesize_stream(self._pending_response):
+                if pcm_chunk:
+                    self._speaker.write(pcm_chunk)
+        except Exception as e:
+            logger.error(f"TTS playback failed: {e}")
+            self._transition_to_idle()
+            return
+
+        logger.info("Playback complete")
+
+        # 模型调了 ask_user 工具 → 自动重开麦克风，不需要再喊唤醒词
+        if self._should_listen and self._continue_round < self._max_continue:
+            self._continue_round += 1
+            logger.info(
+                f"→ Continue conversation (round {self._continue_round}/{self._max_continue})"
+            )
+            self._state.transition(ConversationState.LISTENING)
+        else:
+            if self._should_listen:
+                logger.info("→ Max continue rounds reached")
+            self._transition_to_idle()
+
+    # ---- Internal helpers ----
+
+    def _run_agent_loop(self, user_text: str) -> None:
+        """跑 LLM 工具调用循环，把要朗读的文本交给 _pending_response 或立刻念出来。
+
+        终止条件：
+          - 本轮没有工具调用 → 正常结束
+          - 有工具声明了 requires_followup（如 ask_user）→ 记下要念的话，标记
+            should_listen 后立刻结束。这里不能再问一次模型：既浪费一次往返，
+            也可能让它再说一遍自相矛盾的话。
+          - 达到迭代上限 → 记 warning，把已经拿到的文字念出来
+          - 工具执行出错 → 错误信息作为工具结果回灌给模型，让它自己兜底，而不是中断对话
+
+        另一件要紧的事：**决定调工具的那一轮，它的文字会被立刻念出来**
+        （见 _say_before_tools），而不是攒到循环结束 —— 只有「不调工具」的
+        最终答复才进 _pending_response 留给 SPEAKING。
+        """
+        spoken: list[str] = []
+
+        for iteration in range(self._max_tool_iterations + 1):
+            stream = (
+                self._llm.chat(user_text) if iteration == 0 else self._llm.chat_turn()
+            )
+
+            text_parts: list[str] = []
+            tool_calls: list[ToolCall] = []
+            for event in stream:
+                if event.type == "text":
+                    text_parts.append(event.text)
+                elif event.type == "tool_call" and event.tool_call is not None:
+                    tool_calls.append(event.tool_call)
+
+            text = "".join(text_parts).strip()
+
+            # 本轮不调工具 → 这是最终答复，留给 SPEAKING 统一念（原行为不变）。
+            if not tool_calls:
+                if text:
+                    spoken.append(text)
+                break
+
+            # 本轮要调工具 → 这段文字是「动手前的交代」，必须**现在**就说。
+            # 否则用户要干等工具跑完才听到第一声（实测工具前有 2.4-10s 全静默）。
+            # ★ 别再并进 spoken —— 已经念过了，并进去结尾会重复念一遍。
+            #
+            # 例外：这批里有「自己会念话」的工具（ask_user）时，不能两边都念 ——
+            # 模型惯于把问题**既写进正文、又传给 ask_user**（2026-09-13 17:16、
+            # 09-17 13:56 实测），正文念一遍、工具返回后再念一遍 =「话说了两遍」。
+            # 判据是「正文里有没有问句」：有 → 正文照念，丢掉工具那句重复的；
+            # 没有 → 两边都留着（正文多半是解释，工具那句才是要用户回答的）。
+            self_speaking = self._batch_speaks(tool_calls)
+            repeated = self_speaking and _asks_a_question(text)
+
+            # 正文有内容就念。正文为空时：工具自己会念就闭嘴等它说，
+            # 别拿兜底那句去填空（那会让用户先听到「稍等一下」再听到问题）。
+            #
+            # 兜底那句一轮只念一次：多步动作（「云台往左再往右」）每步都应一声
+            # 「稍等一下」太吵 —— 2026-09-17 14:22 实测 2.3s 内念了两遍。
+            # 模型自己的进度话不受限制，每步照念。
+            if text or not self_speaking:
+                self._say_before_tools(text, allow_filler=iteration == 0)
+
+            if iteration == self._max_tool_iterations:
+                logger.warning(
+                    f"→ 工具调用达到上限 {self._max_tool_iterations} 次，提前收尾"
+                )
+                break
+
+            speak_texts, followup = self._execute_tool_calls(tool_calls)
+            if repeated:
+                logger.info(f"→ 正文已问过，跳过工具的重复播报: {speak_texts!r}")
+                speak_texts = []
+            spoken.extend(text for text in speak_texts if text.strip())
+            if followup:
+                self._should_listen = True
+                break
+
+        self._pending_response = "\n".join(spoken).strip()
+
+    def _say_before_tools(self, text: str, allow_filler: bool = True) -> None:
+        """执行工具之前先出个声。
+
+        模型**默认不会**在调工具前说话 —— 实测 deepseek-v4-flash 4/4 轮
+        preamble 为空，1.4-1.9s 直接吐 tool_call。所以光靠 system_prompt 里
+        那句「动手前先说一句」不保险，这里必须有兜底：模型说了就念它的，
+        没说就念配置里写死的 conversation.pre_tool_filler。
+
+        为什么非说不可：从 ASR 结束到 SPEAKING 之间有 5-7s 全静默（轮1 无文本
+        + 工具执行 + 轮2 流式），用户体感就是「喊完没反应」。
+
+        走 _speak（TTS + Speaker，不经状态机）—— 此刻在 THINKING，状态机再转
+        一圈会把 _on_enter_* 回调重入。**同步阻塞**到播完才返回，所以工具会在
+        人声之后才开始跑；这是刻意的取舍（见模块 docstring）。
+
+        Args:
+            text: 模型本轮写的正文。空则用 conversation.pre_tool_filler 兜底。
+            allow_filler: 兜底那句能不能用。多步动作只在第一步传 True ——
+                每一步都应一声「稍等一下」太吵（2026-09-17 14:22 实测）。
+        """
+        # allow_filler=False 且模型没说话 → 保持安静，见 Args。
+        line = text or (self._pre_tool_filler if allow_filler else "")
+        if not line:
+            return
+        logger.info(f"→ 工具前出声: {line!r}")
+        self._spoke_pre_tool = True
+        self._speak(line)
+
+    def _batch_speaks(self, tool_calls: list[ToolCall]) -> bool:
+        """这批工具里有没有「自己会念话」的（见 tools/registry.py 的 Tool.speaks）。
+
+        MCP 工具不在 _registry 里（见 mcp_host/host.py 的说明），目前也都没有
+        speak_text，所以查不到就当它不出声。
+        """
+        for call in tool_calls:
+            if call.name not in self._registry:
+                continue
+            if self._registry.get(call.name).speaks:
+                return True
+        return False
+
+    def _execute_tool_calls(self, tool_calls: list[ToolCall]) -> tuple[list[str], bool]:
+        """执行工具并把结果写回上下文。
+
+        关键不变量：**每个 tool_call 都必须有对应的 tool 结果消息**。
+        否则上下文里会留下没有结果的 assistant.tool_calls，下次请求直接被 API 拒掉。
+        `ToolRegistry.dispatch()` 保证不抛异常，所以这里的循环一定能走到最后。
+
+        Returns:
+            (需要朗读的文本列表, 是否需要重开麦克风)
+        """
+        speak_texts: list[str] = []
+        followup = False
+
+        for call in tool_calls:
+            logger.info(f"→ 执行工具 {call.name}({call.arguments})")
+            # MCP 工具不走 ToolRegistry —— 见 mcp_host/host.py 的说明。
+            # registry.dispatch() 保证不抛异常；_run_mcp_tool 同样保证。
+            if self._mcp.has_tool(call.name):
+                outcome = self._run_mcp_tool(call.name, call.arguments)
+            else:
+                outcome = self._registry.dispatch(call.name, call.arguments)
+            logger.info(f"→ 工具 {call.name} 返回: {outcome.result}")
+
+            if outcome.speak_text:
+                speak_texts.append(outcome.speak_text)
+            if outcome.requires_followup:
+                followup = True
+
+            self._llm_context.add_tool_result(call.id, outcome.result)
+
+        return speak_texts, followup
+
+    # ---- MCP：工具执行与反向通路 ----
+
+    def _build_mcp_bridge(self, config: Config) -> HostBridge:
+        """把 MCP 的四条反向通路接到助手上。
+
+        ClientSession 的能力声明由「传了哪些回调」推导，所以这里给了什么，
+        服务器才知道能向我们要什么 —— 这就是「诚实协商」的落点。
+        """
+        return HostBridge(
+            elicit=self._voice_elicit,
+            sample=self._sampling_handler,
+            roots=self._mcp_roots,
+            sample_model=str(config.get("llm.model", "unknown")),
+        )
+
+    def _run_mcp_tool(self, name: str, arguments: dict[str, Any]) -> ToolOutcome:
+        """执行一个 MCP 工具。带 destructiveHint 的先语音确认。"""
+        if self._mcp.is_destructive(name):
+            confirm = self._voice_elicit(
+                f"工具 {name} 可能会造成改动，要执行吗？",
+                {
+                    "properties": {"confirm": {"type": "boolean", "description": "是否执行"}},
+                    "required": ["confirm"],
+                },
+            )
+            content = confirm.get("content") or {}
+            if confirm.get("action") != "accept" or not content.get("confirm"):
+                logger.info(f"→ 用户未确认，跳过危险工具 {name}")
+                return ToolOutcome(result=f"用户没有确认，已跳过工具 {name}。")
+
+        return ToolOutcome(result=self._call_mcp_with_pump(name, arguments))
+
+    def _call_mcp_with_pump(self, name: str, arguments: dict[str, Any]) -> str:
+        """★ 边等边泵 —— elicitation 不死锁的关键。
+
+        主线程**不能**直接 host.call_tool：那会阻塞在 portal.call 上，而服务器若在
+        这次调用中途发 elicitation，回调需要回主线程做语音 I/O —— 互等死锁。
+        这个死锁已实测复现（/tmp/verify_bidir.py 的 C 组：不泵时 6s 不返回，
+        最后靠 relay 120s + 客户端 30s 双超时才解开）。
+
+        所以把调用丢给工作线程，主线程在等的过程中持续服务 elicitation 请求。
+        max_workers=1 保证同一时刻只有一个 MCP 调用在飞，助手的串行设计不破。
+        """
+        relay = self._mcp.elicit_relay
+        future = self._tool_executor.submit(self._mcp.call_tool, name, arguments)
+        while not future.done():
+            if relay is not None:
+                relay.pump_once(timeout=0.05)
+            else:
+                time.sleep(0.05)
+        return future.result()
+
+    def _voice_elicit(self, message: str, schema: dict[str, Any]) -> dict[str, Any]:
+        """MCP elicitation 的语音实现。**跑在主线程上**（由 ElicitationRelay 转交）。
+
+        结构化表单 → 语音是「尽力而为」的映射，不是等价物：逐字段追问，每个字段
+        一轮录音；enum 把选项念出来。语音场景下用户没法填表，字段多了会很啰嗦，
+        所以用 max_continue_rounds 兜住上限。
+        """
+        properties = (schema or {}).get("properties") or {}
+        if not properties:
+            # 没有结构化字段：只是通知一句，不期待回答
+            self._speak(message)
+            return {"action": "accept", "content": None}
+
+        required = (schema or {}).get("required") or list(properties)
+        max_fields = max(1, int(self._config.get("conversation.max_continue_rounds", 5)))
+
+        logger.info(f"→ elicitation 追问（{len(required[:max_fields])} 个字段）: {message}")
+        collected: dict[str, Any] = {}
+
+        for index, key in enumerate(required[:max_fields]):
+            spec = properties.get(key) or {}
+            question = self._render_elicit_question(message if index == 0 else "", key, spec)
+            self._speak(question)
+
+            value: Any = _ELICIT_INVALID
+            for attempt in range(2):
+                answer = self._listen_once()
+                if answer is None:
+                    logger.info(f"→ elicitation 第 {attempt + 1} 次没听到答复，放弃本轮")
+                    return {"action": "cancel", "content": None}
+                value = self._coerce_elicit_value(answer, spec)
+                if value is not _ELICIT_INVALID:
+                    break
+                self._speak("抱歉没听清，请再说一次。")
+
+            if value is _ELICIT_INVALID:
+                logger.info(f"→ elicitation 字段 {key} 两次都没解析出有效值，按拒绝处理")
+                return {"action": "decline", "content": None}
+            collected[key] = value
+
+        logger.info(f"→ elicitation 收齐: {collected}")
+        return {"action": "accept", "content": collected}
+
+    @staticmethod
+    def _render_elicit_question(intro: str, key: str, spec: dict[str, Any]) -> str:
+        label = spec.get("description") or spec.get("title") or key
+        enum = spec.get("enum")
+        body = f"{label}？可以说：{'、'.join(str(o) for o in enum)}。" if enum else f"{label}？"
+        return f"{intro} {body}".strip() if intro else body
+
+    @staticmethod
+    def _coerce_elicit_value(text: str, spec: dict[str, Any]) -> Any:
+        """把口语回答强转成 schema 要的类型。转不了返回 _ELICIT_INVALID。"""
+        enum = spec.get("enum")
+        if enum:
+            for option in enum:
+                if str(option) in text:
+                    return option
+            return _ELICIT_INVALID
+
+        kind = spec.get("type")
+        if kind in ("integer", "number"):
+            match = re.search(r"-?\d+(?:\.\d+)?", text)
+            if match:
+                raw = match.group()
+                return int(raw) if kind == "integer" else float(raw)
+            value = _first_cn_number(text)
+            if value is None:
+                return _ELICIT_INVALID
+            return value if kind == "integer" else float(value)
+        if kind == "boolean":
+            if any(w in text for w in _ELICIT_NO):
+                return False
+            if any(w in text for w in _ELICIT_YES):
+                return True
+            return _ELICIT_INVALID
+        return text
+
+    def _sampling_handler(
+        self, messages: list[dict[str, Any]], system_prompt: str | None, max_tokens: int
+    ) -> str:
+        """MCP sampling：服务器借用宿主的 LLM。
+
+        LLMClient.complete() 刻意不碰主对话上下文 —— 这条路径是在一次 LLM 回合
+        **中途**被触发的（重入），共用上下文会把宿主的对话历史污染掉。
+        """
+        logger.info(f"→ MCP sampling：借用 LLM 处理 {len(messages)} 条消息")
+        return self._llm.complete(messages, system_prompt, max_tokens)
+
+    @staticmethod
+    def _mcp_roots() -> list[tuple[str, str]]:
+        """告诉 MCP 服务器它的操作边界。"""
+        roots = [(_PROJECT_ROOT, "voice-chatbot")]
+        music = Path.home() / "Music"
+        if music.is_dir():
+            roots.append((music, "Music"))
+        return roots
+
+    def _speak(self, text: str) -> None:
+        """在工具调用中途说话（elicitation 追问 / _say_before_tools 开场白）。
+
+        直接走 TTS + Speaker，不经状态机 —— 此刻正处于 THINKING，
+        状态机要是再转一圈会把 _on_enter_* 回调重入。
+
+        **同步阻塞**到整段播完才返回 —— _listen_once 这类调用方依赖这一点
+        （念完才能开麦，否则喇叭的声音会被 VAD 当成用户开口）。
+        """
+        if not text or not text.strip():
+            return
+        try:
+            for pcm_chunk in self._tts.synthesize_stream(text):
+                if pcm_chunk:
+                    self._speaker.write(pcm_chunk)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"TTS 播报失败: {e}")
+
+    def _listen_once(self) -> str | None:
+        """响一声提示音后录一轮，返回识别文本；没听到有效语音返回 None。"""
+        self._play_sound(self._wake_sound)
+        time.sleep(0.5)  # 等提示音散掉，别被 VAD 当成用户开口（同 _on_enter_listening）
+        try:
+            wav_bytes = self._vad_recorder.record()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"elicitation 录音失败: {e}")
+            return None
+        if len(wav_bytes) < 1000:
+            logger.info("→ elicitation：录音太短或无人说话")
+            return None
+        text = (self._asr.recognize(wav_bytes) or "").strip()
+        return text or None
+
+    def _transition_to_idle(self) -> None:
+        """Reset continue counter and go to IDLE."""
+        self._continue_round = 0
+        self._state.transition(ConversationState.IDLE)
+        logger.info("→ State: IDLE (waiting for wake word)")
+
+    @staticmethod
+    def _resolve_sound(name: str) -> Path | None:
+        """把配置里的提示音路径解析成绝对路径；空字符串表示不播。"""
+        if not name:
+            return None
+        path = Path(name)
+        return path if path.is_absolute() else _PROJECT_ROOT / path
+
+    def _play_sound(self, path: Path | None) -> None:
+        """播放一个预录的 WAV 提示音。
+
+        直接用 PyAudio 写 PCM，不走 TTS —— 提示音要立刻响，
+        不能等一次网络往返。文件必须是 16kHz/mono/int16，与 Speaker 一致。
+        """
+        if path is None:
+            return
+        try:
+            with wave.open(str(path), "rb") as wf:
+                pcm = wf.readframes(wf.getnframes())
+            self._speaker.write(pcm)
+        except Exception as e:
+            logger.warning(f"提示音播放失败 ({path}): {e}")

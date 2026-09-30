@@ -1,0 +1,471 @@
+# /home/cy/k230-vision/pi/t_gimbal_run.py —— gimbal_track_run.py **适配层**的离线单测
+#
+# **不接 ROS、不碰硬件、不碰 /tmp/k230、不跑串口、不发 /servo_cmd。**
+# 用临时目录造 JSON 样本，只测适配层那几个**纯文件 / 纯函数**：
+#
+#     load_json / pick_track / data_age_s / received_at_age_s
+#     read_snapshot / explain / make_read_target / make_rotator
+#
+# 也就是「挑哪一条目标」「数据新不新」「读不动怎么办」这三件事。控制律是
+# Task 2 的 t_gimbal_track.py 在管，这里**一个字都不重复测**。
+#
+#     cd /home/cy/k230-vision/pi && python3 t_gimbal_run.py
+#     cd /home/cy/k230-vision/pi && python3 t_gimbal_run.py --selfcheck   # 变异自检
+#
+# ⚠️ **本文件必须和 gimbal_track_run.py 放在同一个目录。** 它只测 `__file__`
+# 旁边那一个，**不认任何写死的路径** —— 找不到就报错退出，绝不退回别处。
+# 整个目录拷走时两个一起拷；只拷走测试的话它会**当场死**（这是故意的：
+# 静默地测了另一个文件还报绿，比不跑更糟。2026-09-21 验收时真踩过一次：
+# 把两个文件拷到 /tmp 改副本，测试照样全绿，因为读的是原件）。
+#
+# 最后一行是结束标记：全过 = GIMBAL_RUN_TESTS_DONE，有 FAIL = GIMBAL_RUN_TESTS_FAILED
+# （退出码 1）。
+#
+# ---------------------------------------------------------------------------
+# 变异自检（本项目硬性约定：**测试必须能红**）
+#
+# 全绿不算证据 —— 得证明它**会**红。做法照 t_gimbal_track.py：把
+# gimbal_track_run.py 的源码读进来做**一处**字符串替换，在内存里 exec 成模块
+# （不落地第三个文件），再跑同一套断言。
+#
+# `--selfcheck` 会为 MUTATIONS 里的每一项起一个子进程，**要求它变红**；
+# 同时要求"不变异"那一趟是绿的（否则说明测试本身写错了）。三处变异：
+#
+#   M1_src    挑目标的判据 `src == "track"` -> `src == "track2"`   （挑错了）
+#   M2_mtime  新鲜度 `os.stat(...).st_mtime` -> `received_at_age_s(...)`
+#             （**踩那个坑本身**：改用只有秒精度的 _received_at 判新鲜度）
+#   M3_order  `for o in objs` -> `for o in reversed(objs)`          （挑第一条变最后一条）
+#
+# 锚点每个都断言 count == 1 —— 源码一改、锚点失配就当场炸，不会静默失效。
+# 实跑记录见文件末尾注释。
+
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import types
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)                       # 旁边那个 gimbal_track_run.py
+sys.path.insert(0, "/home/cy/k230-vision/pi")   # 依赖：gimbal_track / camcenter / geom
+
+# ⚠️ **只认 `__file__` 旁边那一个，不写死绝对路径。**
+# 理由见文件头：这个项目没有 git，回滚靠目录拷贝 / tar.gz 快照，"整包拷到别处"
+# 是常态。写死路径的话，拷出去的那份测试会**一边测原件、一边报绿灯** ——
+# 那种假绿比没有测试更糟，因为它让人以为覆盖到了。
+MOD_PATH = os.path.join(_HERE, "gimbal_track_run.py")
+
+# 变异表：名字 -> (原文, 换成)。原文必须**在源码里恰好出现一次**。
+MUTATIONS = {
+    "M1_src": ('o.get("src") == "track"', 'o.get("src") == "track2"'),
+    # M2 是**优雅降级**版：优先读 _received_at，读不到才退回 mtime。
+    # 这样"没有 _received_at 的样本"照常通过，只有第 5 组（mtime 旧、
+    # _received_at 新）会真的**断言失败** —— 才证得出第 5 组在守这条。
+    "M2_mtime": ("    now = time.time() if now is None else now\n"
+                 "    return now - os.stat(path).st_mtime",
+                 "    now = time.time() if now is None else now\n"
+                 "    got = received_at_age_s(path, now)\n"
+                 "    return (now - os.stat(path).st_mtime) if got is None else got"),
+    "M3_order": ("    for o in objs:\n", "    for o in reversed(objs):\n"),
+}
+
+MUTANT = os.environ.get("GIMBAL_RUN_MUTANT")
+
+
+def _require_module_file():
+    """旁边没有 gimbal_track_run.py 就**当场死**，绝不退回别的路径。
+
+    ⚠️ 刻意**不做**"找不到就退回某个默认路径"的兜底 —— 那正是"测错文件还报绿"
+    的成因。宁可炸得响，也不要给出一个可能测了别的文件的绿灯。
+    """
+    if not os.path.isfile(MOD_PATH):
+        sys.stderr.write(
+            "错误：本测试只测**和它放在同一个目录**里的 gimbal_track_run.py，\n"
+            "      但那个目录里没有它：\n"
+            "          %s\n"
+            "      本测试文件在：\n"
+            "          %s\n"
+            "      请把这两个文件放在一起再跑。\n"
+            "      **不会**退回别的路径 —— 那会测错文件还报绿，比不跑更糟。\n"
+            % (MOD_PATH, os.path.abspath(__file__)))
+        sys.exit(2)
+
+
+def load_module(mutant=None):
+    """读源码 → （可选）变异一处 → 在内存里 exec 成模块。**不落地任何文件。**"""
+    src = io.open(MOD_PATH, encoding="utf-8").read()
+    if mutant:
+        old, new = MUTATIONS[mutant]
+        n = src.count(old)
+        assert n == 1, ("变异 %s 的锚点在源码里出现 %d 次（要求恰好 1 次）"
+                        "—— 源码动过，变异表要跟着更新" % (mutant, n))
+        src = src.replace(old, new)
+    mod = types.ModuleType("gimbal_track_run")
+    mod.__file__ = MOD_PATH
+    sys.modules["gimbal_track_run"] = mod
+    exec(compile(src, MOD_PATH, "exec"), mod.__dict__)
+    return mod
+
+
+# ===========================================================================
+# 断言小工具
+# ===========================================================================
+FAILS = []
+
+
+def chk(cond, label):
+    print(("  ok    " if cond else "  FAIL  ") + label)
+    if not cond:
+        FAILS.append(label)
+
+
+def chk_eq(got, want, label):
+    chk(got == want, "%s（期望 %r，实得 %r）" % (label, want, got))
+
+
+# ===========================================================================
+# 造样本：临时目录里写 JSON
+# ===========================================================================
+BOX_A = [0.10, 0.20, 0.30, 0.40]        # 探测器条目（**没有 src**）
+BOX_B = [0.60, 0.10, 0.70, 0.30]        # 探测器条目，在 track 条目**后面**
+BOX_T = [0.40, 0.30, 0.55, 0.70]        # 真正要跟的那条
+BOX_T2 = [0.05, 0.05, 0.15, 0.15]       # 第二条 track（多条时要能被测出来）
+
+
+def make_doc(objs, frame=1234, received=None):
+    d = {"w": 1280, "h": 720, "frame": frame,
+         "ts": int(time.time() * 1000), "objs": objs}
+    if received is not None:
+        d["_received_at"] = received
+    d["_peer"] = "127.0.0.1:1"
+    return d
+
+
+def write_file(tmp, name, payload, mtime=None):
+    """payload 是 dict 就 json.dump，是 str 就原样写（造坏文件用）。"""
+    path = os.path.join(tmp, name)
+    with open(path, "w") as f:
+        if isinstance(payload, str):
+            f.write(payload)
+        else:
+            json.dump(payload, f)
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
+def det(box, cls="chair"):
+    """检测器条目：**没有 src** —— 会跳会丢，不该被挑中。"""
+    return {"cls": cls, "score": 0.503, "box": box}
+
+
+def trk(box, cls="person", track_id=1):
+    """跟踪器条目：有 src == "track"。"""
+    return {"cls": cls, "score": 1.0, "box": box,
+            "track_id": track_id, "src": "track"}
+
+
+# ===========================================================================
+# 测试
+# ===========================================================================
+def run_tests(mod):
+    tmp = tempfile.mkdtemp(prefix="t_gimbal_run_")
+    now = time.time()
+
+    print("1) 正常：有 src==\"track\" → 挑对那一条（**别的条目不能挑错**）")
+    # 故意把 track 夹在两个检测器条目中间：挑第一条 / 挑最后一条 / 挑最大的
+    # 都会挑错，只有"认 src"才对。
+    p = write_file(tmp, "ok.json",
+                   make_doc([det(BOX_A), trk(BOX_T), det(BOX_B)]))
+    snap = mod.read_snapshot(p, 0.5, now)
+    chk_eq(snap.state, mod._S_OK, "判定是 ok")
+    chk_eq(snap.box, BOX_T, "拿到的是 src==\"track\" 那条的 box")
+    chk_eq(snap.frame, 1234, "frame 取**顶层**的（不是 obj 里的）")
+    chk(snap.ok, "snap.ok 为真")
+    rt, last = mod.make_read_target(p, 0.5, clock=lambda: now)
+    got = rt()
+    chk_eq(got, (BOX_T, 1234), "read_target() 返回 (box, frame)")
+    chk_eq(last[0].state, mod._S_OK, "read_target() 顺手记下了快照")
+    chk_eq(mod.pick_track([det(BOX_A), det(BOX_B)]), None,
+           "pick_track 在没有 track 条目时返回 None")
+
+    print()
+    print("2) 只有检测器条目（没有 src）→ 没目标")
+    p = write_file(tmp, "notrack.json", make_doc([det(BOX_A), det(BOX_B)]))
+    snap = mod.read_snapshot(p, 0.5, now)
+    chk_eq(snap.state, mod._S_NO_TRACK, "判定是 no_track")
+    chk(snap.age < 0.5, "但**数据是新鲜的**（age=%.3f s）—— 这正是要区分开的那件事"
+        % snap.age)
+    rt, _last = mod.make_read_target(p, 0.5, clock=lambda: now)
+    chk_eq(rt(), None, "read_target() 返回 None（模块会报 no_target）")
+
+    print()
+    print("3) 文件不存在 / 坏 JSON / 空文件 / 顶层不是对象 → 都优雅处理")
+    rt, _last = mod.make_read_target(os.path.join(tmp, "nope.json"), 0.5,
+                                     clock=lambda: now)
+    chk_eq(rt(), None, "文件不存在：read_target() 返回 None，不抛异常")
+    chk_eq(mod.read_snapshot(os.path.join(tmp, "nope.json"), 0.5, now).state,
+           mod._S_MISSING, "文件不存在：判定是 missing")
+
+    cases = [
+        ("bad.json", '{"objs": [ this is not json', mod._S_UNREADABLE, "坏 JSON"),
+        ("empty.json", "", mod._S_UNREADABLE, "空文件"),
+        ("blank.json", "   \n  ", mod._S_UNREADABLE, "只有空白"),
+        ("list.json", [1, 2, 3], mod._S_UNREADABLE, "顶层是数组不是对象"),
+        ("num.json", 42, mod._S_UNREADABLE, "顶层是数字"),
+    ]
+    for name, payload, want, label in cases:
+        pth = write_file(tmp, name, payload)
+        snap = mod.read_snapshot(pth, 0.5, now)
+        chk_eq(snap.state, want, "%s：判定是 %s（原因：%s）"
+               % (label, want, snap.note))
+        chk(bool(snap.note), "%s：带一句能看的原因" % label)
+        rt, _l = mod.make_read_target(pth, 0.5, clock=lambda: now)
+        chk_eq(rt(), None, "%s：read_target() 返回 None，不抛异常" % label)
+    chk_eq(mod.load_json(os.path.join(tmp, "bad.json"))[0], None,
+           "load_json 读不动时返回 (None, 原因)")
+
+    print()
+    print("4) 多条 src==\"track\" → 规则是**取 JSON 数组里的第一条**")
+    p = write_file(tmp, "two.json",
+                   make_doc([trk(BOX_T, "a", 1), trk(BOX_T2, "b", 2)], frame=77))
+    got = mod.pick_track(json.load(io.open(p))["objs"])
+    chk_eq(got["box"], BOX_T, "取的是第一条（不是最后一条、不是最大的）")
+    chk_eq(got["track_id"], 1, "track_id 也是第一条的")
+    snap = mod.read_snapshot(p, 0.5, now)
+    chk_eq(snap.box, BOX_T, "read_snapshot 同样取第一条")
+
+    print()
+    print("5) ★ 过期只认 mtime：_received_at 看着新鲜也没用")
+    # ⚠️ 阈值**特意取 5.0s**（不是默认的 0.5s）。原因值得记下来：`_received_at`
+    # **只有秒精度**，把它折算成年龄只在 [0,1)s 之间抖。如果这条用 0.5s 判，
+    # "改用 `_received_at` 判新鲜度"那种改法会**时红时绿** —— 变异自检里真抓到了
+    # （同一个变异两次跑出 5 条和 2 条 FAIL）。阈值抬到 5.0s 之后，那 1 秒以内的
+    # 抖动就稳定地落在"新鲜"一侧，这条测试才每次都红得干脆。
+    STALE_MAX_AGE = 5.0
+    old = now - 30.0
+    # 故意把两个字段造成**互相矛盾**的样子：mtime 是 30 秒前、
+    # _received_at 却是"刚刚"。这正是线上那个坑的形状。
+    p = write_file(tmp, "old.json",
+                   make_doc([det(BOX_A), trk(BOX_T)],
+                            received=time.strftime("%Y-%m-%d %H:%M:%S")),
+                   mtime=old)
+    age = mod.data_age_s(p, now)
+    chk(abs(age - 30.0) < 2.0, "data_age_s 按 mtime 算出 %.2fs（应约 30s）" % age)
+    other = mod.received_at_age_s(p, now)
+    chk(other is not None and abs(other) < 1.5,
+        "_received_at 折算出来只有 %.2fs —— **它确实是'看着新鲜'的**，"
+        "所以这个样本真的带着那个坑" % (other if other is not None else -999))
+    snap = mod.read_snapshot(p, STALE_MAX_AGE, now)
+    chk_eq(snap.state, mod._S_STALE, "判定是 stale（按 mtime，不是按 _received_at）")
+    rt, _l = mod.make_read_target(p, STALE_MAX_AGE, clock=lambda: now)
+    chk_eq(rt(), None, "过期数据不给控制器 —— read_target() 返回 None")
+    chk("没更新" in mod.explain(snap), "过期那句原因说清了是「没更新」")
+    # 反过来：mtime 新鲜、_received_at 很旧 —— 一样得认 mtime（判为新鲜）
+    p2 = write_file(tmp, "newmtime.json",
+                    make_doc([trk(BOX_T)],
+                             received=time.strftime("%Y-%m-%d %H:%M:%S",
+                                                    time.localtime(now - 60))),
+                    mtime=now)
+    chk_eq(mod.read_snapshot(p2, 0.5, now).state, mod._S_OK,
+           "mtime 新鲜 / _received_at 很旧 → 仍按 mtime 判为新鲜（对称验证）")
+
+    print()
+    print("6) 有目标但顶层没有 frame → 不发指令（帧号是唯一的防重复保护）")
+    d = make_doc([trk(BOX_T)])
+    del d["frame"]
+    p = write_file(tmp, "noframe.json", d)
+    snap = mod.read_snapshot(p, 0.5, now)
+    chk_eq(snap.state, mod._S_NO_FRAME, "判定是 no_frame")
+    rt, _l = mod.make_read_target(p, 0.5, clock=lambda: now)
+    chk_eq(rt(), None, "read_target() 返回 None（宁可不跟，也不拿旧图反复转）")
+
+    print()
+    print("7) 每一档判定都得有一句人话，且**两档必须能分得开**")
+    samples = {
+        mod._S_OK: mod.Snapshot(mod._S_OK, box=BOX_T, frame=1, age=0.05),
+        mod._S_NO_TRACK: mod.Snapshot(mod._S_NO_TRACK, age=0.05),
+        mod._S_STALE: mod.Snapshot(mod._S_STALE, age=3.2),
+        mod._S_MISSING: mod.Snapshot(mod._S_MISSING, age=-1, note="/tmp/x.json"),
+        mod._S_UNREADABLE: mod.Snapshot(mod._S_UNREADABLE, age=0.1,
+                                        note="JSON 解不开"),
+        mod._S_NO_FRAME: mod.Snapshot(mod._S_NO_FRAME, age=0.1),
+    }
+    for st, sn in samples.items():
+        txt = mod.explain(sn)
+        chk(bool(txt) and st not in txt,
+            "%s -> 有话可说，且不把内部代号漏出去（%s）" % (st, txt))
+    chk("数据新鲜" in mod.explain(samples[mod._S_NO_TRACK]),
+        "no_track 那句明说了**数据是新鲜的**（跟断流分开）")
+    chk("没更新" in mod.explain(samples[mod._S_STALE]),
+        "stale 那句明说了**没更新**")
+    chk("3.20" in mod.explain(samples[mod._S_STALE]),
+        "stale 那句带上了具体秒数")
+
+    print()
+    print("8) make_rotator：脉宽记到对的轴上，(us, hit_limit) **原样透传**")
+    calls = []
+
+    class FakeCtrl:
+        def camera_nudge(self, direction, degrees):
+            calls.append((direction, degrees))
+            return (1234 if direction in ("left", "right") else 1777, False)
+
+    rot, last_us = mod.make_rotator(FakeCtrl())
+    chk_eq(rot("right", 5.0), (1234, False), "返回值原样透传")
+    chk_eq(last_us["pan"], 1234, "right 记到 pan")
+    chk_eq(last_us["tilt"], None, "tilt 还没动过 → None（不是 0）")
+    chk_eq(rot("up", 2.0), (1777, False), "返回值原样透传")
+    chk_eq(last_us["tilt"], 1777, "up 记到 tilt")
+    chk_eq(last_us["pan"], 1234, "pan 没被 up 覆盖")
+    chk_eq(rot("left", 3.0), (1234, False), "left 也走 pan")
+
+    class LimCtrl:
+        def camera_nudge(self, direction, degrees):
+            return (2200, True)          # 撞限位
+
+    rot2, _lu = mod.make_rotator(LimCtrl())
+    chk_eq(rot2("right", 9.0), (2200, True), "hit_limit 标志不被吞掉")
+
+    print()
+    print("9) 每档判定都必须是 read_target() == None（只有 ok 才给数据）")
+    for st, sn in samples.items():
+        if st == mod._S_OK:
+            continue
+        # 直接查 read_snapshot 的契约：非 ok 一律不该被喂给控制器。
+        # 这里用"能不能返回 (box, frame)"来表达，跟 make_read_target 一致。
+        chk(not sn.ok, "%s 的 snap.ok 是假 → read_target() 必然返回 None" % st)
+    chk(samples[mod._S_OK].ok, "ok 的 snap.ok 是真")
+
+    sys.stdout.flush()
+    return tmp
+
+
+# ===========================================================================
+# 变异自检
+# ===========================================================================
+def selfcheck():
+    """对每个变异起一个子进程跑本文件，**要求它变红**。"""
+    _require_module_file()   # 旁边没模块就别自检：子进程全绿或全崩都读不懂
+    py = sys.executable or "python3"
+    print("=" * 72)
+    print("变异自检：每个变异都必须让测试**变红**（exit != 0）")
+    print("=" * 72)
+    allgood = True
+
+    r = subprocess.run([py, os.path.abspath(__file__)],
+                       capture_output=True, text=True)
+    green = (r.returncode == 0)
+    print("  %-10s exit=%d  %s" % ("(无变异)", r.returncode,
+                                   "绿 ✓" if green else "**红了 ✗ 测试本身写错了**"))
+    if not green:
+        allgood = False
+        print(r.stdout[-2000:])
+
+    for name in MUTATIONS:
+        env = dict(os.environ)
+        env["GIMBAL_RUN_MUTANT"] = name
+        r = subprocess.run([py, os.path.abspath(__file__)],
+                           capture_output=True, text=True, env=env)
+        red = (r.returncode != 0)
+        print("  %-10s exit=%d  %s" % (name, r.returncode,
+                                       "变红 ✓" if red else "**没红 ✗**"))
+        fails = [l.strip() for l in r.stdout.splitlines()
+                 if l.strip().startswith("FAIL")]
+        for l in fails[:3]:
+            print("        " + l)
+        if len(fails) > 3:
+            print("        ...（共 %d 条 FAIL）" % len(fails))
+        if red and not fails:
+            # **红得不对劲**：不是断言失败，而是崩了。崩了也算"能红"，但
+            # 它证明不了"哪条断言在守这个行为" —— 如实打出来，不粉饰。
+            print("        ⚠️ 没有 FAIL 行 —— 是**崩了**，不是断言失败：")
+            tail = (r.stderr or r.stdout).strip().splitlines()[-3:]
+            for l in tail:
+                print("        | " + l)
+        if not red:
+            allgood = False
+
+    print()
+    if allgood:
+        print("变异自检通过：不变异是绿的，%d 个变异全部变红。" % len(MUTATIONS))
+        print("GIMBAL_RUN_SELFCHECK_DONE")
+        return 0
+    print("变异自检**失败** —— 见上面带 ✗ 的那几行。")
+    print("GIMBAL_RUN_SELFCHECK_FAILED")
+    return 1
+
+
+# ===========================================================================
+def main():
+    _require_module_file()
+    if "--selfcheck" in sys.argv and not MUTANT:
+        return selfcheck()
+
+    tag = ("  [变异 %s]" % MUTANT) if MUTANT else ""
+    print("=" * 72)
+    print("t_gimbal_run.py —— gimbal_track_run.py 适配层的离线单测%s" % tag)
+    print("不接 ROS、不碰硬件、不碰 /tmp/k230（样本全在临时目录里）")
+    print("=" * 72)
+
+    mod = load_module(MUTANT)
+    tmp = run_tests(mod)
+
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)      # 临时样本自己清掉
+
+    print()
+    print("=" * 72)
+    if FAILS:
+        print("结果: %d 项失败" % len(FAILS))
+        for f in FAILS:
+            print("   -", f)
+        print("GIMBAL_RUN_TESTS_FAILED")
+        return 1
+    print("结果: 全部通过")
+    print("GIMBAL_RUN_TESTS_DONE")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+# ---------------------------------------------------------------------------
+# 变异自检实跑记录（2026-09-21，在树莓派上跑 `python3 t_gimbal_run.py --selfcheck`）
+#
+#   (无变异)    exit=0  绿 ✓
+#   M1_src      exit=1  变红 ✓   第 1 组 6 条 FAIL（挑不到目标），
+#                                随后第 4 组因为 pick_track 返回 None 而崩
+#                                （TypeError）—— 红了，但**不是全断言出来**的
+#   M2_mtime    exit=1  变红 ✓   第 5 组 FAIL（data_age_s 从 30s 变成 <1s；
+#                                "mtime 新鲜 / _received_at 很旧"那条也翻）
+#   M3_order    exit=1  变红 ✓   第 4 组 3 条 FAIL（取第一条变成取最后一条）
+#
+# 说明：M2 就是把新鲜度判据换成"读 `_received_at`"—— 也就是**那个坑本身**。
+# 第 5 组的样本故意把 mtime 造成 30 秒前、`_received_at` 造成"刚刚"，阈值取
+# **5.0s 而不是默认的 0.5s**：`_received_at` 只有秒精度，折算出的年龄在 [0,1)s
+# 之间抖，阈值取 0.5 会让这条断言**时红时绿**（变异自检真抓到过一次，所以我
+# 把当时随手加的那条 0.5s 断言删了 —— 时红时绿的断言比没有更糟）。
+#
+# ---------------------------------------------------------------------------
+# 路径绑定复验（2026-09-21，协调者验收时发现的问题）
+#
+# 原来 `MOD_PATH` 写死绝对路径。后果：把 gimbal_track_run.py + t_gimbal_run.py
+# 整包拷到别处、改**副本**、跑测试 —— 测试读的是**原件**，于是
+# **测了另一个文件还报绿灯**。这个项目没有 git，回滚靠目录拷贝 / tar.gz 快照，
+# "整包拷走"是常态，所以这个坑会反复踩，而且踩的人不会知道。
+#
+# 改成从 `os.path.dirname(os.path.abspath(__file__))` 推导，并且旁边没有
+# gimbal_track_run.py 时**当场 exit 2**，不退回任何路径。
+#
+# 复验（协调者的原方法，2026-09-21 实跑）：
+#   A) 改后：cp 两个文件到 /tmp/mut2 → sed 把副本改成 "track2" → 跑 → **exit 1**
+#      6 条 FAIL（判定 / box / frame / ok / read_target / 快照），随后第 4 组崩
+#      —— 真的红了
+#   B) 对照：把改前那版备份也放进 /tmp/mut2（同一个被改坏的副本旁边）→
+#      **exit 0 "结果: 全部通过"** —— 这就是那个假绿，一屏之隔，看得见
+#   C) 只拷测试、不拷模块（/tmp/mut3）→ exit 2 + 报错说清缺哪个文件
+# ---------------------------------------------------------------------------

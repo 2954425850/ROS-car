@@ -1,0 +1,184 @@
+"""唤醒握手 —— 把一次唤醒劈成「快动作」和「慢流水线」。
+
+## 为什么需要这个类
+
+唤醒模块是**硬件串口设备**：`wakeword/engine.py` 的监听线程读到唤醒帧就**内联**调
+`on_detected()`（`_listen_loop → _handle_detection`）。而今天那个回调是
+`ConversationManager._on_wake_word()`，它**同步跑完了整条对话流水线**
+（录音 → ASR → LLM → TTS，几秒到几十秒）。后果：
+
+    流水线跑着的那段时间串口没人读，用户喊唤醒词**进不来** —— 急停失效。
+    2026-09-17 实车复现：「他在往前走的时候，喊他没用」。
+
+即将新增的 `look` 工具（拍照 + 云端视觉理解）实测 4~10 秒，会把盲窗从「几秒」
+拉到「十几秒」，绕不过去了。所以照设计 §3 把一次唤醒**劈成两段**：
+
+    快动作（停音乐、急停小车，几十~320ms）  ← 留在监听线程上同步跑完
+    慢流水线（录音 → ASR → LLM → TTS）      ← 丢到后台线程，同一时刻只允许一条
+
+急停那条路径的**延迟一点没变**（仍然是那两行 stop），但它现在**随时可用** ——
+流水线在跑也照样进得来。
+
+## 为什么单独抽成这个类
+
+`ConversationManager.__init__` 会把麦克风 / 扬声器 / ASR / TTS / ROS 全起起来，
+根本没法单测。而「快慢分离 + 防重入」这段**并发语义**恰恰是最需要测、也最容易
+写错的一段（防重入漏了 = 一次唤醒跑出两条流水线 = 两条线程同时驱动同一个状态机、
+抢同一个麦克风）。所以照 `car/kinematics.py` 的做法，把它抽成一个**不依赖任何硬件**
+的纯 Python 单元，行为由 `tests/test_wake_handoff.py` 完整钉住。
+
+## 不变量（改动时请勿破坏）
+
+**同一时刻最多一条流水线。** 所以状态机的 `_on_enter_*` 回调全部跑在**同一条**
+线程上，彼此不会并发 —— `core/conversation.py` 里「整条流水线同步串行」那条
+不变量**没有被破坏**，被换掉的只是它**跑在哪条线程上**（这正是选 B 方案而不是
+fire-and-forget 的理由）。
+"""
+
+from __future__ import annotations
+
+import threading
+from typing import Callable
+
+from loguru import logger
+
+
+class WakeHandoff:
+    """把一次唤醒拆成「快动作」和「慢流水线」。**线程安全。**
+
+    Usage:
+        handoff = WakeHandoff(music_and_car_stop, run_pipeline, name="conversation")
+        wakeword.start(on_detected=handoff.on_wake)   # 监听线程调它
+        ...
+        handoff.shutdown()                            # 先收流水线
+        wakeword.stop()                               # 再停监听线程（顺序反了收不干净）
+
+    两条线程的交接全部由 `_lock` 保护：`on_wake()` 在监听线程上跑，
+    清 busy 在流水线线程上跑 —— 这是真的跨线程，不是「看起来像」。
+    """
+
+    def __init__(
+        self,
+        fast_action: Callable[[], None],
+        pipeline: Callable[[], None],
+        *,
+        name: str = "conversation",
+    ) -> None:
+        """
+        Args:
+            fast_action: 急停路径，在监听线程上**同步**跑完。它必须短 ——
+                今天的实现是 `music.stop()` + `car.stop_all()`，实测几十~320ms
+                （8 帧 × 40ms）。它抛异常不会向上传播，见 `on_wake()`。
+            pipeline: 整条对话流水线，丢到后台线程跑，同一时刻最多一条。
+                返回值没人要；抛出的异常记进日志后吞掉（流水线自己已经有
+                完整的错误处理，这里再抛只会变成 stderr 上没人看的 traceback）。
+            name: 后台线程名。照 `car/controller.py` 的 `name="car-motion"` 的
+                做法 —— 线程名是并发出问题时，唯一能一眼看出「这行日志是谁打的」
+                的东西，别用默认的 Thread-N。
+        """
+        self._fast_action = fast_action
+        self._pipeline = pipeline
+        self._name = name
+
+        self._lock = threading.Lock()
+        self._busy = False                       # 有流水线在跑；跨线程读写，必须持锁
+        self._thread: threading.Thread | None = None
+        self._closed = False                     # shutdown() 之后不再起新流水线
+
+    # ------------------------------------------------------------ 监听线程
+
+    def on_wake(self) -> None:
+        """监听线程调。**必须立刻返回**（设计 §3.1 的契约：<400ms）。
+
+        做两件事，顺序不能反：
+
+        1. **同步**跑 `fast_action()` —— 这是急停路径。它失败**不向上抛**：
+           这里跑在串口监听线程上，抛出去会杀掉监听，从此唤醒词彻底失灵。
+           而且流水线**照样要起** —— 急停失败不等于用户不想说话，别顺带把
+           对话也废掉。
+        2. 再看流水线忙不忙：空闲 → 起后台线程，立刻返回；忙 → **只记一条
+           info 日志**，绝不起第二条。注意第二次唤醒的**快动作照跑** ——
+           「喊了就停」在任何时刻都可用，正是本次重构的目的。
+
+        关闭过程中（已 `shutdown()`、监听线程还没停）来的唤醒：快动作照跑
+        （急停幂等、无害），但不再起流水线。
+        """
+        try:
+            self._fast_action()
+        except Exception as exc:  # noqa: BLE001 —— 监听线程上绝不能有异常逃出去
+            logger.exception(f"唤醒快动作失败 —— {exc}")
+
+        with self._lock:
+            if self._busy:
+                # 这条日志是 T6 端到端验收要看的证据（设计 §6“日志可见「忙，只急停」”）。
+                logger.info("对话流水线正忙，本次唤醒只做急停")
+                return
+            if self._closed:
+                logger.info("正在关闭，不再起新的对话流水线")
+                return
+            # ★ 先置 busy 再起线程：并发的第二次 on_wake 只会在锁上排队，
+            #   进来时看到的已经是 True，于是不会漏出第二条流水线。
+            self._busy = True
+            thread = threading.Thread(
+                target=self._pipeline_loop, name=self._name, daemon=True
+            )
+            self._thread = thread
+
+        # 在锁外 start()：锁里只做状态变更，持锁时间越短越好。
+        try:
+            thread.start()
+        except Exception as exc:  # noqa: BLE001 —— 起不来必须把 busy 放回去
+            with self._lock:
+                self._busy = False
+                self._thread = None
+            logger.error(f"起不了对话线程 —— {exc}")
+
+    # ------------------------------------------------------------ 流水线线程
+
+    def _pipeline_loop(self) -> None:
+        """后台线程体 —— `on_wake()` 起的那条线程跑的就是它。"""
+        try:
+            self._pipeline()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"对话流水线出错 —— {exc}")
+        finally:
+            # ★ finally 是硬要求，不是风格问题：少这一行的表现是「流水线每崩一次，
+            #   助手就永久卡在忙」—— 之后每次唤醒都只急停、再也进不了对话，
+            #   而日志上只有一条看似无害的「正忙」。这种 bug 在真机上极难定位。
+            with self._lock:
+                self._busy = False
+                self._thread = None
+
+    # ------------------------------------------------------------ 生命周期
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """收掉流水线：join 后台线程，并让之后的 `on_wake()` 不再起新的。
+
+        调用方必须**先**调它、**再**停唤醒引擎（设计 §3.5）—— 顺序反了的话，
+        监听线程可能正卡在 `on_wake()` 里起新流水线，就收不干净了。
+
+        Args:
+            timeout: 等流水线的上限（秒）。流水线可能正卡在 4~10 秒的拍照上，
+                所以超时后不抛异常、也不再等 —— 线程是 daemon，进程退得掉。
+                只留一条 warning，让调用方知道有活没干完。
+        """
+        with self._lock:
+            self._closed = True
+            # 在锁里取一次引用：_pipeline_loop 的 finally 会把它置回 None，
+            # 取了再 join 才不会 join 到 None 上。
+            thread = self._thread
+
+        if thread is None or not thread.is_alive():
+            return
+        thread.join(timeout)
+        if thread.is_alive():
+            logger.warning(f"对话流水线 {timeout:.0f} 秒内没结束，不再等它了")
+        else:
+            logger.info("对话流水线已收干净")
+
+    @property
+    def is_busy(self) -> bool:
+        """有没有流水线在跑。测试用它同步；`ConversationManager` 也可以据此
+        决定要不要提示用户「稍等」。"""
+        with self._lock:
+            return self._busy

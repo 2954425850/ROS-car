@@ -1,0 +1,152 @@
+"""唤醒引擎（`wakeword/engine.py`）的行为测试。
+
+这个文件只测**属于引擎**的两件事：
+  * `test_drain_discards_frames_accumulated_during_callback` —— `_drain()` 在回调之后
+    丢弃「回调执行期间堆积的帧」是**有意行为**，不是 bug（设计文档 §7 坑 1）；
+  * `test_cooldown_swallows_rapid_second_wake` —— 冷却期（默认 2.0s）内的第二次唤醒被忽略。
+
+**有意不测的东西**：回调是**内联**的，回调返回之前引擎不会再去读串口 —— 这是
+`start()` 里写明的契约（回调必须立刻返回），不是缺陷。「流水线跑着的时候唤醒词仍然
+存活」这件事**不归引擎保证**，由调用方侧的 `core/wake_handoff.WakeHandoff` 负责，
+测试在 `tests/test_wake_handoff.py`。**想修那个问题就去那边修，不要给引擎加锁。**
+
+2026-09-18 这里曾经有一个 `test_slow_callback_does_not_block_listening`，用户拍板删掉了。
+记一笔免得有人再写一个：它实际测的只是「回调跑完 → `_drain()` 跑完 → 循环还在读」
+（与上面第 1 个用例重复），并不能防「后人给引擎加锁」—— 因为「回调返回前不读串口」
+**本来就是当前内联回调的行为**。留一个声称提供保护、实际不提供保护的测试，比没有更糟。
+
+背景（设计文档 §3）：2026-09-18 的「唤醒握手重构」要解决的阻塞在**调用方** ——
+`ConversationManager._on_wake_word` 把整条流水线（录音 / ASR / LLM / TTS，实测 4~10 秒）
+跑在了 `on_detected` 回调里。引擎侧只改了契约文档，可执行代码零改动。
+"""
+
+import threading
+import time
+
+from tests.fakes import FakeSerial
+from wakeword.engine import WakeWordEngine
+
+
+class _FakeConfig:
+    """引擎只用到 config.get()，给个字典就够了（照 test_car_controller.py 的写法）。"""
+
+    def __init__(self, **values):
+        self._values = values
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+
+def _start_engine(monkeypatch, on_detected, *, cooldown=0.0, timeout=0.05):
+    """建引擎并 start()，返回 (engine, 引擎内部建出来的那个假串口)。
+
+    `serial.Serial` 是**全局**替换的（monkeypatch 会在用例结束后还原：
+    它替换的是 serial 模块上的 Serial 属性，而 wakeword.engine 引用的就是这个模块）。
+    """
+    monkeypatch.setattr("wakeword.engine.serial.Serial", FakeSerial)
+    config = _FakeConfig(**{
+        "wakeword.port": "/dev/fake",
+        "wakeword.baudrate": 115200,
+        "wakeword.serial_timeout_sec": timeout,
+        "wakeword.cooldown_sec": cooldown,
+    })
+    engine = WakeWordEngine(config)
+    engine.start(on_detected)
+
+    fake = engine._ser          # 引擎在 start() 里自己建的那一个
+    assert isinstance(fake, FakeSerial), "serial.Serial 没被换成 FakeSerial？"
+    return engine, fake
+
+
+def _wait_until(predicate, timeout=2.0, interval=0.005):
+    """轮询等条件成立。超时上限都压得很短 —— 出问题是「断言失败」，不是「测试挂死」。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
+def test_drain_discards_frames_accumulated_during_callback(monkeypatch):
+    """回调执行期间堆积的帧会被 `reset_input_buffer()` 丢掉 —— 有意行为，不是 bug。
+
+    为什么必须丢：回调返回之后，缓冲里如果还留着用户在这几百毫秒里多喊的那一声，
+    监听循环会**立刻**拿它再触发一次唤醒。这一轮刚跑完，马上又被旧帧唤起 ——
+    比丢帧糟得多。所以「丢」是设计（设计文档 §7 坑 1），不是缺陷。
+
+    这里同时钉住「丢了之后不会又被翻出来」：丢掉之后静静等一会儿，计数必须还是 1。
+    """
+    detections: list[int] = []
+    first_callback_started = threading.Event()
+
+    def on_detected():
+        detections.append(len(detections))
+        first_callback_started.set()
+        time.sleep(0.3)                 # 假装在跑急停 / 流水线
+
+    engine, fake = _start_engine(monkeypatch, on_detected, cooldown=0.0)
+    try:
+        fake.feed_frame(0x01)
+        assert first_callback_started.wait(2.0), "第一次回调压根没跑起来"
+
+        # ★ 这一帧落在**回调执行期间**：监听循环此刻正卡在回调里，没人去读串口，
+        #   所以它只会躺在 OS 缓冲里等着被 _drain() 清掉。
+        stale = fake.feed_frame(0x02)
+
+        assert _wait_until(lambda: fake.discard_calls, 2.0), \
+            "回调返回后 _drain() 没有执行"
+        assert stale in fake.discard_calls, (
+            "回调期间堆积的帧没有被丢掉 —— _drain() 的行为变了？"
+            "（丢帧是设计，改它之前请先读 docstring）"
+        )
+
+        time.sleep(0.4)                 # 给「万一被翻出来」留足时间
+        assert len(detections) == 1, "被丢掉的陈旧帧居然又触发了一次唤醒"
+    finally:
+        engine.stop()
+
+
+class _FakeTime:
+    """只提供 monotonic() 的假 time 模块 —— 用来把冷却期瞬间推过去，不用真等 2 秒。
+
+    替换的是 `wakeword.engine` 模块里那个 `time` 名字（不是真的 time 模块），
+    所以不会影响 pytest / logging 自己的计时。
+    """
+
+    def __init__(self, start=1000.0):
+        self.t = start                  # 起点必须远离 0：_last_detection_time 初值就是 0.0
+
+    def monotonic(self):
+        return self.t
+
+
+def test_cooldown_swallows_rapid_second_wake(monkeypatch):
+    """冷却期（默认 2.0s）内的第二次唤醒被忽略，过了冷却期又能正常唤醒。
+
+    冷却是引擎**自己的**防抖，跟调用方的防重入是两件事（后者管的是「上一轮流水线还在跑」）。
+    两个不同的唤醒词（cmd 0x01 / 0x02）共用同一个冷却 —— 冷却按引擎算，不按 cmd 算。
+
+    后半段（推进假时钟后必须醒得过来）不是凑数：只测「第二次被忽略」的话，
+    监听线程万一已经死掉，那个用例照样会绿。
+    """
+    clock = _FakeTime()
+    monkeypatch.setattr("wakeword.engine.time", clock)
+
+    detections: list[int] = []
+    engine, fake = _start_engine(monkeypatch, lambda: detections.append(1),
+                                 cooldown=2.0)     # 就是 config 里的默认值
+    try:
+        fake.feed_frame(0x01)
+        assert _wait_until(lambda: len(detections) == 1, 2.0), "第一次唤醒没反应"
+
+        fake.feed_frame(0x02)                     # 冷却期内的第二声（<2s）
+        time.sleep(0.4)
+        assert len(detections) == 1, "冷却期内的第二次唤醒没被忽略"
+
+        clock.t += 3.0                            # 冷却期过去了
+        fake.feed_frame(0x03)
+        assert _wait_until(lambda: len(detections) == 2, 2.0), \
+            "冷却期过后仍然醒不过来 —— 引擎是不是已经停了？"
+    finally:
+        engine.stop()

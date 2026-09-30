@@ -1,0 +1,15 @@
+webrtcvad
+pyaudio
+pyserial
+dashscope
+openai
+loguru
+pyyaml
+# MCP。`mcp<2` 是**硬约束**不是偏好：qq-music-mcp 依赖 mcp.server.fastmcp，
+# 而 mcp 2.x 把它改名成了 MCPServer，import 时就 ModuleNotFoundError。
+# mcp 1.30.0 给到协议 2025-11-25，tools/resources/prompts +
+# elicitation/sampling/roots 双向能力齐全，够用。
+mcp<2
+qq-music-mcp
+# 测试
+pytest

@@ -1,0 +1,350 @@
+"""K230 拍照 + 云端视觉理解 —— 语音助手「看一眼」的客户端。
+
+这一层只做三件事：跑 `k230ctl snap` 抓一张 JPEG、把图 base64 后发给视觉模型、
+把正文原样返回。**失败一律抛 `LookError`**，不在这一层转成人话 ——
+转人话是工具层（`tools/vision.py`）的事，本层保持纯粹，方便单测。
+
+两个外部依赖都是**可注入的构造参数**（照 `car/ros_bridge.py` 的做法）：
+  * `runner` —— 跑 `k230ctl` 的子进程调用，默认 `subprocess.run`
+  * `client` —— `openai.OpenAI` 实例，默认**第一次真要发请求时**才按 config 建
+测试靠这两个换假的：不插 K230、断网也能跑。
+
+★ 隐藏坑一（2026-09-18 在 Pi 上实测）：`deepseek-flash` 是**推理模型**，
+先吐 `reasoning_content` 再吐 `content`。`max_tokens` 给小了（实测 200）
+正文直接是空的 —— 表现是「工具返回空字符串」，看着像工具坏了，
+其实是预算被思考过程吃光。所以「正文为空」在本模块里是**单独一条失败路径**，
+绝不返回空字符串。详见设计文档 §4.3。
+
+★ 隐藏坑二（T4b）：`k230ctl snap` **成功时也会往 stderr 写 `WARN 只攒到 N 帧`**。
+那意味着画面可能没跨过 IDR、图像可能是坏的，而坏画面喂给视觉模型，
+它会**自信地描述一个不存在的东西**。语音助手里「自信地说错」比「说看不清」
+糟得多，而且事后极难发现。所以 `snap()` 对可疑照片重试一次，仍可疑才在回答
+前面加一句保留（见 `snap()` / `describe()`）。
+"""
+
+from __future__ import annotations
+
+import base64
+import shlex
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+from loguru import logger
+from openai import OpenAI
+
+# ---------------------------------------------------------------- 默认值
+# ★ 默认值写在**代码里**，因为 `config.yaml` 的 `vision:` 段是 T5 才加的 ——
+# 在那之前本模块必须能在「完全没有 vision 段」的配置下照常工作。
+# 数值与设计 §5 一致，别各改各的。
+DEFAULT_SNAP_CMD = "/home/cy/k230-vision/pi/k230ctl snap"
+# 这是**整个 snap()（含重试）的总预算**，不是单次子进程调用的超时（T4b）。
+DEFAULT_SNAP_TIMEOUT_SEC = 25
+DEFAULT_REQUEST_TIMEOUT_SEC = 30
+DEFAULT_MODEL = "deepseek-flash"
+# 推理模型，给小了正文为空（§4.3 实测 200 就空）。别往下调。
+DEFAULT_MAX_TOKENS = 1500
+DEFAULT_DETAIL = "low"
+DEFAULT_INSTRUCTION = "用一到两句口语化中文回答，直接说结论，不要罗列。"
+
+# 最多试几次（1 次正常 + 1 次重试）。重试的触发条件见 snap()。
+_MAX_SNAP_ATTEMPTS = 2
+# 单次子进程调用的上限。真正的上限是 min(它, 剩余预算)。
+#
+# ★ 必须**严格大于** `k230ctl` 自己的 `--timeout` 默认值（12s），所以这里取 15。
+#   两个 12 相等就是**竞态** —— 谁先到点不定：
+#     * 内层（k230ctl）先到：它退出码非 0，并把具体的 `SNAP FAILED: <原因>` 写进
+#       stderr，我们能原样转达给模型；
+#     * 外层（我们）先到：只能给一句笼统的「拍照超时」，上面那条线索反而丢了。
+#   取 15 = 让内层先干净地退出，外层只当兜底。
+# ⚠️ 将来若在 config.yaml 的 `vision.snap_cmd` 里给了别的 `--timeout`，**这个常量要
+#   跟着调**，始终留出余量（建议 = 内层 timeout + 3 秒左右）。
+_PER_ATTEMPT_TIMEOUT_SEC = 15.0
+# 照片可疑时给模型的一句保留。要短、口语化、能被直接念出来，别像系统报错。
+_SUSPECT_CAVEAT = "（照片可能没拍全，看不太准）"
+
+
+class LookError(Exception):
+    """一次「看一眼」失败。工具层会把它转成给模型看的人话。"""
+
+
+def _first_line(text: str | None) -> str:
+    """取第一行非空内容 —— stderr 可能整段是空的，也可能前面垫了空行。"""
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return "(stderr 是空的)"
+
+
+class K230Vision:
+    """一次「看一眼」：拍照 → 上云 → 返回画面内容。
+
+    Usage:
+        vision = K230Vision(config)
+        print(vision.look("前面有什么"))
+
+    `config` 只要有个 `get(key, default)` 就行（`utils.config.Config` 那个形状），
+    不依赖具体类型 —— 测试里用的是同形状的小替身。
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        *,
+        runner: Callable[..., Any] = subprocess.run,
+        client: Any = None,
+    ) -> None:
+        self._config = config
+        self._runner = runner
+        self._client = client  # None → 第一次发请求时才建，见 _ensure_client
+
+        self._snap_cmd = config.get("vision.snap_cmd", DEFAULT_SNAP_CMD)
+        self._snap_timeout = config.get("vision.snap_timeout_sec", DEFAULT_SNAP_TIMEOUT_SEC)
+        self._request_timeout = config.get(
+            "vision.request_timeout_sec", DEFAULT_REQUEST_TIMEOUT_SEC
+        )
+        self._model = config.get("vision.model", DEFAULT_MODEL)
+        self._max_tokens = config.get("vision.max_tokens", DEFAULT_MAX_TOKENS)
+        self._detail = config.get("vision.detail", DEFAULT_DETAIL)
+        self._instruction = config.get("vision.instruction", DEFAULT_INSTRUCTION)
+
+        # 最近一次 snap() 拿到的照片是否「可疑」。describe() 靠它决定要不要加保留。
+        # 只在 describe() **自己**拍了照的那条路径上被读（见 describe）。
+        self._last_snap_suspect = False
+
+    # ---------------------------------------------------------------- 拍照
+
+    def snap(self) -> str:
+        """跑 `k230ctl snap` 抓一张 JPEG，返回它的路径。
+
+        ★ `vision.snap_timeout_sec` 是**整个 snap()（含重试）的总预算**，不是单次超时。
+        最多试 `_MAX_SNAP_ATTEMPTS` 次；每次子进程调用只拿
+        `min(_PER_ATTEMPT_TIMEOUT_SEC, 剩余预算)`，剩余预算 ≤ 0 就直接收工、
+        不再发起新尝试。
+
+        触发重试的两种情况（**都算**）：
+          * **硬失败** —— 退出码非 0 / 超时 / 命令跑不起来
+          * **可疑** —— 退出码 0，但 stderr 里有 `WARN`（攒的帧太少、未必跨过 IDR，
+            画面可能不可靠，见 pi/README.md）
+
+        「可疑」**不是**失败：照片是拿到了的，常常仍然能用。所以重试后仍然可疑时
+        **不抛异常** —— 路径照给，只是 `describe()` 会在回答前面加一句保留，
+        让模型别自信地描述一个不存在的东西（记一条 warning）。硬失败重试后仍然
+        失败才抛 `LookError`。
+
+        ★ 本方法**不依赖 `k230ctl` 内部的重试**（`--attempts`）：内层自己也重试会让
+        「总预算 + 两次尝试」变成两层各算各的，预算就不可控了。T5 会把 snap_cmd
+        改成带 `--attempts 1`。这里只按「一次调用 = 一次尝试」来算。
+
+        ★ 取 stdout / 用 `shlex.split` + `shell=False` 的理由见 `_snap_once`。
+        """
+        deadline = time.monotonic() + float(self._snap_timeout)
+        kept_path: str | None = None  # 拿到过、但可疑的照片
+        failure: LookError | None = None
+
+        for attempt in range(1, _MAX_SNAP_ATTEMPTS + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(f"视觉：拍照总预算 {self._snap_timeout} 秒用完了，不再尝试")
+                break
+
+            try:
+                path, suspect = self._snap_once(min(_PER_ATTEMPT_TIMEOUT_SEC, remaining))
+            except LookError as exc:
+                failure = exc
+                if attempt < _MAX_SNAP_ATTEMPTS:
+                    logger.warning(f"视觉：第 {attempt} 次拍照没成 —— {exc}；重试一次")
+                continue
+
+            if not suspect:
+                self._last_snap_suspect = False
+                return path
+
+            # 可疑：先留着。万一后面几次都拿不到更好的，这张仍然比「没拍成」有用。
+            kept_path = path
+            failure = None
+            if attempt < _MAX_SNAP_ATTEMPTS:
+                logger.warning(
+                    f"视觉：第 {attempt} 次拍照只攒到很少的帧（疑似没跨过 IDR）；重试一次"
+                )
+
+        if kept_path is not None:
+            self._last_snap_suspect = True
+            logger.warning(
+                "视觉：重试后照片仍可疑（stderr 里有 WARN）—— 照常送模型，"
+                "但回答会带一句保留"
+            )
+            return kept_path
+
+        self._last_snap_suspect = False
+        if failure is not None:
+            raise failure
+        raise LookError(
+            f"拍照超时（总预算 {self._snap_timeout} 秒用完了，K230 可能没连上）"
+        )
+
+    def _snap_once(self, timeout: float) -> tuple[str, bool]:
+        """跑一次 `k230ctl snap`，返回 `(路径, 是否可疑)`；硬失败抛 `LookError`。
+
+        「可疑」= 退出码 0 但 stderr 里有 `WARN` —— 照片是拿到了的，所以不算失败。
+
+        ★ 用 `shlex.split` + `shell=False`，**不用** `shell=True`。理由是超时：
+        `subprocess.run` 超时后只能杀掉**直接子进程**。走 shell 的话它杀的是
+        `/bin/sh`，真正的 `k230ctl`（python）会被留下来继续跑 —— 而它正占着 K230
+        的 RTSP 流、还要往 `/tmp/k230` 写文件，下一张照片就会撞上它，而且没人知道
+        那个进程还在。对一条「会挂住十几秒」的命令来说，「杀掉真正在跑的那个」
+        比「支持在配置里写重定向/管道」重要得多。
+        代价：`~` 和 `$VAR` 不展开，`vision.snap_cmd` 里必须写绝对路径。
+        """
+        argv = shlex.split(self._snap_cmd or "")
+        if not argv:
+            raise LookError("vision.snap_cmd 是空的，没有可执行的命令")
+
+        try:
+            result = self._runner(argv, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise LookError(
+                f"拍照超时（单次上限 {timeout:g} 秒，K230 可能没连上）"
+            ) from exc
+        except OSError as exc:
+            # snap_cmd 指向不存在的程序 / 没有执行权限 / 不是可执行文件。
+            # 不包住的话它就不是 LookError，工具层转不成人话（T6 验收会拔 K230）。
+            raise LookError(f"跑不通 snap 命令 {argv[0]!r} —— {exc}") from exc
+
+        if result.returncode != 0:
+            raise LookError(
+                f"snap 失败（退出码 {result.returncode}）—— {_first_line(result.stderr)}"
+            )
+
+        # 成功时 stdout 只有一行路径，但可能带尾随空格/空行（`IMG=$(k230ctl snap)`）。
+        lines = (result.stdout or "").strip().splitlines()
+        if not lines:
+            raise LookError("snap 说成功了，但 stdout 里没有路径")
+        path = lines[0]
+
+        if not Path(path).exists():
+            raise LookError(f"snap 报的路径不存在 —— {path}")
+        size = Path(path).stat().st_size
+        if size == 0:
+            # 0 字节是 snap 的**已知中间态**（文件先被创建、再写内容，见 pi/README.md）——
+            # 当成功就会把一张空图发给模型，然后得到一句莫名其妙的回答。
+            raise LookError(
+                f"snap 产出的文件是 0 字节（已知的中间态，照片没写成）—— {path}"
+            )
+
+        suspect = "WARN" in (result.stderr or "")
+        logger.info(
+            f"视觉：拍到一张 {size} 字节的照片"
+            f"{'（可疑：stderr 里有 WARN）' if suspect else ''} —— {path}"
+        )
+        return path, suspect
+
+    # ---------------------------------------------------------------- 上云
+
+    def describe(self, question: str, image_path: str | None = None) -> str:
+        """把一张照片交给视觉模型，返回要念给用户听的那句话。
+
+        `image_path` 省略时**先拍一张**（等价于 `look()`）—— 这条默认值是为了让
+        「手上已经有一张图，直接问它」也能用（冒烟测试就是这么调的）。
+        正常链路请用 `look()`，它把「拍哪张」和「描述哪张」绑成同一次拍照。
+
+        若这张照片是我们自己拍的、且**可疑**（见 `snap()`），返回文本前面会加一句
+        简短保留 —— 「自信地说错」比「说看不清」糟得多，而坏画面最容易让模型
+        自信地说错。调用方给了现成路径时不加（我们不知道那张图是怎么来的）。
+        """
+        if image_path is None:
+            path = self.snap()
+            return self._describe(question, path, self._last_snap_suspect)
+        # 外部给的现成照片：我们不知道它是怎么来的，凭空加一句「可能没拍全」就是假警报
+        return self._describe(question, image_path, suspect=False)
+
+    def _describe(self, question: str, path: str, suspect: bool) -> str:
+        """`describe` / `look` 共用的那一段：读图 → 上云 → 按需加保留。"""
+        image_bytes = self._read_image(path)
+        data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")
+
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"{self._instruction}\n\n用户的问题：{question}",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url, "detail": self._detail},
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": self._max_tokens,
+            "stream": False,
+            # 超时逐次传（而不是构造 OpenAI 时写死）：改了 config 不用重启就生效
+            "timeout": self._request_timeout,
+        }
+
+        try:
+            response = self._ensure_client().chat.completions.create(**payload)
+        except Exception as exc:  # noqa: BLE001 —— HTTP 错误/超时/网络断，一律转成 LookError
+            logger.error(f"视觉：请求 {self._model} 失败 —— {exc}")
+            raise LookError(f"视觉请求失败 —— {exc}") from exc
+
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            raise LookError("视觉模型没返回任何候选结果")
+
+        content = getattr(choices[0].message, "content", None) or ""
+        if not content.strip():
+            # ★ 这里**绝不能**返回空字符串。空串的表现是「工具坏了」，
+            # 而真因是预算被 reasoning 吃光（deepseek-flash 先吐 reasoning_content）。
+            logger.error(
+                f"视觉：正文是空的（max_tokens={self._max_tokens}）—— "
+                f"{self._model} 是推理模型，reasoning 会先吃预算；"
+                f"把 vision.max_tokens 调大（≥1000）"
+            )
+            raise LookError(
+                f"视觉模型只回了思考过程、正文是空的"
+                f"（max_tokens={self._max_tokens} 可能被 reasoning 吃光）"
+            )
+
+        text = content.strip()
+        if suspect:
+            return f"{_SUSPECT_CAVEAT}{text}"
+        return text
+
+    def look(self, question: str) -> str:
+        """拍一张，然后让模型描述**刚拍的这一张**。工具层调的就是这个。
+
+        snap 是整条链路里最慢的一跳（3~8 秒，设计 §4.4），所以拍照只做一次 ——
+        这里的 `self.snap()` 结果必须原样传给 `describe`。
+        """
+        path = self.snap()
+        return self._describe(question, path, self._last_snap_suspect)
+
+    # ---------------------------------------------------------------- 内部
+
+    def _read_image(self, path: str) -> bytes:
+        try:
+            data = Path(path).read_bytes()
+        except OSError as exc:
+            raise LookError(f"读不到照片 {path} —— {exc}") from exc
+        if not data:
+            raise LookError(f"照片是 0 字节，发出去也没意义 —— {path}")
+        return data
+
+    def _ensure_client(self) -> Any:
+        """惰性建 OpenAI 客户端：不真发请求就永远不读 key、不建连接池。
+
+        顺带的好处：只想测 `snap` 的调用方（不注入 client）不会因为配置里
+        没有 `llm.api_key` 而在构造对象时就炸掉。
+        """
+        if self._client is None:
+            self._client = OpenAI(
+                api_key=self._config.get("llm.api_key"),
+                base_url=self._config.get("llm.base_url", "https://api.deepseek.com"),
+            )
+        return self._client

@@ -1,0 +1,200 @@
+"""唤醒引擎（`wakeword/engine.py`）的行为特征化测试。
+
+★★ 这个文件里的测试**不是**「驱动某次改动」的测试，而是**特征化测试**
+（characterization test）—— 它们钉住的是**引擎侧本来就不阻塞**这个既有事实。
+
+背景：2026-09-18 的「唤醒握手重构」要解决的阻塞**不在引擎**，而在调用方 ——
+`ConversationManager._on_wake_word` 把整条对话流水线（录音 / ASR / LLM / TTS，
+实测 4~10 秒）跑在了 `on_detected` 回调里。引擎自身从头到尾只是
+「读字节 → 解析帧 → 调回调」，本次改动**一行可执行代码都没动**，
+只改了它的契约文档（模块 docstring / `start()` 的 Args / `_drain()` 的注释）。
+详见 docs/plans/2026-09-18-wake-handoff-and-vision-design.md §3。
+
+所以 `test_slow_callback_does_not_block_listening` 这个用例**在改动前后都会通过**。
+它存在的唯一目的是：**防止后人看到别处阻塞了，就跑来这里顺手给引擎加把锁**
+（例如「回调返回前不读串口」这种防重入保护）。真那么加，会同时毁掉两件事：
+  1.「喊唤醒词 = 急停」在流水线正忙时立刻失效 —— 那是本项目最重要的一条路径；
+  2. 唤醒词的响应会被上一轮流水线的长度直接拖住。
+防重入是**调用方**的责任（设计文档 §3.1 的契约反转）—— 要加去调用方加，
+**不要加在引擎里**。哪天觉得这个用例「多余、删掉吧」，请先读完上面这段。
+
+顺带钉住的另外两条：
+  * `_drain()` 在回调之后丢弃「回调执行期间堆积的帧」是**有意行为**，不是 bug；
+  * 冷却期（默认 2.0s）内的第二次唤醒被忽略。
+"""
+
+import threading
+import time
+
+from tests.fakes import FakeSerial
+from wakeword.engine import WakeWordEngine
+
+
+class _FakeConfig:
+    """引擎只用到 config.get()，给个字典就够了（照 test_car_controller.py 的写法）。"""
+
+    def __init__(self, **values):
+        self._values = values
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+
+def _start_engine(monkeypatch, on_detected, *, cooldown=0.0, timeout=0.05):
+    """建引擎并 start()，返回 (engine, 引擎内部建出来的那个假串口)。
+
+    `serial.Serial` 是**全局**替换的（monkeypatch 会在用例结束后还原：
+    它替换的是 serial 模块上的 Serial 属性，而 wakeword.engine 引用的就是这个模块）。
+    """
+    monkeypatch.setattr("wakeword.engine.serial.Serial", FakeSerial)
+    config = _FakeConfig(**{
+        "wakeword.port": "/dev/fake",
+        "wakeword.baudrate": 115200,
+        "wakeword.serial_timeout_sec": timeout,
+        "wakeword.cooldown_sec": cooldown,
+    })
+    engine = WakeWordEngine(config)
+    engine.start(on_detected)
+
+    fake = engine._ser          # 引擎在 start() 里自己建的那一个
+    assert isinstance(fake, FakeSerial), "serial.Serial 没被换成 FakeSerial？"
+    return engine, fake
+
+
+def _wait_until(predicate, timeout=2.0, interval=0.005):
+    """轮询等条件成立。超时上限都压得很短 —— 出问题是「断言失败」，不是「测试挂死」。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
+def test_slow_callback_does_not_block_listening(monkeypatch):
+    """慢回调不会把监听循环拖死 —— 回调返回后，新的唤醒帧照样能被检测到。
+
+    ★ 特征化测试：改动前后都会通过（见模块 docstring 那段 ★★）。
+
+    时序（注意第 2 帧为什么必须等 `_drain()` 落定之后再喂）：
+
+        t≈0      喂第 1 帧
+        t≈0      引擎读完这一帧 → 调回调 → 回调阻塞 0.3s
+        t≈0.3    回调返回 → finally: `_drain()` 丢掉期间堆积的帧（见下面第 2 个用例）
+        t≈0.3+   喂第 2 帧 → 引擎仍在监听 → 第 2 次回调
+
+    第 2 帧如果喂在回调执行期间，会被 `_drain()` **有意**丢掉 —— 那是
+    `test_drain_discards_frames_accumulated_during_callback` 钉的行为，
+    不是这里要测的东西。这里要测的是：回调那 0.3s 没有把监听循环拖住。
+    """
+    detections: list[int] = []
+    first_callback_done = threading.Event()
+
+    def on_detected():
+        detections.append(len(detections))
+        if len(detections) == 1:
+            time.sleep(0.3)             # 故意的慢回调：假装在读串口线程上干了件事
+            first_callback_done.set()
+
+    engine, fake = _start_engine(monkeypatch, on_detected, cooldown=0.0)
+    try:
+        fake.feed_frame(0x01)
+        assert first_callback_done.wait(2.0), "第一次回调压根没跑起来"
+
+        # 等 _drain() 执行完再喂 —— 否则第 2 帧会被它有意丢掉（见 docstring）。
+        # 顺带也钉住了「回调返回后 finally 块确实跑了」。真有人把 _drain() 拿掉，
+        # 这里会和第 2 个用例一起红 —— 那不是误报，是同一个改动的两个症状。
+        assert _wait_until(lambda: fake.discard_calls, 2.0), \
+            "回调返回后 _drain() 没有执行"
+
+        fake.feed_frame(0x02)
+        assert _wait_until(lambda: len(detections) >= 2, 2.0), (
+            "回调返回后监听循环再没检测到新的唤醒帧 —— 监听循环被回调的耗时拖住了。"
+            "（如果有人给引擎加了「回调返回前不读串口」之类的锁，就是这里炸）"
+        )
+    finally:
+        engine.stop()
+
+
+def test_drain_discards_frames_accumulated_during_callback(monkeypatch):
+    """回调执行期间堆积的帧会被 `reset_input_buffer()` 丢掉 —— 有意行为，不是 bug。
+
+    为什么必须丢：回调返回之后，缓冲里如果还留着用户在这几百毫秒里多喊的那一声，
+    监听循环会**立刻**拿它再触发一次唤醒。这一轮刚跑完，马上又被旧帧唤起 ——
+    比丢帧糟得多。所以「丢」是设计（设计文档 §7 坑 1），不是缺陷。
+
+    这里同时钉住「丢了之后不会又被翻出来」：丢掉之后静静等一会儿，计数必须还是 1。
+    """
+    detections: list[int] = []
+    first_callback_started = threading.Event()
+
+    def on_detected():
+        detections.append(len(detections))
+        first_callback_started.set()
+        time.sleep(0.3)                 # 假装在跑急停 / 流水线
+
+    engine, fake = _start_engine(monkeypatch, on_detected, cooldown=0.0)
+    try:
+        fake.feed_frame(0x01)
+        assert first_callback_started.wait(2.0), "第一次回调压根没跑起来"
+
+        # ★ 这一帧落在**回调执行期间**：监听循环此刻正卡在回调里，没人去读串口，
+        #   所以它只会躺在 OS 缓冲里等着被 _drain() 清掉。
+        stale = fake.feed_frame(0x02)
+
+        assert _wait_until(lambda: fake.discard_calls, 2.0), \
+            "回调返回后 _drain() 没有执行"
+        assert stale in fake.discard_calls, (
+            "回调期间堆积的帧没有被丢掉 —— _drain() 的行为变了？"
+            "（丢帧是设计，改它之前请先读 docstring）"
+        )
+
+        time.sleep(0.4)                 # 给「万一被翻出来」留足时间
+        assert len(detections) == 1, "被丢掉的陈旧帧居然又触发了一次唤醒"
+    finally:
+        engine.stop()
+
+
+class _FakeTime:
+    """只提供 monotonic() 的假 time 模块 —— 用来把冷却期瞬间推过去，不用真等 2 秒。
+
+    替换的是 `wakeword.engine` 模块里那个 `time` 名字（不是真的 time 模块），
+    所以不会影响 pytest / logging 自己的计时。
+    """
+
+    def __init__(self, start=1000.0):
+        self.t = start                  # 起点必须远离 0：_last_detection_time 初值就是 0.0
+
+    def monotonic(self):
+        return self.t
+
+
+def test_cooldown_swallows_rapid_second_wake(monkeypatch):
+    """冷却期（默认 2.0s）内的第二次唤醒被忽略，过了冷却期又能正常唤醒。
+
+    冷却是引擎**自己的**防抖，跟调用方的防重入是两件事（后者管的是「上一轮流水线还在跑」）。
+    两个不同的唤醒词（cmd 0x01 / 0x02）共用同一个冷却 —— 冷却按引擎算，不按 cmd 算。
+
+    后半段（推进假时钟后必须醒得过来）不是凑数：只测「第二次被忽略」的话，
+    监听线程万一已经死掉，那个用例照样会绿。
+    """
+    clock = _FakeTime()
+    monkeypatch.setattr("wakeword.engine.time", clock)
+
+    detections: list[int] = []
+    engine, fake = _start_engine(monkeypatch, lambda: detections.append(1),
+                                 cooldown=2.0)     # 就是 config 里的默认值
+    try:
+        fake.feed_frame(0x01)
+        assert _wait_until(lambda: len(detections) == 1, 2.0), "第一次唤醒没反应"
+
+        fake.feed_frame(0x02)                     # 冷却期内的第二声（<2s）
+        time.sleep(0.4)
+        assert len(detections) == 1, "冷却期内的第二次唤醒没被忽略"
+
+        clock.t += 3.0                            # 冷却期过去了
+        fake.feed_frame(0x03)
+        assert _wait_until(lambda: len(detections) == 2, 2.0), \
+            "冷却期过后仍然醒不过来 —— 引擎是不是已经停了？"
+    finally:
+        engine.stop()

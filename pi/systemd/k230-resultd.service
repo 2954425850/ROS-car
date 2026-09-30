@@ -1,0 +1,18 @@
+[Unit]
+Description=K230 视觉结果接收 (Pi 侧)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cy
+WorkingDirectory=/home/cy/k230-vision/pi
+ExecStart=/usr/bin/python3 /home/cy/k230-vision/pi/k230ctl resultd
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

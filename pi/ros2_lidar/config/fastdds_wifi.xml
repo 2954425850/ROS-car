@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Fast DDS profile for the WiFi link between the Pi (nepu) and the desktop.
+
+  WHY: slam_toolbox publishes /map as a ~20 KB RELIABLE + TRANSIENT_LOCAL
+  OccupancyGrid. Fast DDS's default transport hands that to the kernel as a
+  single ~20 KB UDP datagram, which IP then splits into ~14 fragments. This
+  WiFi link (2.4 GHz, phone hotspot) drops a large fraction of fragmented
+  packets: `ping -s 3000` shows ~35% loss where `ping -s 1400` shows 0%. The
+  odds of all ~14 fragments of one /map surviving are therefore effectively
+  zero. RELIABLE keeps retransmitting the undeliverable sample, which
+  saturates the link and drags /scan down with it.
+
+  maxMessageSize below forces Fast DDS to fragment at the RTPS layer instead,
+  so every datagram on the wire stays well under the 1500 byte MTU and is
+  never IP fragmented. 1400 leaves headroom for the UDP/IP headers.
+
+  USE (on BOTH machines, in every shell that talks to the other):
+      export FASTRTPS_DEFAULT_PROFILES_FILE=/path/to/fastdds_wifi.xml
+
+  NOTE ON PLACEMENT: initialPeersList belongs directly under <builtin>, NOT
+  inside <discovery_config>. Putting it under discovery_config makes Fast DDS
+  reject the whole file with
+      "Invalid element found into 'discoverySettingsType'"
+  and then silently fall back to default multicast discovery, so the mistake
+  is invisible unless you read the node's stderr. The old unicast_peers.xml in
+  this directory had exactly that bug.
+
+  BOTH peers are listed so discovery works even if the AP filters multicast.
+  If a host's DHCP address changes, update every copy.
+      10.222.152.225  raspberry pi "nepu"     (rplidar + slam_toolbox)
+      10.222.152.118  ubuntu 24.04 "desktop"  (rviz2)
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>udp_wifi</transport_id>
+            <type>UDPv4</type>
+            <!-- Never emit a datagram that IP would have to fragment. -->
+            <maxMessageSize>1400</maxMessageSize>
+            <!-- Absorb retransmit bursts instead of dropping them in kernel. -->
+            <sendBufferSize>1048576</sendBufferSize>
+            <receiveBufferSize>1048576</receiveBufferSize>
+        </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="wifi_frag" is_default_profile="true">
+        <rtps>
+            <userTransports>
+                <transport_id>udp_wifi</transport_id>
+            </userTransports>
+            <useBuiltinTransports>false</useBuiltinTransports>
+            <builtin>
+                <discovery_config>
+                    <discoveryProtocol>SIMPLE</discoveryProtocol>
+                    <leaseDuration>
+                        <sec>20</sec>
+                    </leaseDuration>
+                </discovery_config>
+                <initialPeersList>
+                    <locator>
+                        <udpv4>
+                            <address>10.222.152.225</address>
+                        </udpv4>
+                    </locator>
+                    <locator>
+                        <udpv4>
+                            <address>10.222.152.118</address>
+                        </udpv4>
+                    </locator>
+                </initialPeersList>
+            </builtin>
+        </rtps>
+    </participant>
+
+</profiles>

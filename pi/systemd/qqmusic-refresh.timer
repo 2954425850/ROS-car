@@ -1,0 +1,12 @@
+[Unit]
+Description=每 6 小时查一次 QQ音乐 key 剩余寿命（只在快到期时才真续期）
+
+[Timer]
+# 检查是纯本地读文件，不联网也不消耗登录次数，所以查得勤一点没关系。
+# 关键是 refresh 的 12h 门槛必须被逮住 —— 每 6h 查一次，必然落在 (6h,12h] 窗口里。
+OnCalendar=*-*-* 00,06,12,18:37:00
+# 机器那天没开机/关机，开机后补跑一次
+Persistent=true
+
+[Install]
+WantedBy=timers.target

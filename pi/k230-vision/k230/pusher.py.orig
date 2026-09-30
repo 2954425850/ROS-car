@@ -1,0 +1,95 @@
+# /sdcard/k230vision/pusher.py
+"""裸 H.264 over TCP 推流。
+
+## 丢帧策略（重要，别写错）
+
+H.264 的 P 帧有参考链。**发半帧、或丢单个 NAL，会污染整条流直到下一个 I 帧。**
+所以本模块的铁律是：
+
+    一整帧要么整帧发完，要么整帧不发。
+
+实现：阻塞发送 + 每帧总超时。若某帧超时，说明 socket 已经堵了，
+**立刻断开重连**（而不是继续硬塞），并由调用方请求 IDR 让流尽快自愈。
+配合 GLOBAL GOP=25（1 秒），任何损伤 1 秒内恢复。
+
+## 为什么不缓冲
+
+MicroPython 堆只有约 3.9 MB。网络一堵就排队 = 内存爆 = 板子崩。
+宁掉帧，不排队。
+"""
+import socket
+import uctypes
+
+
+class Pusher:
+    def __init__(self, host, port, enc, chn, frame_timeout_s=0.5):
+        self.host = host
+        self.port = port
+        self.enc = enc
+        self.chn = chn
+        self.frame_timeout_s = frame_timeout_s
+        self.sock = None
+        self.frames_sent = 0
+        self.frames_dropped = 0
+        self.bytes_sent = 0
+
+    # ---- 连接管理 ----
+    def connect(self):
+        self.close()
+        try:
+            s = socket.socket()
+            s.settimeout(self.frame_timeout_s)
+            s.connect((self.host, self.port))
+            self.sock = s
+            return True
+        except OSError:
+            self.sock = None
+            return False
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    @property
+    def ok(self):
+        return self.sock is not None
+
+    # ---- 发一帧 ----
+    def _send_frame(self, stream_data):
+        """整帧发送。任何一份没发完就抛 OSError，由调用方断线重连。"""
+        for i in range(stream_data.pack_cnt):
+            buf = uctypes.bytearray_at(stream_data.data[i], stream_data.data_size[i])
+            n = self.sock.send(buf)
+            if n != len(buf):
+                raise OSError("partial send: %d/%d" % (n, len(buf)))
+            self.bytes_sent += n
+
+    def pump(self):
+        """取一帧编码码流并推出去。
+
+        返回：0 送出一帧；-1 当前没有码流；-2 连接故障（已断开）
+        """
+        if not self.ok:
+            return -2
+
+        stream_data = StreamData()
+        ret = self.enc.GetStream(self.chn, stream_data, timeout=100)
+        if ret != 0:
+            return -1
+
+        try:
+            self._send_frame(stream_data)
+            self.frames_sent += 1
+            rc = 0
+        except OSError:
+            # 帧已经发残缺，TCP 流不可恢复 -> 断线重连
+            self.frames_dropped += 1
+            self.close()
+            rc = -2
+        finally:
+            self.enc.ReleaseStream(self.chn, stream_data)
+        return rc

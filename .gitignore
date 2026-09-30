@@ -1,0 +1,27 @@
+# ---- 密钥/凭据：绝不入库 ----
+config.yaml
+config.yaml.*
+*.pem
+*.key
+*.env
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ---- ROS 2 构建产物 ----
+build/
+install/
+log/
+
+# ---- 运行日志 ----
+logs/
+*.log
+
+# ---- 旧快照机制遗留（改用 git 前用 tar 备份，只留磁盘不入库）----
+*.tar.gz
+
+# ---- 大块原始数据 ----
+*.raw
+*.bin

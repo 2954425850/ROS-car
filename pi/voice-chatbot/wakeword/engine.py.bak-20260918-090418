@@ -1,0 +1,186 @@
+"""唤醒词检测 —— 硬件串口模块。
+
+协议：5 字节定长帧 `AA 55 <CMD> 00 FB`，CMD 取值 0x01~0x06（对应不同唤醒词）。
+模块直接接 USB 转串口，插上后一般是 /dev/ttyUSB0；也可以用 udev 规则做软链接
+（config 默认的 /dev/myspeech 就是这个思路）。
+
+本引擎**不负责并发**。它只管「读字节 → 解析帧 → 调回调」这一条链，
+「回调里做什么、能不能阻塞、要不要防重入」全是调用方的事 ——
+引擎自身永远不该被某个回调拖住。回调契约见 start() 的 Args。
+
+与 09.AI_Big_Model/mic_serial.py 那份参考实现相比，这里修了三个坑：
+  1. 原版逐字节 read() 后 sleep(0.1)，一个 5 字节帧平白多出 ~500ms 延迟。
+     改成按 in_waiting 批量读，延迟降到 UART 帧时间。
+  2. 原版字节不匹配时不复位状态机，一个噪声字节就能让解析器永久失步。
+     这里任何不匹配都回到 SYNC1，且 0xAA 可以从任意状态重新起帧。
+  3. 原版串口打不开就静默空转，用户完全不知道。这里 start() 直接抛错并给出可操作提示。
+"""
+
+import threading
+import time
+from typing import Callable
+
+import serial
+from loguru import logger
+
+from utils.config import Config
+
+_SYNC1, _SYNC2, _CMD, _RESERVED, _TAIL = range(5)
+
+_HEADER_1 = 0xAA
+_HEADER_2 = 0x55
+_TAIL_BYTE = 0xFB
+_VALID_CMDS = frozenset(range(0x01, 0x07))
+
+
+class WakeWordEngine:
+    """从串口读取硬件唤醒模块的唤醒帧，检测到就回调。
+
+    Usage:
+        engine = WakeWordEngine(config)
+        engine.start(on_detected=lambda: print("Wake!"))
+        # ... later ...
+        engine.stop()
+    """
+
+    def __init__(self, config: Config):
+        self._port = config.get("wakeword.port", "/dev/myspeech")
+        self._baudrate = config.get("wakeword.baudrate", 115200)
+        self._timeout = config.get("wakeword.serial_timeout_sec", 0.1)
+        self._cooldown_sec = config.get("wakeword.cooldown_sec", 2.0)
+
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._on_detected: Callable[[], None] | None = None
+        self._last_detection_time = 0.0
+
+        self._ser: serial.Serial | None = None
+        self._step = _SYNC1
+        self._pending_cmd = 0
+
+    def start(self, on_detected: Callable[[], None]) -> None:
+        """打开串口并启动监听线程。
+
+        Args:
+            on_detected: 检测到唤醒词时调用。**必须立刻返回**（几百毫秒以内）——
+                回调是在监听线程上内联跑的，回调返回前监听循环不会继续读串口，
+                所以任何长操作（录音、ASR、跑模型、TTS……）都会让唤醒词在它执行期间
+                **失效**；长活儿请自己丢到后台线程去。
+                **防重入由调用方自己负责**（例如「上一轮流水线还没跑完就不再起新一轮」），
+                引擎不提供这层保护。
+
+        Raises:
+            serial.SerialException: 串口打不开（设备不存在、被占用、权限不足）。
+        """
+        if self._running:
+            logger.warning("WakeWord: already running")
+            return
+
+        self._on_detected = on_detected
+
+        try:
+            self._ser = serial.Serial(self._port, self._baudrate, timeout=self._timeout)
+        except Exception as e:
+            raise serial.SerialException(
+                f"唤醒模块串口 {self._port} 打开失败：{e}。"
+                f"请检查：① 模块是否插好（ls /dev/ttyUSB*）；"
+                f"② 当前用户是否在 dialout 组（sudo usermod -aG dialout $USER，需重新登录）；"
+                f"③ config.yaml 里 wakeword.port 是否与实际设备一致。"
+            ) from e
+
+        self._running = True
+        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self._thread.start()
+        logger.info(f"WakeWord: listening on {self._port} @ {self._baudrate}")
+
+    def stop(self) -> None:
+        """停止监听并关闭串口。先 join 再 close —— 反过来会让读取线程抛异常。"""
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        if self._ser is not None:
+            try:
+                if self._ser.is_open:
+                    self._ser.close()
+            except Exception as e:
+                logger.debug(f"WakeWord: 关闭串口失败: {e}")
+            self._ser = None
+        logger.info("WakeWord: stopped")
+
+    @property
+    def is_ready(self) -> bool:
+        """串口是否已就绪。"""
+        return self._ser is not None and self._ser.is_open
+
+    # ---- 内部 ----
+
+    def _listen_loop(self) -> None:
+        while self._running:
+            try:
+                waiting = self._ser.in_waiting
+                data = self._ser.read(waiting if waiting else 1)
+            except Exception as e:
+                logger.error(f"WakeWord: 串口读取失败，停止监听: {e}")
+                break
+
+            for byte in data:
+                cmd = self._feed(byte)
+                if cmd is not None:
+                    self._handle_detection(cmd)
+                    break  # 同一批里剩下的字节视为陈旧数据，交给 _drain 丢掉
+
+    def _feed(self, byte: int) -> int | None:
+        """喂一个字节给状态机。
+
+        Returns:
+            完整匹配一帧时返回帧里的 CMD，否则返回 None。
+        """
+        # 0xAA 可以从任何状态重新起帧 —— 这样即使前面被噪声带偏，也能立刻重新同步
+        if byte == _HEADER_1:
+            self._step = _SYNC2
+            return None
+
+        if self._step == _SYNC2:
+            self._step = _CMD if byte == _HEADER_2 else _SYNC1
+        elif self._step == _CMD:
+            if byte in _VALID_CMDS:
+                self._pending_cmd = byte
+                self._step = _RESERVED
+            else:
+                self._step = _SYNC1
+        elif self._step == _RESERVED:
+            self._step = _TAIL if byte == 0x00 else _SYNC1
+        elif self._step == _TAIL:
+            self._step = _SYNC1
+            if byte == _TAIL_BYTE:
+                return self._pending_cmd
+        else:
+            self._step = _SYNC1
+
+        return None
+
+    def _handle_detection(self, cmd: int) -> None:
+        now = time.monotonic()
+        if now - self._last_detection_time < self._cooldown_sec:
+            logger.debug(f"WakeWord: 冷却期内，忽略 cmd=0x{cmd:02X}")
+            return
+        self._last_detection_time = now
+        logger.info(f"WakeWord: detected (cmd=0x{cmd:02X})")
+
+        try:
+            if self._on_detected is not None:
+                self._on_detected()
+        finally:
+            # 清掉「回调执行期间」堆积的陈旧帧（例如急停那几百毫秒里用户又喊了一声）。
+            # **这是有意丢帧，不是 bug**：不改成排队处理，否则一次唤醒结束后会被
+            # 缓冲里的旧帧立刻再触发一次。用户想再唤醒，重新喊一声即可。
+            self._step = _SYNC1
+            self._drain()
+
+    def _drain(self) -> None:
+        try:
+            if self._ser is not None and self._ser.is_open:
+                self._ser.reset_input_buffer()
+        except Exception as e:
+            logger.debug(f"WakeWord: 清空串口缓冲失败: {e}")

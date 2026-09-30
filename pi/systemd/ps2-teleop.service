@@ -1,0 +1,15 @@
+[Unit]
+Description=raspot PS2 teleop + l150pro driver (ROS 2 Jazzy)
+After=multi-user.target
+
+[Service]
+Type=simple
+User=cy
+Environment=HOME=/home/cy
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/cy/raspot_ws/install/setup.bash && exec ros2 launch raspot_teleop ps2_bringup.launch.py'
+Restart=always
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!--
+  Minimal robot description for the nepu robot.
+
+  It exists so that base_link -> laser is published by robot_state_publisher
+  instead of a hand-started static_transform_publisher, and so the lidar's
+  real mounting offset has one obvious place to live.
+
+  NOTE: the origin below is identity, i.e. it claims the lidar sits exactly at
+  base_link. That is a stand-in carried over from the old setup, NOT a
+  measurement. Once you measure where the lidar actually is, put the real
+  xyz/rpy here and every consumer (slam_toolbox, RViz's RobotModel, anything
+  added later) picks it up automatically.
+
+  TODO: add wheel / IMU links here when those drivers land. The odom ->
+  base_link transform deliberately does NOT belong here -- that is a dynamic
+  transform owned by the odometry driver, not a fixed joint.
+-->
+<robot name="nepu">
+
+  <link name="base_link"/>
+
+  <link name="laser"/>
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+</robot>

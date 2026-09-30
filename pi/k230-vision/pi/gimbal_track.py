@@ -1,0 +1,475 @@
+# /home/cy/k230-vision/pi/gimbal_track.py —— 云台两轴**持续跟踪**（纯 Python）
+#
+# 【它解决什么】
+#
+# `camcenter.py` 是**单次**动作：目标跑出画，转过去、转到位就停，然后交给别人去锁。
+# 本模块是**持续跟踪**：板子每来一帧结果就算一次，两轴一起修，把目标一直摁在画面中间。
+# 控制律、方向符号、注入式接口都照 camcenter 的路子，但有**三处刻意不同**：
+#
+#   1. **不等新帧、立刻返回**。camcenter 是单次动作，阻塞等得起；跟踪是常驻循环，
+#      这一拍没有新帧就"不发指令"，然后回去睡 poll_s（见 run()）。
+#   2. **两轴同时动**。camcenter 一次只动偏得大的那一轴 —— 那是单次居中为了省步数；
+#      持续跟踪要跟得上目标，两轴必须一起修。
+#   3. **按帧算，不按时间积分**。没有 dt、没有积分项、没有"累积到超过死区才动"。
+#      所以板子推 0.8Hz 还是 6Hz，跑的是同一套代码。
+#
+# 【三道守卫（2026-09-21 加回）】
+#
+# 持续跟踪环最初移植时把 camcenter 的守卫丢了，代价是一次跑飞：一个**完全静止**的目标
+# （椅子）贴着画面左边缘被切，跟踪器照旧报 du≈+0.41，环拿这个废反馈全额叠指令 ——
+# 0.76 秒发了 5 条 ch5 left（累计 76°），一路撞到行程限位 800µs 才停。现在三道都有：
+#   ① 框有效性：`box_complete(box, margin)` 不过 → **一条指令都不发**。分两个码 ——
+#      BOX_CLIPPED（现在的位置不行，等等可能就行）/ BOX_TOO_BIG（这个框本身就不可能居中）。
+#   ② 无进展：连着 `patience` 帧发了指令而误差改善不到 `min_progress` → 停手（NO_PROGRESS）。
+#      **能恢复**：误差真的改善了就重新开始跟。
+#   ③ 数据陈旧：STALE / stale_s（这条一直留着，没动）。
+# margin / patience / min_progress 的默认值照 k_pan 那套写法**从 CenterConfig 现读**，
+# 本模块不抄数字。
+#
+# 【边界】本模块**只动云台舵机**（ch5 水平 / ch6 俯仰），不碰底盘电机。
+# 纯逻辑：不 import ROS、不 import serial、不碰硬件，能在 PC 上用假对象离线跑（见 t_gimbal_track.py）。
+#
+# 【实测依据（2026-09-19 ~ 09-21，别再验证、也别推翻）】
+#
+#   · `box` 是**归一化 [l,t,r,b]**，画面中心就是 (0.5, 0.5)。
+#   · 要跟的是 `src == "track"` 那一条（跟踪器锁定、帧间连续，实测存在率 ~87%）。
+#     没有 src 的是检测器当帧检出的，会跳会丢 —— **筛选由适配层做**，本模块不碰。
+#   · ⚠️ **`score` 不能用来判断有没有跟丢**（跟到背景上 score 一样 0.999）。
+#     所以本模块**完全不看 score**，也不做任何"置信度太低就丢目标"的判断。
+#   · 两轴**都没有静摩擦死区**：pan 实测 1.0°→15px、2°→34px、3°→52px、6°→104px。
+#     所以这里**没有**、也不该有"误差累积到超过死区才动"的补偿机制 —— 那是为不存在的死区设计的。
+#   · 两轴像素灵敏度都是 ~17 px/度。
+#   · 增益 / 步长上限 / 符号的默认值**不在这里抄数字**，直接读 `camcenter.CenterConfig()`
+#     （k_pan=38.0 / k_tilt=16.0 度每归一化偏差，pan_sign=tilt_sign=+1，均为实测）。
+#     以后重标定只改 camcenter，本模块自动跟着走。
+#   · ⚠️ 已知 `max_step_tilt=4.5` 偏小（25° 能转 462px），**这次照搬不改** —— 实车调参是后面的事。
+
+import math
+import time
+
+from camcenter import CenterConfig
+from geom import box_complete, box_size, safe_center_range
+
+# 默认值只从 camcenter 读，本模块不重复写数字（重标定只改一处）。
+_REF = CenterConfig()
+
+# ---- 结果码 ----
+HOLD = "hold"                    # 有目标，但两轴都在死区内 —— 保持，不动
+TRACKED = "tracked"              # 至少一轴发了指令（正在修）
+NO_TARGET = "no_target"          # 结果流还活着，但这一帧没有 src=="track" 的目标
+NO_NEW_FRAME = "no_new_frame"    # 帧号和上一拍一样 —— 不重复发指令
+STALE = "stale"                  # 拿不到结果数据 / 数据已经过期
+HIT_LIMIT = "hit_limit"          # 撞行程限位：那个方向不再推（**另一轴照常**）
+BAD_BOX = "bad_box"              # 框本身是坏的（不是 4 个数 / NaN / 退化成点）
+BOX_CLIPPED = "box_clipped"      # 框没整个落在画面内（被边缘切了）—— 反馈不可信，不发指令
+BOX_TOO_BIG = "box_too_big"      # 框大到连安全区都放不下 —— 转到哪儿都居中不了
+NO_PROGRESS = "no_progress"      # 连着 patience 帧发了指令而误差没改善 —— 方向反了 / 云台没在动
+
+
+def _bad_box(box):
+    """None = 这个框能用；否则返回一句"为什么不能用"。"""
+    try:
+        vals = [float(v) for v in box]
+    except (TypeError, ValueError):
+        return "不是 4 个数字（%r）" % (box,)
+    if len(vals) != 4:
+        return "不是 4 个数（%r）" % (box,)
+    if not all(math.isfinite(v) for v in vals):
+        return "里面有 nan/inf（%r）" % (box,)
+    l, t, r, b = vals
+    if r <= l or b <= t:
+        return "退化成一个点（l=%.3f r=%.3f t=%.3f b=%.3f）" % (l, t, r, b)
+    return None
+
+
+class TrackConfig:
+    """全部可调。
+
+    ⚠️ 带「实测」的默认值**不在这类里写死**，而是从 `camcenter.CenterConfig()`
+    现读（2026-09-19 真车标定，见 `t_camcalib.py`）—— 以后重标定只改 camcenter 一处。
+    带「待实车调」的是**没有实测依据**的，第一次上机必须现场调。
+
+    两轴灵敏度差 2.4 倍，所以增益和步长上限**按轴分开**（照 camcenter）——
+    共用一个 k 会让其中一轴要么太慢、要么直接冲过头。
+    """
+
+    def __init__(self,
+                 # ---- 实测：增益 = 度 / 归一化偏差 ----
+                 k_pan=_REF.k["pan"], k_tilt=_REF.k["tilt"],
+                 # ---- 实测：一步最多转几度 ----
+                 # ⚠️ max_step_tilt=4.5 偏小是**已知的**（25° 能转 462px），
+                 #    这次照搬不改。
+                 max_step_pan=_REF.max_step["pan"],
+                 max_step_tilt=_REF.max_step["tilt"],
+                 # ---- 实测：两轴都是 +1（`t_camcalib.py` 标出来的）----
+                 # 符号搞反了不会报错，只会越追越远。
+                 pan_sign=_REF.pan_sign, tilt_sign=_REF.tilt_sign,
+                 # ---- 待实车调：死区（归一化）----
+                 # 0.03 归一化 ≈ pan 2.3°、tilt 1.3°（17px/度、1280x720）。
+                 # 取它的**唯一目的**是防止目标停在中心附近时云台逐帧来回抖；
+                 # 代价是稳态残差有 deadband 这么大（比例律本来就过不了死区，
+                 # 这是设计选择，不是 bug）。
+                 # ⚠️ 同一个归一化值对两轴**不等价**：0.03 在 pan 上是 38px、
+                 #    在 tilt 上只有 22px（分母是 1280 vs 720）。要分轴调就显式给
+                 #    deadband_pan / deadband_tilt。
+                 deadband=0.03, deadband_pan=None, deadband_tilt=None,
+                 # ---- 实测（照 camcenter）：框必须整个落在画面内，还要再往里缩这么多 ----
+                 # 这是**硬边界**、不是保守值：2026-09-19 板上实测，目标框一开始出画
+                 # 跟踪器就崩（框塌缩 / ar_dev 跳 / lost）—— 框被切掉时它的输出
+                 # **不再反映目标在画面里的位置**，拿它当反馈就是闭着眼睛推云台。
+                 margin=_REF.margin,
+                 # ---- 照 camcenter：连着 patience 帧发了指令而误差没改善就停手 ----
+                 # 判据口径直接照抄 camcenter.center()，不另外发明一套。
+                 patience=_REF.patience, min_progress=_REF.min_progress,
+                 # ---- 待实车调：多久没拿到新数据就算"过期"（秒）----
+                 # 板子 6Hz → 1.0s = 连丢 6 帧。太小会把"跟踪器本来就会丢的那几帧"
+                 # 误判成断流；太大则目标早跑没了云台还在原地等。
+                 stale_s=1.0,
+                 # ---- 待实车调：run() 的轮询周期（秒）----
+                 # 应当 <= 板子的结果周期（6Hz → 0.167s），否则会漏帧。
+                 poll_s=0.05):
+        self.k = {"pan": k_pan, "tilt": k_tilt}
+        self.max_step = {"pan": max_step_pan, "tilt": max_step_tilt}
+        self.deadband = {"pan": deadband if deadband_pan is None else deadband_pan,
+                         "tilt": deadband if deadband_tilt is None else deadband_tilt}
+        self.pan_sign = pan_sign
+        self.tilt_sign = tilt_sign
+        self.margin = margin
+        self.patience = patience
+        self.min_progress = min_progress
+        self.stale_s = stale_s
+        self.poll_s = poll_s
+
+
+class AxisStep:
+    """一帧里某个轴做了什么（或者为什么没做）。测试直接查这个。"""
+
+    __slots__ = ("axis", "err", "direction", "wanted", "deg", "us",
+                 "hit_limit", "skipped", "blocked")
+
+    def __init__(self, axis, err=None, direction=None, wanted=None, deg=0.0,
+                 us=None, hit_limit=False, skipped=None, blocked=False):
+        self.axis = axis
+        self.err = err                # d = 0.5 - 框中心（>0 = 目标偏左/偏上）
+        self.direction = direction    # **真的发出去了**的方向；None = 这一轴没发指令
+        self.wanted = wanted          # 本来想往哪转（只有被限位拦下时才和 direction 不同）
+        self.deg = deg
+        self.us = us
+        self.hit_limit = hit_limit
+        self.skipped = skipped        # 没动的原因：deadband / blocked / <结果码>
+        self.blocked = blocked
+
+    def __repr__(self):
+        if self.direction is None:
+            return "<%s 未动(%s) d=%s>" % (self.axis, self.skipped, self.err)
+        return "<%s %s %.2f°>" % (self.axis, self.direction, self.deg)
+
+
+class TrackResult:
+    def __init__(self, outcome, note="", axes=None, frame=None, box=None):
+        self.outcome = outcome
+        self.note = note
+        self.axes = axes if axes is not None else {}
+        self.frame = frame
+        self.box = box
+        # 这一拍真的发出去的指令 [(方向, 度数)]，按 pan、tilt 的顺序
+        self.pulses = [(s.direction, s.deg) for s in self.axes.values()
+                       if s.direction is not None]
+        # "跟上了"和"本来就不用动"都算 ok；撞限位/丢目标/过期/坏数据不算。
+        self.ok = outcome in (TRACKED, HOLD)
+
+    @property
+    def moved(self):
+        return bool(self.pulses)
+
+    def __repr__(self):
+        return "<TrackResult %s frame=%s moved=%d %s>" % (
+            self.outcome, self.frame, len(self.pulses), self.note)
+
+
+class GimbalTracker:
+    """两轴持续跟踪。**每次 update() 只处理一帧、立刻返回** —— 不阻塞、不 sleep。
+
+    注入式接口（照 CamCenterer）：
+
+        rotator(direction, degrees) -> (目标脉宽 us, 是否撞限位)
+            direction ∈ left/right/up/down。**必须给结构化返回值** ——
+            `CarController.camera_move` 返回的是给人念的中文串，不能拿来当回路反馈。
+        read_target() -> (box, frame) 或 None
+            box = [l,t,r,b] 归一化（**适配层负责挑 src=="track" 那一条**）；
+            frame = 板子帧号，用来判断"是不是新的一帧"。
+            None = 这一拍没有可用数据（文件读不出来 / 没跟到目标 —— 见 update() 里的注释）。
+
+    时钟和 sleep 都可注入（单测用假的）。
+    """
+
+    def __init__(self, rotator, read_target, cfg=None,
+                 clock=time.monotonic, sleeper=time.sleep):
+        self._rotator = rotator
+        self._read_target = read_target
+        self.cfg = cfg or TrackConfig()
+        self._clock = clock
+        self._sleep = sleeper
+        self.reset()
+
+    def reset(self):
+        """清运行状态。**重新投入跟踪之前调** —— 不清就会带着上一次的帧号
+        （于是第一帧被当成"没更新"）和限位 latch（于是那个方向永远不推）。"""
+        self._last_frame = None
+        self._last_seen_t = None
+        self._blocked = {"pan": None, "tilt": None}
+        # 无进展守卫的记账（口径照 camcenter.center()）：
+        #   _best_err    最近一次"被接受的"最好误差（两轴偏差之和）
+        #   _no_progress 连着几帧发了指令而没改善；一旦 >= cfg.patience 就停手
+        self._best_err = None
+        self._no_progress = 0
+        self.ticks = 0
+
+    # ---- 对外 ----
+    def update(self, now=None):
+        """处理**一帧**。调用方按自己的节奏调（板子 6Hz / 别的源 0.8Hz 都行）。
+
+        **不阻塞**：没有新帧就直接返回 NO_NEW_FRAME，由调用方下一拍再读。
+        （camcenter 会阻塞等新帧，那是单次动作；这里是常驻循环，不能把调用方卡住。）
+        """
+        now = self._clock() if now is None else now
+        self.ticks += 1
+        cfg = self.cfg
+
+        got = self._read_target()
+        if got is None:
+            # 适配层把"文件读不出来"和"这一帧没跟到目标"**都折成 None**，
+            # 所以在模块内部只能用时间区分：最近 stale_s 内拿到过数据 = 流还活着，
+            # 只是这一帧没有目标；否则当作数据通道断了。（这是个已知的歧义，
+            # 见文件末尾"设计上可商榷的地方"。）
+            if (self._last_seen_t is not None
+                    and (now - self._last_seen_t) < cfg.stale_s):
+                return self._idle(NO_TARGET, "这一帧没有 src==\"track\" 的目标", now)
+            return self._idle(STALE,
+                              "结果数据读不出来，或者已经 %.1fs 没更新" % cfg.stale_s,
+                              now)
+
+        box, frame = got
+        self._last_seen_t = now                # 数据源活着（哪怕帧号没变）
+
+        if self._last_frame is not None and frame == self._last_frame:
+            # ⚠️ 同一帧绝不重复发指令 —— camcenter 的原话：不等新帧就会拿着
+            # 同一张旧图反复转，转飞。这里**不**阻塞等新帧，直接放过这一拍。
+            return self._idle(NO_NEW_FRAME, "帧号还是 %s，没更新" % frame,
+                              now, frame=frame, box=box)
+        self._last_frame = frame
+
+        bad = _bad_box(box)
+        if bad is not None:
+            # 坏框会算出天大的偏差，一步把云台推到限位 —— 宁可不动。
+            return self._idle(BAD_BOX, "目标框不能用：%s" % bad, now,
+                              frame=frame, box=box)
+
+        # ---- 守卫 ①：框必须**整个**落在画面内（对应 camcenter 的两道框检查）----
+        # 框被边缘切掉时，跟踪器的输出**不再反映目标在画面里的位置**（2026-09-19 板上实测：
+        # 框一开始出画它就崩），拿这种框当反馈就是闭着眼睛推云台 —— 2026-09-21 就是这么
+        # 0.76s 发了 76°、一路推到行程限位的。所以这里**一条指令都不发**，宁可这一拍不动。
+        if not box_complete(box, cfg.margin):
+            umin, umax, vmin, vmax = safe_center_range(box, cfg.margin)
+            bw, bh = box_size(box)
+            if umin > umax or vmin > vmax:
+                # 框**自身**就比安全区还大 —— 转到哪儿都居中不了。和"现在的位置不行"
+                # 是两码事：这个不用等，得换一个更紧的框（或把目标离远点）。
+                return self._idle(
+                    BOX_TOO_BIG,
+                    "目标框 %.3f x %.3f 比安全区还大，转到哪儿都居中不了"
+                    "（得换个更紧的框，或把目标离远一点）" % (bw, bh),
+                    now, frame=frame, box=box)
+            return self._idle(
+                BOX_CLIPPED,
+                "目标框 %.3f x %.3f 没整个落在画面内（l=%.3f t=%.3f r=%.3f b=%.3f，"
+                "要求留边 %.3f）—— 被边缘切过的框不能当反馈，这一拍不发指令"
+                % (bw, bh, box[0], box[1], box[2], box[3], cfg.margin),
+                now, frame=frame, box=box)
+
+        l, t, r, b = box
+        du = 0.5 - (l + r) / 2.0        # >0 = 目标偏画面左边
+        dv = 0.5 - (t + b) / 2.0        # >0 = 目标偏画面上边
+        err = abs(du) + abs(dv)         # 两轴偏差之和 —— 口径照 camcenter.center()
+
+        axes = {}
+        hit_axes = []
+        blocked_axes = []
+        planned = []      # 这一帧**本来要发**的指令：先算出来，守卫过了才真发
+        acted = 0
+
+        for axis, d in (("pan", du), ("tilt", dv)):
+            st = AxisStep(axis, err=d)
+            axes[axis] = st
+            if abs(d) < cfg.deadband[axis]:
+                st.skipped = "deadband"
+                continue
+            want = self._direction(axis, d)
+            # 撞过限位的那**一个方向**不再推。反方向要放行 —— 顺手把 latch 清掉，
+            # 否则一次瞬时的限位会把这个方向永久废掉。
+            if self._blocked[axis] == want:
+                st.wanted = want      # 想往这边转，但被限位 latch 拦下了
+                st.skipped = "blocked"
+                st.blocked = True
+                blocked_axes.append(axis)
+                continue
+            planned.append((axis, want, d))
+
+        # ---- 守卫 ②：无进展（对应 camcenter 的 NO_PROGRESS）----
+        # 连着 patience 帧**发了指令**而误差改善不到 min_progress 就停手 ——
+        # camcenter 的原话：「方向可能反了，或云台没在动」。记账口径照抄
+        # camcenter.center()：只记"被接受的"最好值，改善要**超过** min_progress 才算数。
+        # ⚠️ 只在 planned 非空时记账：两轴都在死区里（HOLD）不算"发了没改善"，
+        #    否则一个已经居中的目标会被慢慢判成 no_progress。
+        # 恢复：误差真的改善了就把计数清零 —— 下一帧照常发指令。
+        if planned:
+            if self._best_err is None or err < self._best_err - cfg.min_progress:
+                self._best_err = err
+                self._no_progress = 0
+            else:
+                self._no_progress += 1
+                if self._no_progress >= cfg.patience:
+                    for ax, want, _d in planned:
+                        axes[ax].wanted = want
+                        axes[ax].skipped = NO_PROGRESS
+                    return TrackResult(
+                        NO_PROGRESS,
+                        "连着 %d 帧发了指令都没改善（err=%.3f，最好 %.3f）—— 方向可能反了，"
+                        "或云台没在动；先停手，等误差真的改善再跟"
+                        % (cfg.patience, err, self._best_err),
+                        axes, frame=frame, box=box)
+
+        for axis, want, d in planned:
+            st = axes[axis]
+            self._blocked[axis] = None
+            st.direction = want       # 走到这里才是真的发出去了
+
+            # 控制律：一步转多少度 = 增益 × |偏差|，再夹到该轴的步长上限。
+            # 下限就是 0 —— 实测两轴都没有静摩擦死区（1° 就明显动），
+            # 所以**不做**任何"最小步长"或"累积到超过死区才动"的补偿。
+            st.deg = min(cfg.k[axis] * abs(d), cfg.max_step[axis])
+            st.us, st.hit_limit = self._rotator(st.direction, st.deg)
+            acted += 1
+            if st.hit_limit:
+                self._blocked[axis] = st.direction
+                hit_axes.append(axis)
+
+        if hit_axes:
+            # 撞限位只是**这一轴**的事 —— 另一轴这一帧照常发过指令了（上面没有
+            # 提前 return），下一帧也照常。
+            others = [ax for ax in ("pan", "tilt")
+                      if ax not in hit_axes and axes[ax].direction is not None]
+            tail = "；%s 轴照常" % "/".join(others) if others else "（另一轴这一帧没动）"
+            return TrackResult(HIT_LIMIT,
+                               "云台 %s 撞到行程限位，那个方向先不推了%s"
+                               % ("/".join(hit_axes), tail),
+                               axes, frame=frame, box=box)
+
+        if acted:
+            parts = ["%s %s %.1f°" % (s.axis, s.direction, s.deg)
+                     for s in axes.values() if s.direction is not None]
+            note = "云台在跟：" + "，".join(parts)
+            if blocked_axes:
+                note += "（%s 轴顶在限位上，暂不推）" % "/".join(blocked_axes)
+            return TrackResult(TRACKED, note, axes, frame=frame, box=box)
+
+        if blocked_axes:
+            return TrackResult(HIT_LIMIT,
+                               "云台 %s 还顶在行程限位上，推不动" % "/".join(blocked_axes),
+                               axes, frame=frame, box=box)
+
+        return TrackResult(HOLD, "两轴偏差都在死区内，不动", axes,
+                           frame=frame, box=box)
+
+    def run(self, stop=None, on_result=None):
+        """常驻循环：睡 poll_s → update() → 回调。
+
+        stop() 返回 True 就退出（None = 一直跑）；on_result(res) 可选。
+        **实车由调用方起线程跑它** —— 本模块自己不碰线程、不做 IO。
+        """
+        while stop is None or not stop():
+            self._sleep(self.cfg.poll_s)
+            res = self.update()
+            if on_result is not None:
+                on_result(res)
+
+    # ---- 内部 ----
+    def _idle(self, outcome, note, now, frame=None, box=None):
+        """没动成 —— 两轴都标上原因，调用方/模型才知道为什么。"""
+        axes = {ax: AxisStep(ax, skipped=outcome) for ax in ("pan", "tilt")}
+        return TrackResult(outcome, note, axes, frame=frame, box=box)
+
+    def _direction(self, axis, d):
+        """d>0 = 目标偏画面**左边/上边** —— 相机要往左/上转，把画面内容往右/下挪。
+
+        ⚠️ 语义照抄 `camcenter.CamCenterer._direction`，别自己重推一遍：
+        方向搞反了不会报错，只会越追越远。pan_sign/tilt_sign 是实测的（都是 +1）。
+        """
+        sign = self.cfg.pan_sign if axis == "pan" else self.cfg.tilt_sign
+        toward_pos = d > 0
+        if sign < 0:
+            toward_pos = not toward_pos
+        if axis == "pan":
+            return "left" if toward_pos else "right"
+        return "up" if toward_pos else "down"
+
+
+def describe(res):
+    """给人/给模型看的一句话（照 camcenter.describe 的风格）。"""
+    if res.outcome == TRACKED:
+        parts = ["%s %0.1f°" % (s.direction, s.deg)
+                 for s in res.axes.values() if s.direction is not None]
+        txt = "云台正在跟：%s。" % "，".join(parts)
+        stuck = [s.axis for s in res.axes.values() if s.blocked]
+        if stuck:
+            txt += "%s 轴顶在行程限位上，这个方向先不推。" % "/".join(stuck)
+        return txt
+    if res.outcome == HIT_LIMIT:
+        stuck = [s.axis for s in res.axes.values() if s.blocked or s.hit_limit]
+        txt = "云台 %s 轴撞到行程限位，那个方向推不动了。" % "/".join(stuck or ["?"])
+        if res.moved:
+            txt += "另一轴还在跟。"
+        return txt
+    return {
+        HOLD: "目标就在画面中间，云台不用动。",
+        NO_TARGET: "这一帧没跟到目标，云台保持不动。",
+        NO_NEW_FRAME: "画面数据还没更新，不重复发指令。",
+        STALE: "拿不到新的画面数据，云台保持不动。",
+        BAD_BOX: "拿到的目标框是坏的，这次不动。",
+        BOX_CLIPPED: "目标框被画面边缘切掉了一块，这一拍的位置数据不可信 —— "
+                     "先不动，等它整个回到画面里再跟。",
+        BOX_TOO_BIG: "那个目标框太大了，转到哪儿都居中不了 —— 换个更紧的框吧。",
+        NO_PROGRESS: "连着几帧发了指令画面却没变化，先停手 —— "
+                     "可能方向反了或者云台没响应，等误差真的变小再继续跟。",
+    }.get(res.outcome, "云台跟踪没成功（%s）。" % res.outcome)
+
+
+# ---- 离线自检（完整用例见 t_gimbal_track.py）----
+if __name__ == "__main__":
+    cfg = TrackConfig()
+    print("TrackConfig 默认值（增益/步长/符号来自 camcenter.CenterConfig，实测）：")
+    print("  k        pan=%.1f  tilt=%.1f   度 / 归一化偏差"
+          % (cfg.k["pan"], cfg.k["tilt"]))
+    print("  max_step pan=%.1f  tilt=%.1f   度 / 帧"
+          % (cfg.max_step["pan"], cfg.max_step["tilt"]))
+    print("  sign     pan=%+d  tilt=%+d" % (cfg.pan_sign, cfg.tilt_sign))
+    print("  deadband pan=%.3f  tilt=%.3f   （待实车调）"
+          % (cfg.deadband["pan"], cfg.deadband["tilt"]))
+    print("  stale_s=%.1f  poll_s=%.2f       （待实车调）" % (cfg.stale_s, cfg.poll_s))
+    print("  margin=%.3f  patience=%d  min_progress=%.3f  （照 camcenter 现读）"
+          % (cfg.margin, cfg.patience, cfg.min_progress))
+    print()
+    print("控制律 deg = min(k * |d|, max_step)，|d| 与一步转多少度：")
+    print("   |d|    pan°   tilt°   备注")
+    for d in (0.01, 0.02, 0.03, 0.05, 0.10, 0.20, 0.50, 1.00):
+        p = min(cfg.k["pan"] * d, cfg.max_step["pan"])
+        t = min(cfg.k["tilt"] * d, cfg.max_step["tilt"])
+        if d < cfg.deadband["pan"]:
+            why = "死区内，不动"
+        elif cfg.k["tilt"] * d > cfg.max_step["tilt"]:
+            why = "tilt 被 max_step 截住"
+        else:
+            why = ""
+        print("  %5.2f  %5.2f  %5.2f   %s" % (d, p, t, why))
+    print()
+    print("gimbal_track.py 自检通过（完整用例：t_gimbal_track.py）")

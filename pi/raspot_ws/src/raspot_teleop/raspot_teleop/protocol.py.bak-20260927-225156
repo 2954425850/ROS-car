@@ -1,0 +1,123 @@
+# -*- coding: utf-8 -*-
+"""STM32 固件 V2.0（机械臂版）串口协议。
+
+链路: Pi --USB-TTL(CH9102, /dev/l150pro)--> STM32 USART1 @115200 8N1
+帧格式: [帧头, len(=帧总长), 载荷..., crc16-MODBUS(小端, 覆盖 0..len-3)]
+
+下行:
+  0xAA 12B 底盘 vx,vy(int16 mm/s) wz(int16 mrad/s) flags(bit0=enable bit1=estop) seq
+       —— 25Hz 持续发送即链路保活，固件 200ms 收不到自动停车+机械臂保持
+  0xAC 20B 机械臂 p1..p5(int16 0..1000: 夹爪/腕旋/腕俯/小臂/大臂, 夹爪≤600)
+       p6(int16 -1000..+1000 底座连续角度 field=deg*1000/360, 跨圈不 mod)
+       t_ms(uint16) flags(bit0=re-home 边沿触发) seq
+上行:
+  0x55 28B 底盘遥测(电压 mV @22, fault @24)
+  0x56 22B 机械臂反馈(a1..a5@2, a6@12, pot@14, status@16[bit0 ONLINE bit7 ESTOP], base_st@17)
+  0x57 变长 透传回包（本节点不使用，仅跳过）
+"""
+import struct
+
+# JointState position 顺序: [p1..p5, base]
+ARM_JOINT_NAMES = ('gripper', 'wrist_roll', 'wrist_pitch', 'forearm', 'shoulder', 'base')
+
+CHASSIS_VX_MAX_MM = 500      # ±0.5 m/s（云平台限幅）
+CHASSIS_WZ_MAX_MRAD = 1500   # ±1.5 rad/s
+ARM_GRIP_MAX = 600
+ARM_JOINT_MAX = 1000
+ARM_BASE_MAX = 1000          # ±360°, 0.36°/count
+
+
+def crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+
+def build_frame(head: int, payload: bytes) -> bytes:
+    total = 2 + len(payload) + 2
+    body = bytes((head, total)) + payload
+    return body + struct.pack('<H', crc16(body))
+
+
+def build_chassis(vx_mm: int, vy_mm: int, wz_mrad: int, flags: int, seq: int) -> bytes:
+    return build_frame(0xAA, struct.pack(
+        '<hhhBB', int(vx_mm), int(vy_mm), int(wz_mrad), flags & 0xFF, seq & 0xFF))
+
+
+def build_arm(p1, p2, p3, p4, p5, base, t_ms: int, flags: int, seq: int) -> bytes:
+    return build_frame(0xAC, struct.pack(
+        '<6hHBB',
+        int(p1), int(p2), int(p3), int(p4), int(p5), int(base),
+        int(t_ms) & 0xFFFF, flags & 0xFF, seq & 0xFF))
+
+
+def _parse_t55(f: bytes) -> dict:
+    return {
+        'tick_ms': struct.unpack_from('<I', f, 2)[0],
+        'voltage_mv': struct.unpack_from('<H', f, 22)[0],
+        'faults': f[24],
+    }
+
+
+def _parse_t56(f: bytes) -> dict:
+    joints = struct.unpack_from('<5h', f, 2)
+    base, pot = struct.unpack_from('<2h', f, 12)
+    return {
+        'joints': joints,        # 0 = 该拍没读到
+        'base': base,            # ×0.36 = 度
+        'pot_raw': pot,          # -1 = 读失败哨兵
+        'status': f[16],         # bit0 ONLINE, bit7 ESTOP
+        'base_st': f[17],
+    }
+
+
+FAULT_BITS = ((0x01, '欠压'), (0x02, '保留'), (0x04, '急停'),
+              (0x08, 'IMU'), (0x10, '链路超时'), (0x20, '保留'))
+
+
+def fault_names(faults: int):
+    return [name for bit, name in FAULT_BITS if faults & bit]
+
+
+class UplinkParser:
+    """字节流 → 上行帧。feed(buf) 原地消费 buf，返回 [(kind, dict), ...]"""
+
+    @staticmethod
+    def feed(buf: bytearray):
+        out = []
+        while buf:
+            head = buf[0]
+            if head == 0x55:
+                if len(buf) < 28:
+                    break
+                f = bytes(buf[:28])
+                if crc16(f[:26]) == struct.unpack_from('<H', f, 26)[0]:
+                    out.append(('t55', _parse_t55(f)))
+                    del buf[:28]
+                else:
+                    del buf[:1]
+            elif head == 0x56:
+                if len(buf) < 22:
+                    break
+                f = bytes(buf[:22])
+                if crc16(f[:20]) == struct.unpack_from('<H', f, 20)[0]:
+                    out.append(('t56', _parse_t56(f)))
+                    del buf[:22]
+                else:
+                    del buf[:1]
+            elif head == 0x57:
+                if len(buf) < 2:
+                    break
+                total = buf[1]
+                if not 8 <= total <= 64:
+                    del buf[:1]
+                    continue
+                if len(buf) < total:
+                    break
+                del buf[:total]
+            else:
+                del buf[:1]
+        return out

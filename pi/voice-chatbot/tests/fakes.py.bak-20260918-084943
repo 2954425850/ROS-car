@@ -1,0 +1,81 @@
+"""测试替身。
+
+FakeClock 让「按时间推进」的闭环逻辑在测试里瞬间跑完且完全确定 ——
+不用真的 sleep，也不会因为机器慢而 flaky。
+"""
+
+from __future__ import annotations
+
+from car.types import RobotState
+
+
+class FakeClock:
+    """手动推进的时钟。sleep() 只把时间往前拨，不真的等。"""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += seconds
+
+
+class FakeBridge:
+    """按「速度 × 时间」积分的假 ROS 桥。
+
+    不做物理仿真 —— 只要能驱动闭环逻辑就够了。
+    """
+
+    def __init__(
+        self,
+        clock: FakeClock,
+        *,
+        speed_scale: float = 1.0,
+        voltage: float | None = 12.0,
+        fault: int | None = 0,
+        online: bool = True,
+        dead: bool = False,
+    ) -> None:
+        self.velocity_calls: list[tuple[float, float]] = []
+        self.servo_calls: list[list[int]] = []
+        self.closed = False
+        self._clock = clock
+        self._speed_scale = speed_scale
+        self._voltage = voltage
+        self._fault = fault
+        self._online = online
+        self._dead = dead              # True = 永远收不到上行（模拟驱动没跑）
+        self._traveled = 0.0
+        self._yaw = 0.0
+        self._last_t = clock()
+
+    def publish_velocity(self, vx: float, wz: float) -> None:
+        self.velocity_calls.append((vx, wz))
+        now = self._clock()
+        dt = max(0.0, now - self._last_t)
+        self._last_t = now
+        self._traveled += abs(vx) * self._speed_scale * dt
+        self._yaw += wz * dt
+
+    def publish_servo(self, us: list[int]) -> None:
+        self.servo_calls.append(list(us))
+
+    def state(self) -> RobotState:
+        if self._dead:
+            return RobotState(voltage=None, fault=None, wheel_speeds=None,
+                              yaw_rate=None, traveled=0.0, online=False)
+        # yaw_rate 如实回报「上一帧指令」，让 controller 的积分跑得起来
+        last_wz = self.velocity_calls[-1][1] if self.velocity_calls else 0.0
+        return RobotState(
+            voltage=self._voltage,
+            fault=self._fault,
+            wheel_speeds=(0.0, 0.0, 0.0, 0.0),
+            yaw_rate=last_wz,
+            traveled=self._traveled,
+            online=self._online,
+        )
+
+    def close(self) -> None:
+        self.closed = True

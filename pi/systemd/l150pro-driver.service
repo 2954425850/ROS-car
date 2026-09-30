@@ -1,0 +1,16 @@
+[Unit]
+Description=WHEELTEC L150Pro 底盘驱动 + EKF（ROS 2 Jazzy）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cy
+# 底盘板的 USB 没插时先安静等待，不空转重启刷日志。
+# 板子一插上（udev 建出 /dev/l150pro）就开始跑；运行中掉线则由 Restart 拉回并重新等待。
+ExecStart=/bin/bash -c 'if [ ! -e /dev/l150pro ]; then echo "等待底盘板：/dev/l150pro 尚未出现（USB 未插或未上电）…"; fi; while [ ! -e /dev/l150pro ]; do sleep 3; done; echo "已找到 /dev/l150pro，启动驱动与 EKF"; source /opt/ros/jazzy/setup.bash && source /home/cy/l150pro_ws/install/setup.bash && exec ros2 launch l150pro_driver l150pro.launch.py port:=/dev/l150pro use_ekf:=true'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

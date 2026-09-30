@@ -1,0 +1,246 @@
+"""`WakeHandoff` 的并发语义测试 —— 不碰任何硬件，全是 threading。
+
+同步一律用 `threading.Event` / 条件轮询，**不用固定 sleep 去等一件事发生**：
+「睡 0.5 秒再断言」在慢机器上就是随机红，而红了之后最可能的下场是被人当成
+flaky 测试删掉 —— 那急停路径就彻底没护栏了。这里只有一处按时间断言
+（shutdown 的下界），是下界不是上界，慢机器不会误红。
+"""
+
+import threading
+import time
+
+from loguru import logger
+
+from core.wake_handoff import WakeHandoff
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    """轮询等条件成立，成立就立刻返回 True；超时返回 False。
+
+    这是「等一件事发生」，不是「等一段时间」—— 慢机器只会让它晚一点返回，
+    不会让它误判。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.001)
+    return False
+
+
+class _Calls:
+    """记录快动作被调了几次、流水线被起了几条。
+
+    计数在两条线程上读写，所以照样持锁 —— 测试替身也不留数据竞争，
+    否则测出来的红绿本身就不确定。
+    """
+
+    def __init__(self, body=None) -> None:
+        self._lock = threading.Lock()
+        self.fast_count = 0
+        self.pipeline_count = 0
+        self._body = body
+
+    def fast(self) -> None:
+        with self._lock:
+            self.fast_count += 1
+
+    def pipeline(self) -> None:
+        with self._lock:
+            self.pipeline_count += 1
+        if self._body is not None:
+            self._body()
+
+
+def _handoff(body=None, fast=None):
+    calls = _Calls(body)
+    return WakeHandoff(fast or calls.fast, calls.pipeline, name="test-pipeline"), calls
+
+
+# ---------------- 快慢分离 ----------------
+
+def test_on_wake_returns_immediately_while_the_pipeline_is_slow():
+    """★ 整个重构的目的：`on_wake()` 跑在串口监听线程上，**必须立刻返回**。
+
+    流水线用 Event 卡住，只有测试收尾时才放行 —— 所以「立刻返回」是真断言：
+    阻塞实现会直接挂死在这里，而不是慢一点。阈值 0.5 秒是给树莓派留的余量，
+    正确实现是微秒级。
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    def body() -> None:
+        started.set()
+        release.wait(5.0)          # 测试收尾才 set，见 finally
+
+    handoff, calls = _handoff(body)
+    try:
+        t0 = time.monotonic()
+        handoff.on_wake()
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 0.5, (
+            f"on_wake 阻塞了 {elapsed:.2f} 秒 —— 串口监听会被占住，急停失效"
+        )
+        assert calls.fast_count == 1, "快动作没在监听线程上同步跑完"
+        assert started.wait(2.0), "流水线没被起起来"
+    finally:
+        release.set()
+        handoff.shutdown()
+
+
+def test_second_wake_while_busy_stops_but_does_not_start_a_second_pipeline():
+    """★★ 本次重构的核心保证，别删。
+
+    前半条（快动作被调了**第二次**）是「喊了就停」在任何时刻都可用；
+    后半条（流水线计数**不变**）是防重入 —— 少了它，第二次唤醒会再起一条流水线，
+    两条线程同时驱动同一个状态机、抢同一个麦克风与扬声器。
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    def body() -> None:
+        started.set()
+        release.wait(5.0)
+
+    handoff, calls = _handoff(body)
+    try:
+        handoff.on_wake()
+        assert started.wait(2.0), "第一条流水线没起起来"
+
+        handoff.on_wake()          # ← 流水线正忙时的第二次唤醒
+
+        assert calls.fast_count == 2, "忙的时候也必须先急停 —— 急停要随时可用"
+        # 等一会儿，给「万一真起了第二条」留出跑起来的时间：**没起**才算过。
+        # 直接不等就断言的话，第二条线程可能还没被调度到，测试会空过。
+        assert not _wait_until(lambda: calls.pipeline_count != 1, timeout=0.3), (
+            "起了第二条流水线 —— 防重入失效"
+        )
+    finally:
+        release.set()
+        handoff.shutdown()
+
+
+def test_busy_wake_logs_exactly_one_info_line():
+    """「只记一条 info 日志」也是契约的一部分。
+
+    T6 的端到端验收就是靠这行日志证明「没有起第二条流水线」（设计 §6），
+    所以顺手把它的存在钉住 —— 哪天日志被删掉，验收就没证据了。
+    """
+    started = threading.Event()
+    release = threading.Event()
+    messages: list[str] = []
+
+    def body() -> None:
+        started.set()
+        release.wait(5.0)
+
+    handoff, _ = _handoff(body)
+    sink = logger.add(
+        lambda m: messages.append(str(m)), level="INFO", format="{message}"
+    )
+    try:
+        handoff.on_wake()
+        assert started.wait(2.0)
+        handoff.on_wake()
+
+        assert any("忙" in m for m in messages), f"没看到「正忙」的日志：{messages}"
+        assert sum(1 for m in messages if "忙" in m) == 1, f"忙日志重复了：{messages}"
+    finally:
+        logger.remove(sink)
+        release.set()
+        handoff.shutdown()
+
+
+# ---------------- busy 标志的清除 ----------------
+
+def test_a_new_pipeline_starts_after_the_previous_one_finished():
+    """正常结束后 busy 必须被清 —— 否则助手只响应第一次唤醒。"""
+    handoff, calls = _handoff()
+    try:
+        handoff.on_wake()
+        assert _wait_until(lambda: not handoff.is_busy), "流水线结束后 busy 没清"
+
+        handoff.on_wake()
+        assert _wait_until(lambda: calls.pipeline_count == 2), "没能起第二条"
+    finally:
+        handoff.shutdown()
+
+
+def test_pipeline_exception_still_clears_busy():
+    """★ 少了 finally，一次异常就让助手**永久**卡在「忙」。
+
+    表现是：之后每次唤醒都只急停、再也进不了对话，而日志里只有一个看着无害的
+    「正忙」—— 真机上极难定位，所以必须钉死。异常也不能炸掉进程：线程体自己
+    吞掉它（记日志），不让它逃到 threading.excepthook 去。
+    """
+    def body() -> None:
+        raise RuntimeError("模拟流水线崩了")
+
+    handoff, calls = _handoff(body)
+    try:
+        handoff.on_wake()
+        assert _wait_until(lambda: not handoff.is_busy), (
+            "pipeline 抛异常后 busy 没清 —— 助手永久卡在忙"
+        )
+        handoff.on_wake()
+        assert _wait_until(lambda: calls.pipeline_count == 2), (
+            "异常之后应当还能再起一条"
+        )
+    finally:
+        handoff.shutdown()
+
+
+def test_fast_action_exception_does_not_escape_and_pipeline_still_starts():
+    """急停失败不该顺带让对话也废掉，更不该杀掉串口监听线程。
+
+    监听线程上抛出去的异常 = 监听循环结束 = 从此唤醒词彻底失灵，
+    所以 on_wake() 必须把它咽下去。
+    """
+    def boom() -> None:
+        raise RuntimeError("模拟急停失败")
+
+    handoff, calls = _handoff(fast=boom)
+    try:
+        handoff.on_wake()          # ← 不该抛
+        assert _wait_until(lambda: calls.pipeline_count == 1), (
+            "快动作抛异常后流水线也没起 —— 急停失败把对话一起废了"
+        )
+    finally:
+        handoff.shutdown()
+
+
+# ---------------- shutdown ----------------
+
+def test_shutdown_joins_the_running_pipeline_and_blocks_new_ones():
+    """`shutdown()` 要等流水线跑完（设计 §3.5：先收流水线，再停唤醒线程）。
+
+    流水线只靠自己的 1.5 秒超时结束（没人放行它），所以「shutdown 用了多久」
+    是个可靠的下界断言：真 join 了就必然 ≥1.5 秒，没 join 就是微秒级返回。
+    是**下界**不是上界 —— 机器慢只会让它更长，不会误红。
+    """
+    release = threading.Event()    # 故意没人 set：让流水线自己超时结束
+    finished = threading.Event()
+
+    def body() -> None:
+        release.wait(1.5)
+        finished.set()
+
+    handoff, calls = _handoff(body)
+    handoff.on_wake()
+    assert _wait_until(lambda: calls.pipeline_count == 1)
+
+    t0 = time.monotonic()
+    handoff.shutdown(timeout=5.0)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed >= 0.5, f"shutdown 只用了 {elapsed:.3f} 秒 —— 它没等流水线"
+    assert finished.is_set(), "shutdown 返回时流水线还没跑完"
+    assert not handoff.is_busy
+
+    # 关闭之后再唤醒：快动作照跑（急停幂等、无害），但绝不再起新流水线。
+    handoff.on_wake()
+    assert calls.fast_count == 2
+    assert not _wait_until(lambda: calls.pipeline_count != 1, timeout=0.3), (
+        "shutdown 之后又起了流水线"
+    )

@@ -1,0 +1,304 @@
+"""放歌。
+
+## 怎么停（设计里最关键的一问）
+
+播放跑在**独立线程**上，不是唤醒线程 —— 这一点是必须的：唤醒词回调本身就在唤醒
+线程上，如果播放把唤醒线程占住，用户喊唤醒词时根本没人处理，只能等整首歌放完。
+所以播放必须让出唤醒线程。
+
+停止链路（「喊一声唤醒词，歌就停」）：
+
+    用户喊唤醒词 → WakeWordEngine 线程 → ConversationManager._on_wake_word()
+      → self._music.stop()             # 置 Event，播放循环下一帧就退出
+      → （内部 join）等它真正放开 Speaker
+      → 才 transition(LISTENING)        # 保证 TTS/录音不会和音乐抢同一条音频流
+
+停完之后接着说什么都行：「别放了」「换一首」「刚才那首是谁唱的」。
+
+另有两个自动停：歌放完了（自然结束）、超过 `music.max_minutes`（兜底）。
+
+## 为什么用 PyAV 而不是系统自带的 GStreamer
+
+实测本机 GStreamer **没有 AAC 解码器**（`faad` / `avdec_aac` 都不存在），只能解 MP3。
+QQ音乐 默认给的是 m4a(AAC)，那样就只能挑特定音质。PyAV 的 pip 轮子自带整套 FFmpeg
+（libavcodec 62.x，含 AAC），而且**不需要 sudo** —— apt 装 ffmpeg 是要 root 的。
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from typing import Any
+
+import av
+from loguru import logger
+
+from tools.registry import Tool, ToolRegistry
+
+_PCM_RATE = 16000  # 与 Speaker / TTS 一致
+_SEARCH_TOOL = "mcp__qqmusic__search_music"
+_URL_TOOL = "mcp__qqmusic__get_song_url"
+
+
+class MusicController:
+    """搜歌 → 取播放链接 → 解码播放。线程安全（内部有状态锁）。"""
+
+    def __init__(
+        self,
+        *,
+        speaker: Any,
+        mcp_host: Any,
+        config: Any,
+    ) -> None:
+        self._speaker = speaker
+        self._mcp = mcp_host
+        self._config = config
+
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        # 已经找好链接、等 TTS 说完话再开播的曲目。见 start_pending()。
+        self._pending: tuple[str, str] | None = None
+        self._label = ""
+        self._error: str | None = None
+        self._state_lock = threading.Lock()
+
+    # ------------------------------------------------------------ 对外
+
+    @property
+    def is_playing(self) -> bool:
+        with self._state_lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def play(self, query: str) -> str:
+        """搜歌并开始播放。返回一句可以直接念给用户的话。"""
+        query = (query or "").strip()
+        if not query:
+            return "没听清要放什么歌，再说一次歌名？"
+
+        # 一次只放一首：先停掉上一首，避免两条流叠着写 Speaker
+        self.stop()
+
+        song = self._search_first(query)
+        if song is None:
+            return f"没搜到「{query}」，换个说法再试试？"
+        mid, name, singers = song
+
+        url, quality = self._resolve_url(mid)
+        if not url:
+            logger.warning(f"音乐：《{name}》所有音质都拿不到播放链接")
+            return (
+                f"找到《{name}》（{singers}）了，但拿不到播放链接 —— "
+                f"QQ音乐要登录凭证才行，得配 QQ_MUSIC_COOKIE。"
+            )
+
+        logger.info(f"音乐：{name} - {singers} | 音质 {quality}")
+        # **不立刻开播**：等 TTS 把回话说完了再放（见 start_pending）。
+        # 工具返回后 LLM 还会再生成一句「好，给你放…」，那句要走 TTS 出声；
+        # 若此刻音乐已经开播，两路会同时写同一条音频流，糊成一团。
+        with self._state_lock:
+            self._pending = (url, f"{name} - {singers}")
+        return f"好，给你放《{name}》，{singers}。要停就喊唤醒词，然后说「别放了」。"
+        # 也不声明 requires_followup —— 播歌是「说完就完事」，
+        # 自动重开麦克风的话音乐刚开始就被自己的录音打断。
+
+    def start_pending(self) -> None:
+        """开播上一首待播的曲子。**由 ConversationManager 在进入 IDLE 时调用** ——
+        也就是 TTS 已经说完之后。这样人声和音乐永远不会同时占着 Speaker。
+        """
+        with self._state_lock:
+            pending = self._pending
+            self._pending = None
+        if pending is None:
+            return
+        url, label = pending
+        self._start(url, label)
+
+    def stop_and_describe(self) -> str:
+        """给 stop_music 工具用：停掉并回报一句结果。"""
+        label = self._label
+        with self._state_lock:
+            had_anything = self._pending is not None or (
+                self._thread is not None and self._thread.is_alive()
+            )
+        if not had_anything:
+            return "现在没有在放音乐。"
+        stopped = self.stop()
+        if not stopped:
+            return "已经让它停了，但播放线程没及时退出。"
+        return f"已停止播放《{label}》。" if label else "音乐已停止。"
+
+    def stop(self, wait: bool = True, timeout: float = 3.0) -> bool:
+        """停止播放。返回 True 表示已停（或本来就没在放）。
+
+        `_stop` 一置位，`_write()` 就再也不会往 Speaker 写东西 —— 所以即使播放线程
+        卡在 `av.open()` 的网络超时里没能及时 join 掉，也不会和 TTS 抢音频流。
+        """
+        with self._state_lock:
+            self._pending = None  # 还没开播的也一并取消
+            thread = self._thread
+            if thread is None or not thread.is_alive():
+                self._thread = None
+                return True
+            self._stop.set()
+
+        if wait:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.warning("音乐：播放线程未在超时内退出（但已不会再出声）")
+                return False
+        return True
+
+    def close(self) -> None:
+        self.stop()
+
+    # ------------------------------------------------------------ 内部：搜索与取链接
+
+    def _search_first(self, query: str) -> tuple[str, str, str] | None:
+        raw = self._mcp.call_tool(_SEARCH_TOOL, {"keyword": query})
+        data = _loads(raw)
+        if data is None:
+            logger.warning(f"音乐：搜索结果不是 JSON —— {str(raw)[:120]}")
+            return None
+        songs = data.get("songs") or []
+        if not songs:
+            return None
+        hit = songs[0]
+        return (
+            str(hit.get("mid") or ""),
+            str(hit.get("name") or query),
+            str(hit.get("singers") or ""),
+        )
+
+    def _resolve_url(self, mid: str) -> tuple[str, str]:
+        """按配置里的音质顺序逐个尝试，用第一个拿得到链接的。
+
+        无 VIP / 未登录时高码率会返回空 url，所以必须能降级 —— 实测匿名状态下
+        **所有**音质都返回空，那时的报错要能让用户看懂是缺 Cookie 而不是代码错。
+        """
+        qualities = self._config.get("music.qualities", ["320", "128", "m4a"]) or ["320", "128", "m4a"]
+        for quality in qualities:
+            raw = self._mcp.call_tool(_URL_TOOL, {"song_mid": mid, "quality": str(quality)})
+            data = _loads(raw)
+            if data is None:
+                continue
+            url = str(data.get("url") or "").strip()
+            if url:
+                return url, str(quality)
+            logger.info(f"音乐：音质 {quality} 没拿到链接，继续往下降")
+        return "", ""
+
+    # ------------------------------------------------------------ 内部：播放
+
+    def _start(self, url: str, label: str) -> None:
+        self._stop.clear()
+        self._error = None
+        self._label = label
+        with self._state_lock:
+            self._thread = threading.Thread(
+                target=self._run, args=(url, label), name="music-playback", daemon=True
+            )
+            self._thread.start()
+
+    def _run(self, url: str, label: str) -> None:
+        started = time.monotonic()
+        max_seconds = float(self._config.get("music.max_minutes", 10) or 0) * 60
+
+        try:
+            with av.open(url, timeout=15.0) as container:
+                stream = next((s for s in container.streams if s.type == "audio"), None)
+                if stream is None:
+                    logger.error(f"音乐：《{label}》这个流里没有音轨")
+                    return
+
+                # 直接重采样成 Speaker 要的格式（s16 / mono / 16k），
+                # 免得再写一条「解码 → 重采样 → 写流」的手工链路。
+                resampler = av.AudioResampler(format="s16", layout="mono", rate=_PCM_RATE)
+
+                for frame in container.decode(stream):
+                    if self._should_stop(started, max_seconds):
+                        break
+                    self._write(resampler.resample(frame))
+                else:
+                    # for-else：只有正常放完才 flush 尾部残留；被打断就不必了
+                    if not self._stop.is_set():
+                        self._write(resampler.resample(None))
+        except Exception as exc:  # noqa: BLE001 —— 播放失败不该影响对话
+            self._error = str(exc)
+            logger.error(f"音乐：播放《{label}》失败 —— {exc}")
+        finally:
+            logger.info(f"音乐：《{label}》结束，历时 {time.monotonic() - started:.1f}s")
+
+    def _should_stop(self, started: float, max_seconds: float) -> bool:
+        if self._stop.is_set():
+            return True
+        if max_seconds > 0 and time.monotonic() - started > max_seconds:
+            logger.warning(f"音乐：超过 {max_seconds / 60:.0f} 分钟上限，自动停止")
+            self._stop.set()
+            return True
+        return False
+
+    def _write(self, frames: Any) -> None:
+        """把重采样后的帧写进 Speaker。
+
+        每一帧前后都查 `_stop`：停止信号一置位就立刻收手，绝不和 TTS 抢同一条流。
+        """
+        for frame in frames or ():
+            if self._stop.is_set():
+                return
+            payload = frame.to_ndarray().tobytes()
+            if not payload:
+                continue
+            if self._stop.is_set():
+                return
+            # Speaker.write() 自带写锁，会和 TTS 串行化
+            self._speaker.write(payload)
+
+
+def register_music_tools(registry: ToolRegistry, controller: MusicController) -> None:
+    """把放歌能力登记成原生工具。
+
+    为什么是**原生工具**而不是 MCP：搜歌和取链接确实来自 QQ音乐 MCP server，
+    但「在树莓派的喇叭上出声」是本机硬件能力，不是 MCP 该管的事。
+    服务器给链接、宿主负责放 —— 这个分工才是对的。
+    """
+    registry.register(
+        Tool(
+            name="play_music",
+            description=(
+                "播放音乐。用户说「放首歌」「来一首…」「我想听…」「放周杰伦的歌」时调用。"
+                "参数可以是歌名、歌手名，或「歌手 歌名」。查到了会立刻开始播放。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "要播放的歌，比如「晴天」「周杰伦」「周杰伦 晴天」",
+                    }
+                },
+                "required": ["query"],
+            },
+            handler=lambda query: controller.play(query),
+        )
+    )
+
+    registry.register(
+        Tool(
+            name="stop_music",
+            description="停止正在播放的音乐。用户说「别放了」「停」「关掉音乐」时调用。",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=lambda: controller.stop_and_describe(),
+        )
+    )
+
+
+def _loads(raw: Any) -> dict[str, Any] | None:
+    """MCP 工具返回的是 JSON 字符串；解析失败返回 None（调用方负责兜底）。"""
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None

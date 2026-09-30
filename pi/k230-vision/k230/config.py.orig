@@ -1,0 +1,28 @@
+# /sdcard/k230vision/config.py
+"""全部可调参数集中在这里。"""
+
+WIFI_SSID = "TP-LINK_EE82"
+WIFI_PASS = "123456789"
+
+# 云端推流目标（先用 Pi 做验证，云端就绪后改成云端公网 IP）
+PUSH_HOST = "192.168.1.108"
+PUSH_PORT = 8555
+
+# 结构化结果上报目标
+RESULT_HOST = "192.168.1.108"
+RESULT_PORT = 8556
+
+# 视频规格
+WIDTH = 1280
+HEIGHT = 720
+FPS = 25
+BITRATE_KBPS = 2048      # 2 Mbps
+GOP = 25                 # 1 秒，任何损伤 1 秒内自愈
+PUSH_CHN = 0             # chn0 -> 推云端
+RTSP_CHN = 1             # chn1 -> 局域网给 Pi
+RTSP_PORT = 8554
+RTSP_SESSION = "k230"
+
+# 看门狗
+PUSH_STALL_WARN_MS = 3000   # 连续这么久没成功发出帧就告警
+RECONNECT_BACKOFF_MS = 1000

@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""PS2 手柄遥控节点（并控布局：边开车边操作机械臂）。
+
+发布:
+  /cmd_vel      geometry_msgs/Twist     底盘 vx(m/s)/wz(rad/s)，恒频发布（含零速，供驱动节点判活）
+  /arm/command  sensor_msgs/JointState  position=[p1..p5 raw 0..1000, base field ±1000]，
+                                        有臂输入及其尾随期按 loop_hz 发布
+  /estop        std_msgs/Bool           急停锁存状态（边沿发布）
+服务客户端:
+  /arm/rehome   std_srvs/Trigger        START 键触发机械臂回中（锚定+回中）
+
+运动模型与云平台 114.215.188.147 一致:
+  vx∈±0.5 m/s, wz∈±1.5 rad/s, 最小转弯半径 0.6m（不能原地转）,
+  有转向输入时最低 0.12 m/s, 摇杆死区 0.12, 平滑 0.35, 档位 0.15~0.50 步进 0.05。
+键位在下方 CFG，--probe 实测编号后按需修改。
+"""
+import argparse
+import signal
+import time
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool
+from std_srvs.srv import Trigger
+
+from .js_input import JsReader, JsState, run_probe
+from .protocol import ARM_JOINT_NAMES
+
+CFG = {
+    # —— 轴（2026-09-27 22:07 实测确认：0=左X 1=左Y 2=右X 3=右Y 4=十字X 5=十字Y；
+    #    每个轴的负方向 = 该摇杆/十字键的 左 或 上；DIR=±1 纠方向）——
+    'AX_THROTTLE': 1, 'THROTTLE_FLIP': -1,        # 左摇杆Y 上推=前进（车）
+    'AX_STEER': 0, 'STEER_FLIP': 1,               # 左摇杆X 右推=右转（车）
+    'AX_SHOULDER': 3, 'DIR_SHOULDER': 1,          # 右摇杆Y 上下=大臂（5 号舵机，方向已翻）
+    'AX_BASE': 2, 'DIR_BASE': -1,                 # 右摇杆X 左右=底座（用户此前实测该轴方向反了）
+    'AX_HAT_Y': 5,                                # 十字键 上下=速度档升/降
+    'AX_HAT_X': 4,                                # 十字键 左右=预留
+
+    # —— 按钮（2026-09-27 22:07 全量 --probe 实测，按物理位置逐个按、顺序 1:1 对上）——
+    #     面键：上=0 下=2 左=3 右=1        → Y=0 A=2 X=3 B=1（左/右已由 ROLL 那两个实测印证）
+    #     肩/扳机：L1=4 R1=5 L2=6 R2=7
+    #     中间：SELECT=8 START=9 MODE=12
+    #     摇杆按下：L3=10 R3=11
+    #     注意：十字键是 AXIS 4/5，不是按键；摇杆按下才是按键。
+    'BTN_GRIP_CLOSE': 5,          # 夹爪夹紧（1 号舵机）—— R1
+    'BTN_GRIP_OPEN': 4,           # 夹爪放宽（1 号舵机）—— L1
+    'DIR_GRIP': 1,                # 开合物理方向，反了改 -1
+    'BTN_ROLL_LEFT': 3,           # X 腕旋转（实测编号 3）
+    'BTN_ROLL_RIGHT': 1,          # B 腕旋转（实测编号 1）
+    'DIR_ROLL_BTN': -1,           # X/B 对调效果；编号不换
+    'BTN_PITCH_UP': 7,            # 腕俯仰向上 —— R2
+    'BTN_PITCH_DOWN': 6,          # 腕俯仰向下 —— L2
+    'DIR_PITCH_BTN': 1,
+    'BTN_FOREARM_UP': 0,          # Y = 面键上（实测编号 0）
+    'BTN_FOREARM_DOWN': 2,        # A = 面键下（实测编号 2）
+    'DIR_FOREARM_BTN': -1,        # 要的效果：按 Y（面键上）小臂向下
+    'BTN_REHOME': 9,              # START 回中（用户实测编号）
+    'BTN_ESTOP': 8,               # SELECT 急停（用户实测编号；长按 2s 解除）
+
+    # —— 底盘（云平台同款参数）——
+    'JS_DEVICE': '/dev/input/js0',
+    'LOOP_HZ': 25,
+    'GEAR_DEFAULT': 0.15, 'GEAR_MIN': 0.15, 'GEAR_MAX': 0.50, 'GEAR_STEP': 0.05,
+    'VX_MAX': 0.50,
+    'WZ_MAX': 1.50,
+    'R_MIN': 0.6,
+    'V_MIN': 0.12,
+    'LAT_EPS': 0.02,
+    'DEADZONE': 0.15,             # 摇杆死区
+    'SMOOTHING': 0.35,            # 低通系数（越大越跟手）
+    'IDLE_ZERO_S': 3.0,           # 手柄无事件 N 秒 → 底盘清零
+    'ESTOP_HOLD_S': 2.0,          # SELECT 长按 N 秒解除急停
+    'HAT_EDGE_CNT': 16000,        # 十字键判沿阈值（|值|超过视为按下）
+
+    # —— 机械臂 ——
+    'GRIP_MAX': 600,
+    'RATE_STICK': 300.0,          # 摇杆关节速率 raw/s（大臂/底座，满偏约 3.3s 走完）
+    'RATE_BTN': 250.0,            # 按键关节速率 raw/s（夹爪/腕/小臂）
+    'ARM_TAIL_S': 0.30,           # 停止输入后继续发布 N 秒（走完坡道）
+    'ARM_DEBOUNCE_TICKS': 2,      # 臂通道去抖：连续 N 拍有效才生效（滤鬼影事件）
+}
+
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def norm(raw):
+    return clamp(raw / 32767.0, -1.0, 1.0)
+
+
+def dead(x, d):
+    return 0.0 if abs(x) < d else x
+
+
+class Ps2TeleopNode(Node):
+
+    def __init__(self):
+        super().__init__('ps2_teleop_node')
+        self.declare_parameter('js_device', CFG['JS_DEVICE'])
+        self.declare_parameter('loop_hz', CFG['LOOP_HZ'])
+        self.declare_parameter('gear_default', float(CFG['GEAR_DEFAULT']))
+
+        js_dev = self.get_parameter('js_device').value
+        hz = float(self.get_parameter('loop_hz').value)
+        self.gear = clamp(float(self.get_parameter('gear_default').value),
+                          CFG['GEAR_MIN'], CFG['GEAR_MAX'])
+
+        self.pub_cmd = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.pub_arm = self.create_publisher(JointState, 'arm/command', 10)
+        self.pub_estop = self.create_publisher(Bool, 'estop', 10)
+        self.cli_rehome = self.create_client(Trigger, 'arm/rehome')
+        # 跟随实际回读：用户未操作臂时，目标同步到当前位姿，避免接管瞬间大幅跳变
+        self.sub_fb = self.create_subscription(JointState, 'arm/feedback', self.on_fb, 10)
+
+        self.js = JsState()
+        JsReader(js_dev, self.js).start()
+        self.create_timer(1.0 / hz, self.tick)
+        self.period = 1.0 / hz
+
+        # 运行状态
+        self.estop = False
+        self.estop_t0 = 0.0
+        self.last_estop_pub = None
+        self.prev_sel = 0
+        self.prev_buttons = {}
+        self.sm_th = self.sm_st = self.sm_sh = self.sm_bs = 0.0
+        self.prev_hat_up = 0
+        self.prev_hat_dn = 0
+        self.targets = None           # 首条 /arm/feedback 到达后按实际位姿初始化
+        self.base_t = None
+        self.last_arm_input = 0.0
+        self.arm_hold_cnt = {}        # 臂通道去抖计数
+
+        self.get_logger().info(
+            f'ps2_teleop_node 启动：手柄 {js_dev} @ {hz:.0f}Hz，默认档 {self.gear:.2f} m/s')
+
+    def on_fb(self, msg):
+        pos = list(msg.position)
+        if len(pos) < 6:
+            return
+        if self.targets is None:
+            # 首次同步：目标 = 当前实际位姿，绝不用硬编码姿态去推臂
+            self.targets = [clamp(pos[i], 0, CFG['GRIP_MAX'] if i == 0 else 1000)
+                            for i in range(5)]
+            self.base_t = clamp(pos[5], -1000, 1000)
+            self.get_logger().info(f'臂目标已按实际位姿初始化: {self.targets} base={self.base_t:.0f}')
+            return
+        if time.monotonic() - self.last_arm_input < 1.0:
+            return   # 用户正在操作，别让回读覆盖目标
+        for i in range(5):
+            if pos[i] != 0.0:   # 0 = 该拍没读到，保持上次目标
+                self.targets[i] = clamp(pos[i], 0, CFG['GRIP_MAX'] if i == 0 else 1000)
+        self.base_t = clamp(pos[5], -1000, 1000)
+
+    # —— 主循环 ——
+    def tick(self):
+        c = CFG
+        now = time.monotonic()
+        with self.js.lock:
+            axes = dict(self.js.axes)
+            buttons = dict(self.js.buttons)
+            last_ev = self.js.last_event
+        stale = (now - last_ev) > c['IDLE_ZERO_S']
+        if stale:
+            axes, buttons = {}, {}
+
+        # 急停：SELECT 按下沿锁存；持续按住 ESTOP_HOLD_S 解除
+        sel = 1 if buttons.get(c['BTN_ESTOP']) else 0
+        if sel and not self.prev_sel:
+            self.estop = True
+            self.estop_t0 = now
+            self.get_logger().warn('急停锁存：底盘清零、机械臂保持（长按 SELECT 2 秒解除）')
+        if self.estop and sel and (now - self.estop_t0 >= c['ESTOP_HOLD_S']):
+            self.estop = False
+            self.get_logger().info('急停解除')
+        if self.estop != self.last_estop_pub:
+            m = Bool()
+            m.data = self.estop
+            self.pub_estop.publish(m)
+            self.last_estop_pub = self.estop
+        self.prev_sel = sel
+
+        # 速度档：十字键 上=升档 下=降档（按下沿）
+        hat_y = axes.get(c['AX_HAT_Y'], 0)
+        hat_up = 1 if hat_y < -c['HAT_EDGE_CNT'] else 0
+        hat_dn = 1 if hat_y > c['HAT_EDGE_CNT'] else 0
+        if hat_up and not self.prev_hat_up:
+            self.gear = round(clamp(self.gear + c['GEAR_STEP'],
+                                    c['GEAR_MIN'], c['GEAR_MAX']), 2)
+            self.get_logger().info(f'速度档 → {self.gear:.2f} m/s')
+        if hat_dn and not self.prev_hat_dn:
+            self.gear = round(clamp(self.gear - c['GEAR_STEP'],
+                                    c['GEAR_MIN'], c['GEAR_MAX']), 2)
+            self.get_logger().info(f'速度档 → {self.gear:.2f} m/s')
+        self.prev_hat_up = hat_up
+        self.prev_hat_dn = hat_dn
+
+        # 底盘：弧线模型（云平台 Gv）
+        vx = wz = 0.0
+        if not self.estop and not stale:
+            a = c['SMOOTHING']
+            raw_th = c['THROTTLE_FLIP'] * norm(axes.get(c['AX_THROTTLE'], 0))
+            raw_st = c['STEER_FLIP'] * norm(axes.get(c['AX_STEER'], 0))
+            self.sm_th += a * (dead(raw_th, c['DEADZONE']) - self.sm_th)
+            self.sm_st += a * (dead(raw_st, c['DEADZONE']) - self.sm_st)
+            if abs(self.sm_th) >= c['DEADZONE'] * 0.5:   # 无油门不蠕行
+                r = self.gear * abs(self.sm_th)
+                if abs(self.sm_st) > c['LAT_EPS']:
+                    r = max(r, c['V_MIN'])
+                vx = -r if self.sm_th < 0 else r
+                wz = clamp(vx * self.sm_st / c['R_MIN'], -c['WZ_MAX'], c['WZ_MAX'])
+        else:
+            self.sm_th = self.sm_st = 0.0
+        msg = Twist()
+        msg.linear.x = clamp(vx, -c['VX_MAX'], c['VX_MAX'])
+        msg.angular.z = clamp(wz, -c['WZ_MAX'], c['WZ_MAX'])
+        self.pub_cmd.publish(msg)
+
+        # 机械臂：增量目标积分
+        active = False
+        if not self.estop and not stale and self.targets is not None:
+            a = c['SMOOTHING']
+            raw_sh = c['DIR_SHOULDER'] * (-norm(axes.get(c['AX_SHOULDER'], 0)))
+            raw_bs = c['DIR_BASE'] * norm(axes.get(c['AX_BASE'], 0))
+            self.sm_sh += a * (dead(raw_sh, c['DEADZONE']) - self.sm_sh)
+            self.sm_bs += a * (dead(raw_bs, c['DEADZONE']) - self.sm_bs)
+            in_sh = dead(self.sm_sh, c['DEADZONE'])
+            in_bs = dead(self.sm_bs, c['DEADZONE'])
+            in_wr = c['DIR_ROLL_BTN'] * (
+                (1 if buttons.get(c['BTN_ROLL_LEFT']) else 0)
+                - (1 if buttons.get(c['BTN_ROLL_RIGHT']) else 0))
+            in_wp = c['DIR_PITCH_BTN'] * (
+                (1 if buttons.get(c['BTN_PITCH_UP']) else 0)
+                - (1 if buttons.get(c['BTN_PITCH_DOWN']) else 0))
+            in_fu = c['DIR_FOREARM_BTN'] * (
+                (1 if buttons.get(c['BTN_FOREARM_UP']) else 0)
+                - (1 if buttons.get(c['BTN_FOREARM_DOWN']) else 0))
+            in_gr = c['DIR_GRIP'] * (
+                (1 if buttons.get(c['BTN_GRIP_OPEN']) else 0)
+                - (1 if buttons.get(c['BTN_GRIP_CLOSE']) else 0))
+
+            # 去抖：通道连续 N 拍有效才生效（滤单帧鬼影事件）
+            nd = c['ARM_DEBOUNCE_TICKS']
+            chans = {'wr': in_wr, 'wp': in_wp, 'sh': in_sh,
+                     'bs': in_bs, 'fu': in_fu, 'gr': in_gr}
+            for ch, val in chans.items():
+                self.arm_hold_cnt[ch] = self.arm_hold_cnt.get(ch, 0) + 1 if val else 0
+                chans[ch] = val if self.arm_hold_cnt[ch] >= nd else 0.0
+            in_wr, in_wp, in_sh, in_bs, in_fu, in_gr = (
+                chans[k] for k in ('wr', 'wp', 'sh', 'bs', 'fu', 'gr'))
+
+            dt = self.period
+            self.targets[0] = clamp(self.targets[0] + in_gr * c['RATE_BTN'] * dt, 0, c['GRIP_MAX'])
+            self.targets[1] = clamp(self.targets[1] + in_wr * c['RATE_BTN'] * dt, 0, 1000)
+            self.targets[2] = clamp(self.targets[2] + in_wp * c['RATE_BTN'] * dt, 0, 1000)
+            self.targets[3] = clamp(self.targets[3] + in_fu * c['RATE_BTN'] * dt, 0, 1000)
+            self.targets[4] = clamp(self.targets[4] + in_sh * c['RATE_STICK'] * dt, 0, 1000)
+            self.base_t = clamp(self.base_t + in_bs * c['RATE_STICK'] * dt, -1000, 1000)
+
+            active = any(abs(x) > 1e-9 for x in (in_wr, in_wp, in_sh, in_bs, in_fu, in_gr))
+            if active:
+                self.last_arm_input = now
+
+            # 回中（按下沿 → 服务）
+            cur_re = 1 if buttons.get(c['BTN_REHOME']) else 0
+            old_re = 1 if self.prev_buttons.get(c['BTN_REHOME']) else 0
+            if cur_re and not old_re:
+                if self.cli_rehome.service_is_ready():
+                    self.cli_rehome.call_async(Trigger.Request())
+                    self.get_logger().info('回中请求已发送（锚定+回中约需 10 秒以上）')
+                else:
+                    self.get_logger().warn('arm/rehome 服务不可用（驱动节点没在跑？）')
+
+            if active or (now - self.last_arm_input) < c['ARM_TAIL_S']:
+                js = JointState()
+                js.header.stamp = self.get_clock().now().to_msg()
+                js.name = list(ARM_JOINT_NAMES)
+                js.position = [float(t) for t in self.targets] + [float(self.base_t)]
+                self.pub_arm.publish(js)
+
+        self.prev_buttons = buttons
+
+    def cleanup(self):
+        self.pub_cmd.publish(Twist())          # 零速
+        if self.last_estop_pub:
+            m = Bool()
+            m.data = False
+            self.pub_estop.publish(m)
+
+
+def main(args=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--probe', action='store_true',
+                    help='打印手柄原始事件（校键号用），不启动 ROS')
+    opts, ros_args = ap.parse_known_args(args)
+    if opts.probe:
+        run_probe(CFG['JS_DEVICE'])
+        return
+
+    def _on_term(*_):
+        raise KeyboardInterrupt()
+    rclpy.init(args=ros_args)
+    signal.signal(signal.SIGTERM, _on_term)
+    node = Ps2TeleopNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.cleanup()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

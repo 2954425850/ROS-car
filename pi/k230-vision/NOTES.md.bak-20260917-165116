@@ -1,0 +1,171 @@
+# K230 开发笔记
+
+## 2026-09-17
+
+- 测 WiFi 吞吐**必须等连接稳定后**再测。connect() 后十几秒内测出的 0.04 Mbps 是假的
+  （速率自适应未爬升），稳定后同代码测出 12.2 Mbps，差 300 倍。
+- 不要用 MicroPython socket 的数字代表 K230 的网络能力。原生 C 路径（RTSP/MPP）
+  与 MicroPython 路径是两套东西。
+- MPP 管线被 Ctrl-C 打断后资源不释放，需 machine.reset() 或断电重上电。
+
+## 执行环境（2026-09-17 实测）
+
+- Pi: `mpremote 1.29.0` 装在 `~/.local/bin/mpremote`（`pip3 install --user --break-system-packages`）。
+- 用户 `cy` 在 `dialout` 组内，`/dev/ttyACM0` 可读写（crw-rw---- root:dialout）。
+- **传文件到 K230 用**：`~/.local/bin/mpremote connect /dev/ttyACM0 fs cp <本地文件> :<远程路径>`
+  （裸 `fs cp` 直接可用，不需要走 `/dev/stdin`）。
+- K230 上 `/sdcard/k230vision/` 已建立（空的）。
+- K230 `gc.mem_free()` ≈ **4.14 MB**（印证设计文档「堆只有约 3.9 MB」）。
+- `/sdcard` 顶层已有：`libs` `res` `examples` `revision.txt` `output.png`。
+
+## Task 1 WiFi 模块（2026-09-17 完成）
+
+- **实测 IP = `192.168.1.112`**（K230，TP-LINK_EE82）。`ifconfig()` 返回 4 元组
+  `('192.168.1.112','255.255.255.0','192.168.1.1','111.11.11.1')`，**DNS 位是 `111.11.11.1`**。
+- **`netup.py` 只用 `isconnected()` + `ifconfig()[0]` 判连接，这是对的。** 本固件上
+  `w.status()` 返回 `True`（bool，不是状态码），`w.config('ssid')` / `w.config('rssi')`
+  也**返回 True 而不是值**，用它们判状态会得到假阳性。
+- `WLAN(STA_IF).active(True)` 会打印 `Network (rt-smart) is always active and cannot be disabled.`
+  —— 这是 rt-smart 平台的正常提示，不是错误，不用管。
+- **`mpremote run <file>` 只跑本地文件，不接受远程路径。** 计划 Task 1 Step 4 里写的
+  `mpremote ... run /sdcard/k230vision/t_wifi.py` 会报
+  `mpremote: could not read file '/sdcard/k230vision/t_wifi.py'`（exit 1）。
+  要跑**板上**的脚本得用：
+  `mpremote connect /dev/ttyACM0 exec "exec(open('/sdcard/k230vision/t_wifi.py').read())"`
+- 断线重连实测：`disconnect()` 后 `is_up()` 立刻变 False，`ensure()` **约 11 秒**重连成功
+  （两次运行都是 11 s，稳定复现）。这 11 s 里大头是 `connect()` 内的 `time.sleep(3)` 静置
+  + 关联/拿 IP；`connect()` 的默认 20 s 超时够用。
+- 上电后 K230 会**自己**连上 WiFi（本次开工时已是 192.168.1.112）。所以 `connect()` 走
+  `is_up()` 短路返回 True 是**正常**路径，不代表没连过。
+- Task 1 验收输出（两次运行一致）：
+  `CONNECT True in 0 s` / `IP 192.168.1.112` / `IS_UP True` /
+  `AFTER_DISCONNECT is_up = False` / `RE_ENSURE True 192.168.1.112 in 11 s`
+
+## Task 2 推流最小闭环（2026-09-17，**功能通、规格不达标**）
+
+链路：sensor(GC2093) → VENC chn0 → MediaManager.link 零拷贝 → 裸 TCP → Pi 落盘。
+两次运行均 `EXIT=0`，未出现 `MediaManager link failed(9)`，板子健康。
+
+### 实测数据（两次运行）
+
+| 项 | Run 1 | Run 2 | 计划预期 |
+|---|---|---|---|
+| Pi sink 速率 | **3.904 Mbps** / 14.75 s / 7198479 B | **3.892 Mbps** / 14.10 s / 6858033 B | 1.8xx Mbps（窗口 1.5~2.2）|
+| K230 `sent` | 870 | 831 | ≈375 |
+| K230 `dropped` | **0** | **0** | 0 |
+| 实际帧率 | ≈58 fps | ≈59 fps | 25 fps |
+| GOP（IDR 间隔）| 32 帧 | ≈32 帧 | ≤25 帧 |
+| NAL 分布 | `{1:812, 5:29, 7:29, 8:29}` | `{1:777, 5:27, 7:27, 8:27}` | 7/8 各≥1，5 在开头 |
+
+- 两次运行**高度一致** → 3.9 Mbps 是**真实、可复现**的数字，**不是**「链路未预热」。
+  链路本身健康（远低于 NOTES 里 12.2 Mbps 基线），**问题是配置不是带宽**。
+- SPS/PPS/IDR 各 29（Run1），且开头就是 `[7, 8, 5, 1, 1, 1, ...]`，流是合法 H.264。
+- **GOP 实测 32 帧 ≠ `config.GOP=25`**：`cam.py` 调 `ChnAttrStr(...)` 时**没有传 `gop_len`**，
+  25 这个配置值**根本没被用到**，走的是驱动默认值。注意 32 帧 @58fps ≈ 0.55 s，
+  按**时间**算仍 < 1 s，但按 Global Constraints 的「GOP ≤ 25 帧」字面要求是超的。
+
+### 速率/帧率不达标的根因（**未修，留待人工决策**）
+
+`cam.py` 只调了 `set_framesize(width, height, alignment)` 设**分辨率**，
+**从头到尾没设过帧率**。sensor 跑的是它的原生 `1920x1080@60` 模式（初始化日志可见
+`mode 0, output 1920x1080@60`），`MediaManager.link` 把**每一帧**都喂给编码器，
+于是 720p 流实际产出 ≈58~60 fps，是目标 25 fps 的 **2.3 倍**，码率随之被顶到 ~3.9 Mbps。
+
+- **规格（Global Constraints「720p25，1.5~2 Mbps」）与计划代码不一致**：
+  计划的 `Expected` 写 `DONE sent≈375`（=25 fps），说明 25 fps 是**本意**，
+  但计划给的 `cam.py` 代码达不到。
+- **不要靠改 `BITRATE_KBPS` 把数字压回窗口**——那是凑数字。真正要做的是**限帧率**
+  （sensor/VENC 侧的 fps 配置），这是**规格决策**，已按「不达标如实报告、不调参凑数」上报。
+
+### 其他环境事实
+
+- **计划 Step 5 的 NAL 解析代码用错了位掩码**：写的是 `(b >> 5) & 0x07`（那是 **H.265** 的
+  布局）。H.264 的 `nal_unit_type` 是**低 5 位** `b & 0x1F`。用错掩码会把
+  `0x67`(SPS) 读成 3、`0x41`(P 帧) 读成 2，得到 `{2:812, 3:87}` 这种**看似全是分区帧**的
+  假结论，会误判成「流损坏」。**正确掩码下才是 `{1,5,7,8}`。**
+- **`pusher.py` 计划代码漏了 `StreamData` 的 import**（它定义在 `media.vencoder`，
+  `cam.py` 里的 star-import 不跨模块共享）。不补会 `NameError: name 'StreamData' is not defined`，
+  在第一帧就崩。补法：`from media.vencoder import StreamData`。
+- `cam.stop()` 路径**干净**：连跑两次都能正常重建管线，无资源泄漏，
+  `gc.mem_free()` 回到 4.14 MB。这对避免断电重上电是好消息。
+- Pi 的 GStreamer **没有 `h264parse` 组件**，无法用 gst 独立校验 H.264 合法性，
+  只能靠 Step 5 的 NAL 统计（本项目缺 ffmpeg，一直如此）。
+- Pi 侧接收端要活过 SSH 通道，用 `setsid nohup ... &` 会被 ssh 通道拖住导致调用超时；
+  实测可行写法是再套一层 `timeout`：
+  `timeout 8 bash -c 'setsid nohup python3 <sink> ... >/tmp/sink.log 2>&1 </dev/null & sleep 2'`
+
+## Task 2 续：帧率攻坚（2026-09-17）——**结论：本硬件做不到 25fps**
+
+上面「未修，留待人工决策」那节作废，实际已动手做到能做的一切。结论如下。
+
+### 机制（本任务真正的收获）
+
+1. **`bit_rate` 是「每帧字节预算」，不是整条流的硬上限。** 实测三个数据点，
+   误差均 <4%：
+
+   ```
+   总码率 ≈ bit_rate × 实际输出帧率 / src_frame_rate
+   ```
+
+   | 配置 | 实际 fps | 预测 kbps | 实测 kbps |
+   |---|---|---|---|
+   | src=25 dst=25 | 53.4 | 4375 | 4212 |
+   | src=60 dst=25 | 50.2 | 1713 | 1684 |
+   | src=30 dst=25 | 55.2 | 3768 | 3834 |
+   | src=60 dst=25（1080p 源）| 56.0 | 1911 | 1927 |
+
+   这解释了计划原版为什么是 3.9 Mbps：三处都没配 → sensor 跑 60fps 档 →
+   `2048 × 58/30 ≈ 3.9 Mbps`（与实测 3.904 吻合到 1%）。
+
+2. **`ChnAttrStr` 的 `src_frame_rate` / `dst_frame_rate` / `gop_len` 默认都是 30**，
+   不显式赋值就完全用不上 `config.FPS` / `config.GOP`。
+   验证：赋 `gop_len=25` 后 IDR 间隔从 **32（=30+2）变成 27（=25+2）**，确认赋值生效。
+
+3. **压帧率的唯一有效开关是 `Sensor(fps=...)` 构造函数参数**（`libs/PipeLine.py`
+   里就是 `Sensor(id=..., fps=board_fps)`，本板 `fps_map` 给的是 30）。
+   `Sensor.set_framerate()` **本固件不支持**（抛 `set_framerate`）；
+   `Sensor.get_framerate()` 是 **NotImplementedError**，读不回来。
+
+### 帧率阶梯逐条试的结果
+
+| 手段 | 结果 |
+|---|---|
+| `Sensor(fps=25)` | 被**静默接受**，但 **0 帧** |
+| `Sensor(fps=30)` | **0 帧，且会把 USB 卡死**（5 次尝试仅 1 次侥幸出 24fps） |
+| `sensor.set_framerate(25/30/60)` | 不支持，一律抛异常 |
+| `dst_frame_rate=25`（源真在 30fps 时）| **真的丢帧 → 24.0fps** ✓ 但 30fps 档起不来 |
+| `dst_frame_rate=25`（源在 60fps 时）| **不丢帧**，只改码率预算 |
+| 裸 `Sensor()` | 稳定落在 **1080p60** 档，~56fps（唯一可靠的档） |
+
+gc2093 硬件档位只有 **1080p30 / 1080p60 / 960p90 / 720p90**，**没有 25**。
+
+**所以要真正做到 25fps，只剩「改走 SendFrame」一条路**（Python 侧按 25fps 抽样
+再喂编码器，这样参考链才是干净的；在编码**输出**侧丢帧会破坏 P 帧参考链）。
+那是**设计变更**，不在 Task 2 范围内，已上报等决策。
+
+### 最终采用的配置（可靠下限方案）
+
+`config.SENSOR_FPS = 60` + `src_frame_rate=60` + `dst_frame_rate=25` + `gop_len=25`：
+- 码率 **1927 kbps**（落进 1.5~2.2 窗口）✓
+- IDR 间隔 **25** ✓
+- **fps ≈ 56，不是 25** ✗ ← 唯一不达标的验收项
+
+### ⚠️ 板子已进入需要「物理断电重上电」的状态
+
+反复起停管线 + `Sensor(fps=30)` 多次把 USB 卡死之后，**连原本稳定的裸 `Sensor()`
+配置也不再出帧了**（0 帧）。已按恢复阶梯全部试过：
+
+1. `soft-reset`（多次）—— 一度有效，最后无效
+2. pyserial 发 `Ctrl-C` —— 无效
+3. **→ 需要人工物理断电重上电**
+
+对照实验证明**与 WiFi 无关**：同一份裸配置，**带 WiFi 和不带 WiFi 都是 0 帧**，
+而同一份裸配置在本任务早期能稳定出 870/831 帧。这就是设计文档 V4 记录的
+MPP 资源不释放故障模式。
+
+### 其它环境坑
+
+- **一次 MicroPython 会话只能建一条 MPP 管线。** 在同一会话里 `stop()` 后再建第二条，
+  必报 `MediaManager link failed(9)`。要跑多组配置必须**每组单独开一次 mpremote exec**。
+- `Sensor(fps=30)` 会让 USB CDC 层卡死（mpremote 报 `[Errno 5] Input/output error`），
+  之后 `/dev/ttyACM0` 会短暂 busy。**Task 4/7 千万别用 30fps 档。**

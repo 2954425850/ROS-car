@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""K230 视觉链路的 Pi 侧命令行。
+
+    k230ctl snap [-o FILE] [--min-frames N] [--timeout S] [--attempts N] [--proto tcp|udp] [--json]
+    k230ctl resultd                 前台常驻收结果（给 systemd 用）
+    k230ctl result [--json]         打印最近一条视觉结果
+    k230ctl status [--json]         汇总 resultd / 照片 的状态
+
+`snap` 成功时把最终 JPEG 的路径打到 stdout（退出码 0），失败打原因到 stderr（退出码 1）。
+默认输出「只有一行路径」，方便 shell 直接取用：  IMG=$(k230ctl snap)
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import k230pi  # noqa: E402
+
+
+def cmd_snap(args):
+    try:
+        r = k230pi.snap(out=args.out, min_frames=args.min_frames,
+                        timeout=args.timeout, proto=args.proto,
+                        attempts=args.attempts)
+    except k230pi.SnapError as e:
+        print("SNAP FAILED: %s" % e, file=sys.stderr)
+        return 1
+    if r["suspect"]:
+        # 文件照样给，但要让调用方知道他拿到的东西可能不可靠（没攒够一整个 GOP）
+        print("WARN 只攒到 %d 帧（< %d），未必跨过 IDR，画面可能不可靠"
+              % (r["frames"], args.min_frames), file=sys.stderr)
+    if args.json:
+        print(json.dumps(r, ensure_ascii=False))
+    else:
+        print(r["path"])
+    return 0
+
+
+def cmd_resultd(args):
+    k230pi.resultd()
+    return 0
+
+
+def cmd_result(args):
+    obj = k230pi.read_latest_result()
+    if obj is None:
+        print("还没有收到任何结果（%s 不存在或为空）" % k230pi.LATEST_RESULT,
+              file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(obj, ensure_ascii=False))
+        return 0
+    objs = obj.get("objs") or []
+    print("frame=%s  w=%s h=%s  objs=%d  recv=%s  peer=%s"
+          % (obj.get("frame"), obj.get("w"), obj.get("h"), len(objs),
+             obj.get("_received_at"), obj.get("_peer")))
+    for o in objs:
+        print("  %-12s %.3f %s" % (o.get("cls"), o.get("score", 0), o.get("box")))
+    return 0
+
+
+def cmd_status(args):
+    st = k230pi.read_status()
+    age = k230pi.status_age_s()
+    jpg = k230pi.LATEST_JPEG
+    if args.json:
+        print(json.dumps({"resultd": st, "status_age_s": age,
+                          "latest_jpeg": jpg,
+                          "latest_jpeg_bytes": (os.path.getsize(jpg)
+                                                if os.path.exists(jpg) else None)},
+                         ensure_ascii=False))
+        return 0 if st else 1
+    rc = 0
+    if st is None:
+        print("resultd: 未运行（%s 不存在）" % k230pi.STATUS_FILE)
+        rc = 1
+    else:
+        print("resultd: pid=%s listening=%s connected=%s peer=%s connects=%s "
+              "msgs=%s bad_lines=%s last_frame=%s last_objs=%s last_msg=%s "
+              "status_age=%ss"
+              % (st.get("pid"), st.get("listening"), st.get("connected"),
+                 st.get("peer"), st.get("connects"), st.get("msgs"),
+                 st.get("bad_lines"), st.get("last_frame"), st.get("last_objs"),
+                 st.get("last_msg"), age))
+        if age is not None and age > 30:
+            print("  ⚠ 状态文件 %ss 没更新 —— 守护进程可能已经死了" % age)
+            rc = 1
+    print("latest.jpg: %s"
+          % (("%s (%d B)" % (jpg, os.path.getsize(jpg)))
+             if os.path.exists(jpg) else "无（还没拍过）"))
+    return rc
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="k230ctl")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("snap", help="从 K230 抓一张 JPEG")
+    s.add_argument("-o", "--out", default=None,
+                   help="输出路径（默认 /tmp/k230/snap-<时间戳>.jpg）")
+    s.add_argument("--min-frames", type=int, default=k230pi.MIN_FRAMES,
+                   help="攒够多少帧才收工（默认 %d，别低于 %d）"
+                        % (k230pi.MIN_FRAMES, k230pi.GOP_LEN + 1))
+    s.add_argument("--timeout", type=float, default=k230pi.DEFAULT_TIMEOUT,
+                   help="单次尝试的墙钟上限秒数（默认 %.0f）" % k230pi.DEFAULT_TIMEOUT)
+    s.add_argument("--attempts", type=int, default=k230pi.DEFAULT_ATTEMPTS,
+                   help="失败重试次数（默认 %d）" % k230pi.DEFAULT_ATTEMPTS)
+    s.add_argument("--proto", choices=["tcp", "udp"], default="tcp")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_snap)
+
+    d = sub.add_parser("resultd", help="前台常驻收 K230 结果（给 systemd 用）")
+    d.set_defaults(func=cmd_resultd)
+
+    q = sub.add_parser("result", help="打印最近一条视觉结果")
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(func=cmd_result)
+
+    t = sub.add_parser("status", help="汇总 resultd / 照片 的状态")
+    t.add_argument("--json", action="store_true")
+    t.set_defaults(func=cmd_status)
+
+    a = ap.parse_args(argv)
+    return a.func(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

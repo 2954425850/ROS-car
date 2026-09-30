@@ -1,0 +1,195 @@
+# /sdcard/k230vision/t_targetrx_logic.py —— targets.py 的纯逻辑测试
+#
+# **不碰 socket、不需要网卡、不建管线** —— 零风险，瞬间跑完。
+# 为什么不测 socket：这个平台 127.0.0.1 不通、连自己的 WiFi 地址也会阻塞，
+# 板上做不了回环。socket 那层只能靠真实外部连接验。
+#
+# 本测试**能红**：正方形不变量是真断言，不是打印出来看看。
+
+import sys
+
+sys.path.insert(0, "/sdcard/k230vision")
+
+from targets import (pt_to_box_px, box_to_px, parse_request,
+                     pick_body_for_face)
+
+W, H = 320, 180
+FAILS = []
+
+
+def chk(cond, label):
+    if not cond:
+        FAILS.append(label)
+        print("  FAIL  %s" % label)
+
+
+def show(label, req):
+    kind, payload = parse_request(req, W, H, 0.12)
+    if kind == "set":
+        print("  %-42s -> set  px=(%.1f, %.1f, %.1f, %.1f)"
+              % (label, payload[0], payload[1], payload[2], payload[3]))
+    else:
+        print("  %-42s -> %s  %s" % (label, kind, payload if payload else ""))
+    return kind, payload
+
+
+print("=" * 74)
+print("0) 浮点精度（决定容差怎么定）")
+print("   0.7-0.4      = %.10f" % (0.7 - 0.4))
+print("   0.7-0.4==0.3 = %s" % ((0.7 - 0.4) == 0.3))
+print("   1.0/3.0      = %.10f" % (1.0 / 3.0))
+print()
+print("A) 正常请求")
+k, px = show('{"pt": [0.5, 0.5]}', {"pt": [0.5, 0.5]})
+chk(k == "set", "pt 应被接受")
+chk(abs(px[2] - px[3]) < 1e-4, "pt 换算出的框在像素上必须是正方形")
+chk(abs(px[2] - 0.12 * W) < 1e-4, "pt 边长应等于 size*W")
+
+k, px = show('{"pt": [0.25, 0.5], "size": 0.2}', {"pt": [0.25, 0.5], "size": 0.2})
+chk(k == "set" and abs(px[2] - 0.2 * W) < 1e-4 and abs(px[2] - px[3]) < 1e-4,
+    "size=0.2 的框应为 64x64 正方形")
+
+k, px = show('{"box": [0.4, 0.4, 0.6, 0.7]}', {"box": [0.4, 0.4, 0.6, 0.7]})
+# ⚠️ 容差用 1e-3：本平台浮点是**单精度**，(0.7-0.4)*180 会有 ~2e-6 的误差。
+#    原来用 1e-6 会误报 —— 这是测试的容差问题，不是代码问题。
+chk(k == "set" and abs(px[2] - 64.0) < 1e-3 and abs(px[3] - 54.0) < 1e-3,
+    "box 换算：w=(0.6-0.4)*320=64, h=(0.7-0.4)*180=54")
+
+k, px = show('{"cmd": "stop"}', {"cmd": "stop"})
+chk(k == "stop", "stop 应被接受")
+
+print()
+print("B) 非法请求（都必须被拒）")
+for label, req in [
+    ('{"pt": [1.5, 0.5]}', {"pt": [1.5, 0.5]}),
+    ('{"pt": [0.5, -0.1]}', {"pt": [0.5, -0.1]}),
+    ('{"pt": [0.5, 0.5, 0.5]}', {"pt": [0.5, 0.5, 0.5]}),
+    ('{"pt": ["a", 0.5]}', {"pt": ["a", 0.5]}),
+    ('{"pt": [0.5,0.5], "size": 0.001}', {"pt": [0.5, 0.5], "size": 0.001}),
+    ('{"pt": [0.5,0.5], "size": 5}', {"pt": [0.5, 0.5], "size": 5}),
+    ('{"box": [0.6, 0.4, 0.4, 0.7]}', {"box": [0.6, 0.4, 0.4, 0.7]}),
+    ('{"box": [0.4, 0.4, 0.4005, 0.4005]}', {"box": [0.4, 0.4, 0.4005, 0.4005]}),
+    ('{"box": [0.4, 0.4, 0.6]}', {"box": [0.4, 0.4, 0.6]}),
+    ('{"box": [1.2, 0.4, 0.6, 0.7]}', {"box": [1.2, 0.4, 0.6, 0.7]}),
+    ('{}', {}),
+    ('[]（非 dict）', []),
+    ('{"foo": 1}', {"foo": 1}),
+]:
+    k, _ = show(label, req)
+    chk(k == "err", "%s 应被拒" % label)
+
+print()
+print("C) 正方形不变量（扫一遍 u/v/size）")
+bad = 0
+for u in (0.05, 0.3, 0.5, 0.75, 0.95):
+    for v in (0.05, 0.5, 0.95):
+        for s in (0.03, 0.1, 0.25, 0.5):
+            bx = pt_to_box_px(u, v, s, W, H)
+            if abs(bx[2] - bx[3]) > 1e-4:
+                bad += 1
+                print("  FAIL  非正方形 u=%s v=%s s=%s -> %s" % (u, v, s, bx))
+chk(bad == 0, "所有 (u,v,size) 组合都应为正方形（共 %d 个反例）" % bad)
+print("  扫了 60 个组合，非正方形 %d 个" % bad)
+
+print()
+print("D) 门槛：**目标框必须整个落在画面内**")
+print("   （模板裁剪窗口可以出画 —— 那部分现在补灰边，见 TrackCropApp 的 pad 分支；")
+print("    但目标本身得完整可见：拿半个身子当模板是跟不住的）")
+k, px = show('{"pt": [0.01, 0.5]}', {"pt": [0.01, 0.5]})
+chk(k == "err", "贴左边的点应被拒（框伸出画面）")
+
+# 崩溃复现点：size=0.12 -> 框边 38.4；u=0.05 时 x = 16-19.2 = -3.2（负）
+k, px = show('{"pt": [0.05, 0.05]}', {"pt": [0.05, 0.05]})
+chk(k == "err", "崩溃复现点 (0.05,0.05) 必须被拒（回归）")
+
+# 别把功能一起改没了：正中心必须还能锁
+k, px = show('{"pt": [0.5, 0.5]}', {"pt": [0.5, 0.5]})
+chk(k == "set", "正中心应被接受")
+
+# size=0.12 时安全区 = u[0.06,0.94] / v[0.1067,0.8933]
+# 纵向两侧各钉一个：v=0.10 -> y=18-19.2=-1.2（拒）；v=0.13 -> y=4.2（收）
+k, px = show('{"pt": [0.5, 0.10]}', {"pt": [0.5, 0.10]})
+chk(k == "err", "v=0.10 框纵向上越界，应被拒")
+k, px = show('{"pt": [0.5, 0.13]}', {"pt": [0.5, 0.13]})
+chk(k == "set", "v=0.13 刚进安全区，应被接受")
+
+# ⚠️ v=0.20 以前被拒（那时门槛是"裁剪窗口放得下"），**现在应该收**
+# —— 这一条专门盯着"pad 补上之后边界有没有真的放宽"
+k, px = show('{"pt": [0.5, 0.20]}', {"pt": [0.5, 0.20]})
+chk(k == "set", "v=0.20 在旧门槛下被拒，现在应被接受（pad 生效的证据）")
+
+# size 上限 = 短边/W = 180/320 = 0.5625（框自身要放得下）
+k, px = show('{"pt": [0.5, 0.5], "size": 0.6}', {"pt": [0.5, 0.5], "size": 0.6})
+chk(k == "err", "size=0.6 的框比画面还高，正中心也应被拒")
+k, px = show('{"pt": [0.5, 0.5], "size": 0.5}', {"pt": [0.5, 0.5], "size": 0.5})
+chk(k == "set", "size=0.5 的框仍放得下（模板靠补灰），应被接受")
+
+print()
+print("E) 脸 -> 身体框 的绑定（pick_body_for_face）")
+print("   判据是「脸被包住的比例」，不是 IoU —— 脸只占身体约 1/20，IoU 天然 <0.1，")
+print("   拿 IoU 当门槛会把正确答案一起筛掉。下面第一条就是为了钉死这一点。")
+FACE = [0.40, 0.10, 0.50, 0.20]          # 0.10 x 0.10
+PA = {"cls": "person", "score": 0.6, "box": [0.30, 0.05, 0.60, 0.80]}   # 完全包住
+PB = {"cls": "person", "score": 0.6, "box": [0.45, 0.12, 0.70, 0.90]}   # 只包住 40%
+CH = {"cls": "chair",  "score": 0.6, "box": [0.30, 0.05, 0.60, 0.80]}   # 同类形状、错类
+
+r = pick_body_for_face(FACE, [PA])
+chk(r == PA["box"], "脸被 person 完全包住 -> 取它（实得 %s）" % (r,))
+
+r = pick_body_for_face(FACE, [PA, PB])
+chk(r == PA["box"], "两个 person 都在时取包得更全的那个（实得 %s）" % (r,))
+
+r = pick_body_for_face(FACE, [PB])
+chk(r is None, "只包住 40%%（< min_cover 0.5）-> 不认（实得 %s）" % (r,))
+
+r = pick_body_for_face(FACE, [CH])
+chk(r is None, "同类形状但 cls=chair -> 不认（只认 person）" % ())
+
+r = pick_body_for_face(FACE, [])
+chk(r is None, "一个检测框都没有 -> None")
+
+r = pick_body_for_face([0.95, 0.90, 0.99, 0.99], [PA])
+chk(r is None, "脸和身体框完全不重叠 -> None（实得 %s）" % (r,))
+
+r = pick_body_for_face([0.5, 0.5, 0.5, 0.5], [PA])
+chk(r is None, "退化的脸框（面积 0）-> None")
+
+# ⭐ 变异锚点：如果实现改成"IoU >= 0.5"，第一条必须变红
+chk(pick_body_for_face(FACE, [PA]) is not None,
+    "★ 上面第一条就是变异锚点：改用 IoU 判据会让它变红")
+
+print()
+print("F) 新命令 cmd=auto / cmd=follow")
+k, v = show('{"cmd": "auto"}', {"cmd": "auto"})
+chk(k == "auto", 'cmd=auto -> ("auto", None)（实得 %s）' % k)
+
+k, v = show('{"cmd": "follow", "who": "id1"}', {"cmd": "follow", "who": "id1"})
+chk(k == "follow" and v == "id1", 'follow who=id1 -> ("follow","id1")（实得 %s/%s）' % (k, v))
+
+k, v = show('{"cmd": "follow"}', {"cmd": "follow"})
+chk(k == "err", "follow 不带 who -> 应被拒")
+
+k, v = show('{"cmd": "follow", "who": ""}', {"cmd": "follow", "who": ""})
+chk(k == "err", "who 为空 -> 应被拒")
+
+k, v = show('{"cmd": "follow", "who": 123}', {"cmd": "follow", "who": 123})
+chk(k == "err", "who 是数字 -> 应被拒")
+
+k, v = show('{"cmd": "follow", "who": "id 1"}', {"cmd": "follow", "who": "id 1"})
+chk(k == "err", "who 含空格 -> 应被拒（限死 [A-Za-z0-9_-]）")
+
+k, v = show('{"cmd": "follow", "who": "a/b"}', {"cmd": "follow", "who": "a/b"})
+chk(k == "err", "who 含斜杠 -> 应被拒")
+
+k, v = show('{"cmd": "follow", "who": "id_2-x"}', {"cmd": "follow", "who": "id_2-x"})
+chk(k == "follow" and v == "id_2-x", "合法字符（字母数字 _ -）应被接受（实得 %s/%s）" % (k, v))
+
+print()
+print("=" * 74)
+if FAILS:
+    print("结果: %d 项失败" % len(FAILS))
+    for f in FAILS:
+        print("   -", f)
+else:
+    print("结果: 全部通过")
+print("LOGIC_DONE")

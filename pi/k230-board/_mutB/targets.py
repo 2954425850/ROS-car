@@ -1,0 +1,394 @@
+# /sdcard/k230vision/targets.py
+"""外部目标框的入口 —— 让 K230 能被"从外面指定跟哪个东西"。
+
+## 为什么需要它
+
+`tracker.init(frame, box)` 是有的，但唯一的调用者是 `app.py` 自己拿检测器的框。
+**外面进不来** —— 检测器**不认识**的物体（桃、辣椒……）因此无路可走。
+
+本模块提供那个入口。它**对所有框来源都通用**：点屏、语音+云端 grounding、
+或者别的什么，只要能吐出一个框，走的都是这里。
+
+⚠️ **框来源本身不在这里** —— 那在别的机器上（K230 只负责收）。
+
+## 协议：一行 JSON，一次命令一个连接
+
+连接 → 发一行 JSON → 收一行 JSON → 连接关闭。**不用维持长连接**
+（实现最简单，客户端只要会发一行 TCP 就够：`nc` / `curl` / 几行 python 都行）。
+
+请求（三选一，都以 `\\n` 结尾）：
+
+    {"pt": [u, v]}                      # 点：归一化中心点，开一个默认大小的方框
+    {"pt": [u, v], "size": 0.12}        # 同上，size = 方框边长占**画面宽度**的比例
+    {"box": [l, t, r, b]}               # 框：归一化，与 results.normalize 同约定
+    {"cmd": "stop"}                     # 停止跟踪（释放当前目标）
+
+坐标一律**归一化到推流画面**（0~1，原点左上）—— 和检测器输出、`results` 完全一致。
+**发命令的一方不需要知道 AI 帧是多大、有没有 letterbox，那是 K230 自己的事。**
+
+响应：
+
+    {"ok": true}
+    {"ok": false, "err": "..."}
+
+## ⚠️ 目标中心不能太靠边（2026-09-19 起会明确报错）
+
+框在画面内**不够** —— 板子要在目标中心上**居中裁一个比框大一倍的方形模板**，
+所以中心离边太近会导致裁剪出画。实测这会让板子**直接死机、必须断电**
+（`{"pt":[0.05,0.05]}` 触发过一次）。
+
+默认 `size=0.12` 时的安全区（AI 帧 320x180）：**u ∈ [0.121, 0.879]、v ∈ [0.214, 0.786]** ——
+**纵向只有画面中间 57%**（因为模板是正方形，被帧的短边卡住）。
+`size` 越大安全区越小，`size > 0.28125` 时**任何位置都不行**。
+
+越界会返回 `{"ok": false, "err": "pt too close to edge: ..."}`，
+**err 里直接给出安全范围**，客户端照着夹一下再发即可。
+**不要忽视这个 err** —— 以前这类请求会返回 `{"ok": true}` 然后板子死掉。
+
+## 平台注意（实测）
+
+- **bind 端口需要网卡是活的** —— 所以 `TargetRx` 必须在 `netup` 之后建。
+  没拉 WiFi 时 bind 报 `OSError: no available NIC`。
+- **本平台的 `127.0.0.1` 不通**（`EHOSTUNREACH`）；连板子自己的 WiFi 地址也会阻塞。
+  所以**别想在板上做回环自测** —— 逻辑用 `pt_to_box_px` / `parse_request`
+  这两个纯函数测（不碰 socket），socket 那层靠真实外部连接验。
+
+## 纯函数与 socket 分开
+
+`pt_to_box_px` / `box_to_px` / `parse_request` **不碰任何 socket**，
+可以脱离网络单独测。`TargetRx` 只负责把 socket 接上这几个函数。
+"""
+import socket
+
+import ujson
+
+
+# ---------------- 纯函数（可脱离网络测试）----------------
+
+def pt_to_box_px(u, v, size, W, H):
+    """归一化中心点 + 边长比例 -> 像素框 (x, y, w, h)。
+
+    边长 s = size * W（占画面宽度）。**宽和高都用 s，所以像素上一定是正方形** ——
+    不受 AI 帧是 16:9 的影响。（归一化坐标不是等比的，直接用 size 当高会被拉长。）
+    """
+    s = size * W
+    return (u * W - s / 2.0, v * H - s / 2.0, s, s)
+
+
+def box_to_px(box, W, H):
+    """归一化 [l, t, r, b] -> 像素框 (x, y, w, h)。"""
+    l, t, r, b = [float(x) for x in box]
+    return (l * W, t * H, (r - l) * W, (b - t) * H)
+
+
+# ---------------- 模板裁剪几何 ----------------
+#
+# `TrackCropApp` 初始化模板时，会在目标中心上**居中裁一个正方形**，边长
+#     s_z = round(sqrt((w + 0.5*(w+h)) * (h + 0.5*(w+h))))      # CONTEXT_AMOUNT = 0.5
+# 正方形框（pt 生成的框）时恒等于 `round(2*w)` —— **比目标框大一倍**。
+#
+# ⚠️ 2026-09-19 的历史：这个方框伸出画面时，`ai2d.crop()` 会收到负的起点，
+# **整个 MicroPython VM 直接死**（`{"pt":[0.05,0.05]}` → crop 起点 -22 → 需断电）。
+# 当时的挡法是"裁剪窗口必须整个在画面内"，代价是**纵向只有中间 57% 能锁**。
+#
+# 现在 `TrackCropApp` 已经补了 pad 路径（照抄厂商的 TrackSrcApp）：伸出画面的
+# 那部分**补灰边**，所以裁剪窗口**可以**出画了。门槛相应放宽成 ——
+#
+#   ★ **目标框本身必须整个落在画面内。** ★
+#
+# 理由：灰边只是"目标周围的背景"，补掉无所谓；但**目标本身必须完整可见**，
+# 拿半个身子当模板是跟不住的（模板必须紧贴目标，见 tracker.py 文件头第 1 条）。
+#
+# ⚠️ `template_crop_side()` 与 `vendor/nanotracker.py` 的
+# `TrackCropApp.get_padding_crop_param()` **必须同步**。app.py 启动时会断言。
+
+CONTEXT_AMOUNT = 0.5
+
+
+def template_crop_side(w, h, context=CONTEXT_AMOUNT):
+    """TrackCropApp 会裁出的模板正方形边长（像素）。**纯函数，不碰硬件。**"""
+    a = w + context * (w + h)
+    b = h + context * (w + h)
+    return int(round((a * b) ** 0.5))
+
+
+def box_window_fits(x, y, w, h, W, H):
+    """目标框是否整个落在画面内。**纯函数，不碰硬件。**
+
+    这是现在的门槛。**不是**裁剪窗口 —— 那个现在允许出画（会补灰边）。
+    """
+    return x >= 0 and y >= 0 and x + w <= W and y + h <= H
+
+
+def _safe_center_range(w, h, W, H, **_ignored):
+    """给报错用：目标中心的归一化安全范围 (umin, umax, vmin, vmax)。
+
+    按 `w/2`、`h/2` 算 —— 也就是"框完整可见"的条件。
+    （旧版按模板边长 s_z/2 算，那套数字现在不适用了：裁剪窗口已经允许出画。）
+    **范围可能是空的**（框比画面还大）—— 调用方要判 `umin > umax`。
+    """
+    du = (w / 2.0) / W
+    dv = (h / 2.0) / H
+    return (du, 1.0 - du, dv, 1.0 - dv)
+
+
+def _crop_err(w, h, W, H, size=None):
+    """框放不下时的报错文本。**范围为空要单独说**，否则会打出 u[0.900,0.100] 这种废话。"""
+    umin, umax, vmin, vmax = _safe_center_range(w, h, W, H)
+    head = ("size=%.4g -> %dpx box" % (size, int(w))) if size is not None else \
+           ("%dx%d box" % (int(w), int(h)))
+    if umin > umax or vmin > vmax:
+        return ("box too big for this frame: %s cannot fit in %dx%d at all "
+                "(max size = %.4g)" % (head, W, H, min(W, H) / float(W)))
+    return ("box would leave the frame: %s must be entirely visible "
+            "(the template's grey padding around it is fine); "
+            "center must be in u[%.3f,%.3f] v[%.3f,%.3f]"
+            % (head, umin, umax, vmin, vmax))
+
+
+def pick_body_for_face(face_box, objs, cls="person", min_cover=0.5):
+    """在检测结果里找「这张脸所属的那个人的身体框」。**纯函数。**
+
+    face_box : 归一化 [l,t,r,b]（faces 数组里的 box）
+    objs     : 检测结果列表，每项 {cls, score, box}（归一化）
+    返回      : 归一化 [l,t,r,b]，找不到返回 None
+
+    ⚠️ 判据是「**脸被这个框包住的比例**」，不是 IoU。
+    脸只占身体很小一块（约 1/20），IoU 天然就低到 0.1 以下，
+    拿 IoU 当门槛会把**正确答案一起筛掉**。包住比例量纲才对。
+
+    为什么要它：`faces` 和 `objs` 是两个独立数组，板子不会自动把
+    "张三的脸"和"张三的身体"绑起来。要"跟着张三"就必须有人做这一步。
+    """
+    fl, ft, fr, fbm = [float(v) for v in face_box]
+    fa = (fr - fl) * (fbm - ft)
+    if fa <= 0:
+        return None
+    best = None
+    best_cover = 0.0
+    for o in objs:
+        if o.get("cls") != cls:
+            continue
+        b = o.get("box")
+        if not b or len(b) != 4:
+            continue
+        bl, bt, br, bb = [float(v) for v in b]
+        ix = min(fr, br) - max(fl, bl)
+        iy = min(fbm, bb) - max(ft, bt)
+        if ix <= 0 or iy <= 0:
+            continue
+        cover = (ix * iy) / fa
+        if cover > best_cover:
+            best_cover = cover
+            best = b
+    return best if best_cover >= min_cover else None
+
+
+def _isnum(x):
+    try:
+        float(x)
+        return True
+    except BaseException:
+        return False
+
+
+def parse_request(req, W, H, default_size=0.12):
+    """把一条请求解析成动作。**不碰 socket，纯函数。**
+
+    返回 ("set", box_px) / ("stop", None) / ("err", 原因字符串)
+    """
+    if not isinstance(req, dict):
+        return ("err", "not an object")
+
+    cmd = req.get("cmd")
+    if cmd == "stop":
+        return ("stop", None)
+
+    # 「切回检测器驱动」。补这条是因为：**发过任意外部命令后 det_auto 就永久关掉了**，
+    # 而原来没有回头路（只能重启板子）。没有它，"跟着张三"一用，板子自带的
+    # 自动锁定就全废了 —— 那是个很贵的代价。
+    if cmd == "auto":
+        return ("auto", None)
+
+    # 「跟着某个人」。板子自己拿 faces + objs 做绑定（见 pick_body_for_face），
+    # **不走 8557 给框** —— 那样会把 det_auto 永久关掉。
+    if cmd == "follow":
+        who = req.get("who")
+        if False:
+            return ("err", "follow needs who=<id>")
+        who = who.strip()
+        if not who or len(who) > 32:
+            return ("err", "who empty or too long")
+        for ch in who:
+            # 库名是 ASCII（id1/id2…）。这里限死字符集是因为这个值会一路
+            # 走到身份比对逻辑里，别让奇怪的东西进来。
+            if not ("a" <= ch <= "z" or "A" <= ch <= "Z"
+                    or "0" <= ch <= "9" or ch in "_-"):
+                return ("err", "who must be [A-Za-z0-9_-]")
+        return ("follow", who)
+
+    if "box" in req:
+        box = req["box"]
+        if not isinstance(box, list) or len(box) != 4:
+            return ("err", "box must be [l,t,r,b]")
+        if not all(_isnum(v) for v in box):
+            return ("err", "box not numeric")
+        l, t, r, b = [float(v) for v in box]
+        if not (0.0 <= l <= 1.0 and 0.0 <= t <= 1.0
+                and 0.0 <= r <= 1.0 and 0.0 <= b <= 1.0):
+            return ("err", "box out of 0..1")
+        if r <= l or b <= t:
+            return ("err", "box degenerate")
+        px = box_to_px(box, W, H)
+        if px[2] < 4 or px[3] < 4:
+            return ("err", "box too small")
+        if not box_window_fits(px[0], px[1], px[2], px[3], W, H):
+            return ("err", "box " + _crop_err(px[2], px[3], W, H))
+        return ("set", px)
+
+    if "pt" in req:
+        pt = req["pt"]
+        if not isinstance(pt, list) or len(pt) != 2:
+            return ("err", "pt must be [u,v]")
+        if not (_isnum(pt[0]) and _isnum(pt[1])):
+            return ("err", "pt not numeric")
+        u, v = float(pt[0]), float(pt[1])
+        if not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+            return ("err", "pt out of 0..1")
+        if not _isnum(req.get("size", default_size)):
+            return ("err", "size not numeric")
+        size = float(req.get("size", default_size))
+        if not (0.02 <= size <= 0.9):
+            return ("err", "size out of 0.02..0.9")
+        px = pt_to_box_px(u, v, size, W, H)
+        if px[2] < 4 or px[3] < 4:
+            return ("err", "box too small")
+        if not box_window_fits(px[0], px[1], px[2], px[3], W, H):
+            return ("err", "pt " + _crop_err(px[2], px[3], W, H, size=size))
+        return ("set", px)
+
+    return ("err", "need one of: box / pt / cmd=stop|auto|follow")
+
+
+# ---------------- socket 那层 ----------------
+
+class TargetRx:
+    """监听一个端口，把收到的命令排队，由主循环取走应用。
+
+    ⚠️ 必须在 `netup` 之后构造（bind 需要活网卡）。
+    """
+
+    def __init__(self, port, ai_w, ai_h, default_size=0.12):
+        self.W = ai_w
+        self.H = ai_h
+        self.default_size = default_size
+        self.port = port
+
+        self.pending_box_px = None      # (x, y, w, h) 像素，AI 帧坐标系
+        self.pending_stop = False
+        self.pending_follow = None      # 要跟的人（faces 里的 who），如 "id1"
+        self.pending_auto = False       # 请求切回检测器驱动
+        self.recv_ok = 0
+        self.recv_bad = 0
+
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("0.0.0.0", port))
+        self._srv.listen(1)
+        self._srv.settimeout(0)          # 非阻塞 accept
+
+    def poll(self):
+        """非阻塞。收到命令就排队，主循环下一帧应用。"""
+        try:
+            conn, _addr = self._srv.accept()
+        except OSError:
+            return                       # 没有连接 —— 正常路径
+        try:
+            conn.settimeout(0.2)
+            data = b""
+            while b"\n" not in data and len(data) < 512:
+                try:
+                    chunk = conn.recv(128)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+            line = data.split(b"\n")[0].strip()
+            if not line:
+                self._reply(conn, {"ok": False, "err": "empty"})
+                self.recv_bad += 1
+                return
+            kind, payload = parse_request(ujson.loads(line), self.W, self.H,
+                                          self.default_size)
+            if kind == "err":
+                self._reply(conn, {"ok": False, "err": payload})
+                self.recv_bad += 1
+            elif kind == "stop":
+                self.pending_stop = True
+                self.pending_box_px = None
+                self.pending_follow = None
+                self._reply(conn, {"ok": True})
+                self.recv_ok += 1
+            elif kind == "follow":
+                self.pending_follow = payload
+                self.pending_box_px = None
+                self.pending_stop = False
+                self._reply(conn, {"ok": True})
+                self.recv_ok += 1
+            elif kind == "auto":
+                self.pending_auto = True
+                self.pending_follow = None
+                self._reply(conn, {"ok": True})
+                self.recv_ok += 1
+            else:
+                self.pending_box_px = payload
+                self.pending_stop = False
+                self.pending_follow = None
+                self._reply(conn, {"ok": True})
+                self.recv_ok += 1
+        except BaseException as e:
+            self.recv_bad += 1
+            try:
+                self._reply(conn, {"ok": False, "err": "%s" % e})
+            except BaseException:
+                pass
+        finally:
+            try:
+                conn.close()
+            except BaseException:
+                pass
+
+    def _reply(self, conn, obj):
+        conn.send(ujson.dumps(obj).encode() + b"\n")
+
+    def take(self):
+        """取走待应用的命令。
+
+        返回 ("set", box_px) / ("stop", None) / ("follow", who) / ("auto", None)
+        或 (None, None)。
+
+        ⚠️ follow / auto **不能**由 TargetRx 自己处理 —— 它们要用到**同一帧的**
+        faces 和 objs，那只有主循环里才有。这里只负责把它们递上去。
+        """
+        if self.pending_stop:
+            self.pending_stop = False
+            return ("stop", None)
+        if self.pending_follow is not None:
+            who = self.pending_follow
+            self.pending_follow = None
+            return ("follow", who)
+        if self.pending_auto:
+            self.pending_auto = False
+            return ("auto", None)
+        if self.pending_box_px is not None:
+            px = self.pending_box_px
+            self.pending_box_px = None
+            return ("set", px)
+        return (None, None)
+
+    def close(self):
+        try:
+            self._srv.close()
+        except BaseException:
+            pass
