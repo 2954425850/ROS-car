@@ -497,3 +497,28 @@ def test_joint_comp_measures_the_true_droop_at_the_handover():
             -DROOP['shoulder'] * 500 / 120]
     for g, w in zip(got, want):
         assert abs(g - w) < 3.0, (got, want)
+
+
+# 2026-10-01 第五跑的真值：白盒 r=182mm / z=−106mm。
+# aim 按"预抓点余量最大"挑走 α=−85 ⇒ 接触点余量只剩 49 ⇒ 真机上肩顶到 field 864
+# （离固件上限 875 只差 11）**舵机撑不住**，下扎全程跟不上、40s 超时。
+O_BOX = (0.1818, -0.0131, -0.1060)
+
+
+def test_pick_target_balance_keeps_both_ends_feasible():
+    """★ 下扎轴 α 必须**两头一起挑**：预抓点余量最大的那个 α，往往正是接触点余量最小的。
+
+    变异（实测）：`balance=False` ⇒ 末态余量 49 < 50 ⇒ 这条红。
+    """
+    cfg = _cfg()._replace(alpha0=-84.0)
+
+    def end_slack(a):
+        return grasp.pick_target(O_BOX, cfg, cfg.s_stop_m, a, span=0.0).slack
+
+    t_naive = grasp.pick_target(O_BOX, cfg, cfg.s_pre_m, cfg.alpha0)
+    t_bal = grasp.pick_target(O_BOX, cfg, cfg.s_pre_m, cfg.alpha0, balance=True)
+    e_naive, e_bal = end_slack(t_naive.alpha), end_slack(t_bal.alpha)
+    assert t_naive.slack > 100.0, t_naive.slack          # 前提：现规则确实在预抓点余量很大
+    assert e_naive < 50.0, (t_naive.alpha, e_naive)      # 可是它把接触点余量压到 50 以下
+    assert e_bal >= 55.0, (t_bal.alpha, e_bal)           # 平衡后接触点余量够
+    assert min(t_bal.slack, e_bal) > min(t_naive.slack, e_naive), (t_bal.slack, e_bal)

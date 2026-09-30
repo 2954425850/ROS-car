@@ -124,7 +124,7 @@ def visible(joints, O_m, vis):
     return (vis.u_lo <= u <= vis.u_hi and vis.v_lo <= v <= vis.v_hi), (u, v)
 
 
-def pick_target(O_m, cfg, s_m, prefer_alpha, vis=None, span=None):
+def pick_target(O_m, cfg, s_m, prefer_alpha, vis=None, span=None, balance=False):
     """在 α 上搜一个把**张开态爪尖**放到 `axis_point(O, s, α)` 的可行姿态。
 
     硬门：p3/p4/p5 ∈ [125,875]。排序：余量最大 → α 最接近 prefer_alpha（连续性，避免每拍换解）。
@@ -157,7 +157,23 @@ def pick_target(O_m, cfg, s_m, prefer_alpha, vis=None, span=None):
             if not ok:
                 continue
             vis_ok, px = visible(j, O_m, vis)
-            cands.append(Target(a, s_m, j, f, field_slack(f),
+            sl = field_slack(f)
+            if balance and s_m > 0.0:
+                # ★★ **两头一起看**（2026-10-01 第五跑查明）：下扎轴 α 一旦定下，接触点那个姿态
+                #   也就定了 —— 而"预抓点余量最大"的 α 往往正是"接触点余量最小"的那个。
+                #   实测（r=182mm/z=−106mm）：α=−85 在 8cm 处 slack 106 但末态只剩 43；
+                #   α=−79 末态 67 但 8cm 处只有 13。真机就是栽在这：aim 挑了 −85/−88，
+                #   肩顶到 field 864（离固件上限 875 只差 11）**舵机撑不住** ⇒ 下扎全程跟不上。
+                #   取 `min(此处余量, 接触点余量)` 当排序键 ⇒ 选到的 α 两头都留得下余量（−82：57/57）。
+                #   接触点解不出来 ⇒ 直接判死（−1），别选一个到不了底的角度。
+                try:
+                    Tb = axis_point(O_m, cfg.s_stop_m, a)
+                    jb = ik_open_m(Tb[0], Tb[1], Tb[2], a)
+                    okb, _fb = fields_in_range(jb, cfg.gripper, cfg.wrist_roll)
+                    sl = min(sl, field_slack(_fb)) if okb else -1.0
+                except Unreachable:
+                    sl = -1.0
+            cands.append(Target(a, s_m, j, f, sl,
                                 math.dist(tip_open_m(j), O_m), vis_ok, px[0], px[1]))
         k += cfg.alpha_step
     if not cands:
@@ -194,7 +210,7 @@ def plan_verdict(O_m, cfg, vis=None):
     # 诊断（见 pick_target docstring 的推论）：目标投影像素只由留量 s 决定 ⇒
     # "接近阶段看得见吗 / 在不在可锁带里"是 s_pre 的函数，与目标在哪无关。S0 就报出来给人看。
     try:
-        tp = pick_target(O_m, cfg, cfg.s_pre_m, cfg.alpha0, vis)
+        tp = pick_target(O_m, cfg, cfg.s_pre_m, cfg.alpha0, vis, balance=True)
         pix = '；s_pre=%.1fcm 处：预测像素 (%.0f, %.0f) %s有效区（可锁带 v ≤ %.0f）、slack %.0f' % (
             cfg.s_pre_m * 100, tp.upx, tp.vpx,
             '在' if tp.visible else '**不在**', 0.893 * 180.0, tp.slack)
@@ -476,7 +492,8 @@ def run(cfg, link, phase='aim', log=print):
                 #   实机实测（2026-10-01）：下扎中 α 自己从 −60° 漂到 −67° ⇒ 轴线转向 ⇒
                 #   爪尖沿旧轴走下去、横向偏出 4.6cm（比瓶盖还大）⇒ 夹在瓶盖**后面**。
                 tgt = pick_target(O_u, cfg, s_cmd, prev_alpha,
-                                  span=(None if cur == 'aim' else cfg.alpha_freeze_span))
+                                  span=(None if cur == 'aim' else cfg.alpha_freeze_span),
+                                  balance=(cur == 'aim'))
         except Refused as e:
             rep['stopped'] = 'refuse：%s' % e
             break
