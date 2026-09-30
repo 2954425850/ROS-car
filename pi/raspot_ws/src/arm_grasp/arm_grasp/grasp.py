@@ -42,7 +42,8 @@ GraspConfig = namedtuple('GraspConfig',
     'tol_m tol_px_err patience min_gain_m '             # 判据
     'z_plane_m latency_s k_ewma gate_m '                # 尺度 / 时间 / 估计器
     'close_field lift_m obs_lost_s deadband_counts close_ticks '
-    'min_step_deg close_step close_stall alpha_freeze_span bias_m')
+    'min_step_deg close_step close_stall alpha_freeze_span bias_m '
+    'base_comp base_comp_max')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -75,9 +76,15 @@ GraspConfig.__new__.__defaults__ = (
     # obs_lost_s = 5.0（原 1.0）：**跟踪器在相机移动时会跟丢低纹理目标**（2026-10-01 实测：
      #   瓶盖这种纯色大平面，臂一动就丢、臂一停就稳 8 秒零漂移）。1.0s 会把整轮拦掉。
      #   放长是安全的：丢观测期间**估计器保持 O 不变**、目标点也不变，臂只是继续走向同一个点。
-    # bias_m：**静态偏置**（基座系，米）。实测"指尖总落在目标左边 1cm"（2026-10-01，用户目视）
-    #   ⇒ 目标点往右挪 1cm = `bias_y = −0.01`。它是**臂+相机**的性质，与目标物无关。
-    578.0, 0.04, 5.0, 10.0, 12, 0.75, 30.0, 3, 3.0, (0.0, -0.01, 0.0),
+    # bias_m：**静态偏置**（基座系，米）。**先留 0** —— 2026-10-01 查明"指尖偏左 1cm"的
+    #   真正来源是**底座滞后 ~10 count（3.85°）**（令 −227.7 / 读 −217.0），20cm 上正好 1.34cm。
+    #   底座靠 `base_comp`（外环补偿）修，不再用手调的 (x,y) 偏置（那还会把方向搞反）。
+    #   留着这个字段是给"补偿后仍有残差"时兜底用的。
+    # base_comp：**底座外环补偿**增益。底座是 motor 模式速度环、总差 ~10 count 到不了指令位置
+    #   （2026-10-01 实测 令 −227.7/读 −217.0 = 3.85° ⇒ 20cm 上 1.34cm = 就是"偏左 1cm"）。
+    #   每拍把 (指令−回读)×增益 补回指令，直到回读真的到位；0 = 关掉。
+    # base_comp_max：单次补偿的上限（count），防止一次补过头把底座甩出去。
+    578.0, 0.04, 5.0, 10.0, 12, 0.75, 30.0, 3, 3.0, (0.0, 0.0, 0.0), 0.5, 80.0,
 )
 
 
@@ -325,6 +332,7 @@ def run(cfg, link, phase='aim', log=print):
            'target': None, 's_ach_m': None, 'rows': [], 'phases': []}
     dt = 1.0 / cfg.hz
     j_ref, cmd_sent, f_prev, near = None, None, None, 0
+    f_now = None          # 上一拍的 field（底座外环补偿要用；本拍的更晚才算）
     prev_alpha = cfg.alpha0
     stall, best = 0, None
     s_cmd = cfg.s_pre_m
@@ -464,6 +472,15 @@ def run(cfg, link, phase='aim', log=print):
         fields = to_fields(j_cmd, grip_cmd, cfg.wrist_roll)
         for i in (2, 3, 4):                    # 只夹 p3/p4/p5；p1/p2(夹爪/自转)、p6(底座 ±1000) 原样带过
             fields[i] = min(FIELD_HI, max(FIELD_LO, fields[i]))
+        # ★★ 底座外环补偿（2026-10-01 查明"偏左 1cm"的根源）：底座是 **motor 模式速度环**，
+        #   速度 0 时还是松的，实测它**总差 ~10 count 到不了指令位置**（令 −227.7 / 读 −217.0
+        #   = 3.85°，在 20cm 半径上正好 1.34cm）。做法：把"指令 − 回读"的差按增益补回指令，
+        #   直到回读真的到位。⚠️ 用的是**上一拍**的回读（f_now 在本拍更后面才算）—— 外环慢，
+        #   这是刻意的；增益 <1 也是刻意的（底座那边还有它自己的速度环，别一起震荡）。
+        if cfg.base_comp > 0.0 and f_now is not None and len(f_now) >= 6:
+            err6 = fields[5] - f_now[5]
+            corr = max(-cfg.base_comp_max, min(cfg.base_comp_max, cfg.base_comp * err6))
+            fields[5] = max(-1000.0, min(1000.0, fields[5] + corr))
         if j_ref is not None:
             dmax = max(abs(fields[k] - j_ref[k]) for k in range(6))
             rep['max_step_deg_actual'] = max(rep['max_step_deg_actual'], dmax / 4.1667)
