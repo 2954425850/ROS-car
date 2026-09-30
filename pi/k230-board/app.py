@@ -7,6 +7,29 @@ MicroPython 的 _thread 在这块板子上与 MPP 的配合没验证过，**不�
 所有"取一帧"的动作都是非阻塞或短超时的（pusher 100 ms / rtsp 0），
 在一个循环里轮流推进 —— Task 4 已证单线程 `pump()` 与官方 _thread 版等效。
 
+## 主循环节拍：**一轮里绝不能有阻塞等待**（2026-10-01 的教训）
+
+设计节拍是 10 Hz（`INFER_HZ`），但 2026-10-01 在车上实测只有 **0.6 Hz** ——
+推理、人脸、跟踪、上报**全都被拖慢 16 倍**。原因不是推理慢，是主循环里有阻塞等待：
+
+    推流目标 192.168.5.1:8555 不可达（本车常态）
+      -> pusher.pump() 返回 -2
+      -> time.sleep_ms(1000)          # 1.0 s —— **整条循环陪着睡**
+      -> pusher.connect() 跑满超时     # 0.5 s（实测 0.501 s）
+      = 每轮白付 1.5 s，再加结果上报那 0.2 s ≈ 1.7 s/轮
+
+**修法：一律按时间戳节流，不在循环里 sleep。**
+
+  - 推流重连：`t_push_retry` + `config.PUSH_RETRY_MS`（10 s 一次 ——
+    因为**单次尝试本身就要 0.5 s**，间隔太短等于没改）
+  - 结果上报重连：`Reporter.connect()` 内部节流（`retry_ms`，默认 2 s）——
+    这样 `if not r.ok: r.connect()` 这个惯用法才是真免费
+  - 两个 `pump()` 本来就是短超时/非阻塞的（pusher 100 ms、rtsp 0）
+
+⚠️ **以后加任何 IO 都照这个办**：调用要么本身非阻塞、要么自带节流。
+**不许拿循环去等一个 socket。** "反正是后台任务"不是理由 —— 这里没有后台任务，
+只有一个循环，谁阻塞它谁就拖慢全部。
+
 ## 四处按实测修正的地方（照抄计划原版会踩）
 
 1. **不用 `from libs.PipeLine import PipeLine`**，计划里那句是多余的。
@@ -204,6 +227,12 @@ def _obstacles_payload(objs, frame_no, ts_ms):
 def main():
     netup.init(config.WIFI_SSID, config.WIFI_PASS)
     while not netup.connect():
+        # ★ 这里以前**没有 os.exitpoint()** —— 于是 WiFi 起不来时，板子会卡在一条
+        #   **不可打断**的循环里：Ctrl-C 无效、raw REPL 进不去，**只能断电**
+        #   （README §7.6 记的就是这个坑）。而"WiFi 起不来"最常见的成因恰恰是
+        #   `config_local.py` 没放到卡上 —— 一个配置问题被放大成"板子像是坏了"。
+        #   补上这一行之后，Ctrl-C 随时能把控制权拿回来。
+        os.exitpoint()
         print("WIFI FAILED, retry")
         time.sleep(2)
     print("WIFI OK %s" % netup.ip())
@@ -316,6 +345,7 @@ def main():
     t_start = time.ticks_ms()
     nxt = t_start
     t_stats = t_start
+    t_push_retry = t_start      # 下次允许尝试推流重连的时刻（见循环里 1) 那段注释）
     period = int(1000.0 / INFER_HZ)
     frame_no = 0
     obj_frames = 0
@@ -353,11 +383,20 @@ def main():
             # 1) 推流：每轮尽量取，不空转
             rc = pusher.pump()
             if rc == -2:
-                # 断线：退避后只重连 socket。**不要在这里重建 MPP 管线**（见文件头）
-                time.sleep_ms(config.RECONNECT_BACKOFF_MS)
-                if pusher.connect():
-                    print("PUSH RECONNECTED connects=%d" % pusher.connects)
-                    cam.request_idr(config.PUSH_CHN)   # 显式 no-op，见文件头第 4 条
+                # 断线：**到点了才试一次**重连。不要在这里重建 MPP 管线（见文件头）。
+                #
+                # ⚠️ 这里原来是 `time.sleep_ms(config.RECONNECT_BACKOFF_MS)`（1000 ms）。
+                #    那是**拿整条主循环去等一个 socket**：PUSH 目标不可达时（本车常态）
+                #    每轮白付 1.0 s sleep + 0.5 s connect 超时，把 10 Hz 的主循环
+                #    **拖成 0.6 Hz**（2026-10-01 在车上实测：8556 与 8559 两条上报
+                #    都是 0.6 条/秒）。推理/人脸/跟踪/上报全跟着一起慢 16 倍。
+                #    改成按时间戳节流后，没到点的那一轮**代价为零**。
+                now_ms = time.ticks_ms()
+                if time.ticks_diff(now_ms, t_push_retry) >= 0:
+                    t_push_retry = time.ticks_add(now_ms, config.PUSH_RETRY_MS)
+                    if pusher.connect():
+                        print("PUSH RECONNECTED connects=%d" % pusher.connects)
+                        cam.request_idr(config.PUSH_CHN)   # 显式 no-op，见文件头第 4 条
             # 看门狗每轮都喂（计划只在 rc==0 时喂，那样完全断流时它永不触发）
             wd.tick(pusher.frames_sent)
 

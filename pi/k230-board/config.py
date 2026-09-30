@@ -125,7 +125,18 @@ ROTATE_180 = True
 
 # 看门狗
 PUSH_STALL_WARN_MS = 3000   # 连续这么久没成功发出帧就告警
-RECONNECT_BACKOFF_MS = 1000
+
+# 推流重连的**间隔**（2026-10-01 改）。
+#
+# 原来这里叫 `RECONNECT_BACKOFF_MS = 1000`，用法是主循环里的
+# `time.sleep_ms(...)` —— **阻塞主循环的写法，已删**。为什么删见下以及 app.py 主循环。
+#
+# ⚠️ 为什么是 10 s 而不是 1 s：**一次重连尝试本身要跑满 0.5 s**
+#    （`Pusher.connect()` 用 `frame_timeout_s=0.5` 当超时；对不可达主机实测 0.501 s）。
+#    如果每 1 s 试一次，主循环平均每轮仍白付 ~0.5 s ⇒ 爬不回 10 Hz。
+#    摊到 10 s 一次 ≈ 0.05 s/轮，主循环才回得来。
+#    推流断了晚 10 秒发现**没有实际区别** —— 这个连接现在本来就没人在收。
+PUSH_RETRY_MS = 10000
 
 # ---- Task 5: KPU 推理 ----
 # 模型：官方 /sdcard/examples/05-AI-Demo/object_detect_yolov8n.py 用的 COCO 80 类 YOLOv8n。
