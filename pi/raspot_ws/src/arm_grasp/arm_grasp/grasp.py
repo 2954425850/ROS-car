@@ -42,7 +42,7 @@ GraspConfig = namedtuple('GraspConfig',
     'tol_m tol_px_err patience min_gain_m '             # 判据
     'z_plane_m latency_s k_ewma gate_m '                # 尺度 / 时间 / 估计器
     'close_field lift_m obs_lost_s deadband_counts close_ticks '
-    'min_step_deg close_step close_stall alpha_freeze_span')
+    'min_step_deg close_step close_stall alpha_freeze_span bias_m')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -75,7 +75,9 @@ GraspConfig.__new__.__defaults__ = (
     # obs_lost_s = 5.0（原 1.0）：**跟踪器在相机移动时会跟丢低纹理目标**（2026-10-01 实测：
      #   瓶盖这种纯色大平面，臂一动就丢、臂一停就稳 8 秒零漂移）。1.0s 会把整轮拦掉。
      #   放长是安全的：丢观测期间**估计器保持 O 不变**、目标点也不变，臂只是继续走向同一个点。
-    578.0, 0.04, 5.0, 10.0, 12, 0.75, 30.0, 3, 3.0,
+    # bias_m：**静态偏置**（基座系，米）。实测"指尖总落在目标左边 1cm"（2026-10-01，用户目视）
+    #   ⇒ 目标点往右挪 1cm = `bias_y = −0.01`。它是**臂+相机**的性质，与目标物无关。
+    578.0, 0.04, 5.0, 10.0, 12, 0.75, 30.0, 3, 3.0, (0.0, -0.01, 0.0),
 )
 
 
@@ -394,12 +396,15 @@ def run(cfg, link, phase='aim', log=print):
                 cmd_sent = j_ref = to_fields(from_fields(fbf), cfg.gripper, cfg.wrist_roll)
                 link.publish(cmd_sent)
             continue
+        # ★ 目标点 + **静态偏置**：实测指尖总落在目标左边 1cm ⇒ 目标往右挪 1cm 抵掉。
+        #   下面所有几何（目标姿态/残差/沿轴留量）**一律用 `O_u`**，别混用 est.O。
+        O_u = tuple(est.O[i] + cfg.bias_m[i] for i in range(3))
 
         # ③ 目标（按**当前相** `cur`）
         j_cur_m = from_fields(trace.at(link.now(), 'auto'))
         if cur == 'descend':
             tip = tip_open_m(j_cur_m)
-            s_ach_now = standoff_along_axis(tip, est.O, prev_alpha)
+            s_ach_now = standoff_along_axis(tip, O_u, prev_alpha)
             step = max(cfg.s_min_step, cfg.s_frac * max(s_ach_now, 0.0))
             s_cmd = max(cfg.s_stop_m, s_ach_now - step)
         elif cur == 'lift':
@@ -422,7 +427,7 @@ def run(cfg, link, phase='aim', log=print):
                 # ★ 一旦离开 aim 就把 α **冻住**（span=0）：下扎必须是一条**直线**。
                 #   实机实测（2026-10-01）：下扎中 α 自己从 −60° 漂到 −67° ⇒ 轴线转向 ⇒
                 #   爪尖沿旧轴走下去、横向偏出 4.6cm（比瓶盖还大）⇒ 夹在瓶盖**后面**。
-                tgt = pick_target(est.O, cfg, s_cmd, prev_alpha,
+                tgt = pick_target(O_u, cfg, s_cmd, prev_alpha,
                                   span=(None if cur == 'aim' else cfg.alpha_freeze_span))
         except Refused as e:
             rep['stopped'] = 'refuse：%s' % e
@@ -441,9 +446,9 @@ def run(cfg, link, phase='aim', log=print):
         #   它恒等于 s（因为姿态就是按 T=O+s·(−ẑ) 解出来的），拿它当收敛判据 ⇒ 永远不收敛。
         j_cur = from_fields(trace.at(link.now(), 'auto'))
         tip_act = tip_open_m(j_cur)
-        T_goal = axis_point(est.O, s_cmd, tgt.alpha)
+        T_goal = axis_point(O_u, s_cmd, tgt.alpha)
         err_act = math.dist(tip_act, T_goal)
-        s_ach = standoff_along_axis(tip_act, est.O, tgt.alpha)
+        s_ach = standoff_along_axis(tip_act, O_u, tgt.alpha)
         j_cmd, ratio, reached = limit_step_floor(j_cur, tgt.joints,
                                                  cfg.max_step_deg, cfg.min_step_deg)
         # ★★ 判据查的是**目标**的 field，不是这一拍的**指令**：
