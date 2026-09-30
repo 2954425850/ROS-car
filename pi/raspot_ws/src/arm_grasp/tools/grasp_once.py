@@ -95,7 +95,7 @@ def parse_box(s):
 
 
 def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
-              joint_comp=None):
+              joint_comp=None, hz=None):
     """把 CLI 参数装进 `GraspConfig`。**`--h` 必须真的进 `z_plane_m`**（自检里有闸）。"""
     kw = {'z_plane_m': float(h_m)}
     if max_step is not None:
@@ -107,6 +107,16 @@ def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
     if joint_comp is not None:
         kw['joint_comp'] = float(joint_comp)
     cfg = grasp.GraspConfig(**kw)
+    if hz is not None:
+        # ★ 提频时**必须把"按拍数"的判据一起折算**，否则它们在**墙上时间**上被砍短：
+        #   hz 10→20 会让"卡住 25 拍(2.5s)"变成 1.25s、"合爪兜底 30 拍(3s)"变成 1.5s
+        #   ⇒ 判据比硬件还急、整轮变脆。按 hz/10 同比例放大，**秒数不变**。
+        hz = float(hz)
+        k = hz / cfg.hz
+        cfg = cfg._replace(hz=hz,
+                           patience=max(1, int(round(cfg.patience * k))),
+                           close_ticks=max(1, int(round(cfg.close_ticks * k))),
+                           max_ticks=max(1, int(round(cfg.max_ticks * k))))
     if max_seconds is not None:
         cfg = cfg._replace(max_seconds=float(max_seconds))
     return cfg
@@ -223,6 +233,26 @@ def selftest():
         print('  ✗ 不传 --alpha0 时没有保留 GraspConfig 的默认值')
         ok = False
 
+    # ②c ★ 变异闸：--hz 必须真的进 cfg.hz，**且按拍数的判据要同比折算**
+    #     （把 cfg._replace 里那三项删掉 ⇒ 这一条立刻变红）
+    print('\n②c --hz → cfg.hz 且按拍判据同比折算（秒数不变）：')
+    base = build_cfg(DEFAULT_H_M)
+    for h in (10.0, 20.0, 25.0):
+        c = build_cfg(DEFAULT_H_M, hz=h)
+        k = h / base.hz
+        want = (round(base.patience * k), round(base.close_ticks * k),
+                round(base.max_ticks * k))
+        got = (c.patience, c.close_ticks, c.max_ticks)
+        tag = '✓' if (c.hz == h and got == want) else '✗'
+        if tag == '✗':
+            ok = False
+        print('  %s hz=%-5.0f patience/close_ticks/max_ticks = %s (期望 %s；'
+              '秒数 patience=%.1fs close=%.1fs)'
+              % (tag, h, got, want, c.patience / h, c.close_ticks / h))
+    if build_cfg(DEFAULT_H_M).hz != grasp.GraspConfig().hz:
+        print('  ✗ 不传 --hz 时没有保留 GraspConfig 的默认值')
+        ok = False
+
     # ③ 名义点上跑 S0（打印**原文**，断言不抛异常）
     print('\n③ 名义点 S0（grasp.plan_verdict 原文）：')
     cfg = build_cfg(DEFAULT_H_M)
@@ -304,6 +334,10 @@ def main(argv=None):
                          '中心、`span` 当半径去搜，第一拍的中心就是 α0 ⇒ α0 错了、'
                          '真解又在窗外，第一拍就 refuse（臂一步不动）。'
                          '目标越低越远，需要的 α 越陡：桌面(−12.6cm)、半径 17.8cm 时要 −73°…−88°。')
+    ap.add_argument('--hz', type=float, default=None,
+                    help='控制频率（默认 10）。真机可到 ~20——**硬上限是回读滞后 ~0.4s**，'
+                         '再快就是拿过期数据发指令。会按 hz/10 同比折算 patience/close_ticks/'
+                         'max_ticks，保证各判据的**秒数**不变。')
     ap.add_argument('--joint-comp', type=float, default=None,
                     help='肩/肘/腕位置环下垂补偿增益（默认 1.0；**0 = 关掉**）。'
                          'A/B 用：第 2 跑（无它）下扎通、第 4~6 跑（有它）下扎卡住。')
@@ -322,7 +356,7 @@ def main(argv=None):
         return 2
 
     cfg = build_cfg(args.h, max_step=args.max_step, patience=args.patience,
-                    alpha0=args.alpha0, joint_comp=args.joint_comp,
+                    alpha0=args.alpha0, joint_comp=args.joint_comp, hz=args.hz,
                     max_seconds=args.max_seconds)
     print('框 box=%s（归一化）  目标面高 h=%.4f m（%.1f mm）→ cfg.z_plane_m'
           % (want, args.h, args.h * 1000))
