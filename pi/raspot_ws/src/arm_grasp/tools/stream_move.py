@@ -396,7 +396,6 @@ def main(argv=None):
                          '= max_step × (小行程/大行程)。实测肩/腕行程比 ~3.5:1，max_step=0.5 时'
                          '腕每拍只有 2 count、**落进舵机死区一动不动**，姿态永远到不了'
                          '（2026-09-30 真跑两次都栽在这）。6.0 下最慢的关节也有 ~7 count/拍。')
-                    help='每拍每关节最多多少度（默认 1.5）')
     ap.add_argument('--t-ms', type=int, default=100,
                     help='arm_t_ms：每条 0xAC 的移动时长（默认 100 ≈ 10Hz 一拍）')
     ap.add_argument('--max-seconds', type=float, default=None,
