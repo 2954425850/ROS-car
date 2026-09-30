@@ -137,17 +137,20 @@ from arm_grasp.servo import ik_open_m
 class Plant:
     """一台"真"臂：关节按速度上限追指令。模型即真值（模型误差另用参数注入）。"""
 
-    def __init__(self, j0, v_max_deg=20.0, tip_err_m=(0.0, 0.0, 0.0), droop_deg=None):
+    def __init__(self, j0, v_max_deg=20.0, tip_err_m=(0.0, 0.0, 0.0), droop_deg=None, dead_deg=0.0):
         self.j = dict(j0)
         self.v = v_max_deg
         self.tip_err = tip_err_m
         # `droop_deg` = 舵机**位置环下垂**：稳态下真实位置停在"指令 − 下垂"处。
         # 2026-10-01 真机实测 p5/p4/p3 分别是 +16.7/+6.0/+8.4 count（= 4.0/1.5/2.0°）。
         self.droop = dict(droop_deg or {})
+        self.dead = dead_deg
 
     def step(self, j_cmd, dt):
         for k in self.j:
             d = (j_cmd[k] - self.droop.get(k, 0.0)) - self.j[k]
+            if abs(d) < self.dead:      # ★ 舵机**死区**：差得不够多就一动不动（真机 5~6 count）
+                continue
             m = self.v * dt
             self.j[k] += max(-m, min(m, d))
 
@@ -522,3 +525,23 @@ def test_pick_target_balance_keeps_both_ends_feasible():
     assert e_naive < 50.0, (t_naive.alpha, e_naive)      # 可是它把接触点余量压到 50 以下
     assert e_bal >= 55.0, (t_bal.alpha, e_bal)           # 平衡后接触点余量够
     assert min(t_bal.slack, e_bal) > min(t_naive.slack, e_naive), (t_bal.slack, e_bal)
+
+
+def test_descend_accepts_the_servo_deadband_instead_of_stalling():
+    """★ 下扎到位必须认**舵机死区**这条硬件极限，不能只认"沿轴留量 ≤ s_stop"。
+
+    真机第六跑：`s_ach` 停在 **5.7mm**（判据 3.5mm），舵机死区让它再也动不了 ⇒
+    25 拍后判"卡住"、整轮白跑。`near`（回读落进死区量级连 3 拍）那条接近相一直有、下扎相漏了。
+    变异（已实测）：把 `or near >= 3` 去掉 ⇒ 这条红。
+    """
+    # 用"肩沉降 −1.8°"（= 7.5 count ≤ deadband_counts 10）造一个**停在离目标几毫米**的稳态：
+    # 这正是真机第六跑的现场（`s_ach` 停在 5.7mm 再也下不去，用户肉眼确认"几乎贴着"）。
+    # 关掉 joint_comp，免得它把这个残余补掉、测试就失去意义。
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=1200, joint_comp=0.0)
+    plant = Plant(_start_joints(s_m=0.10), droop_deg={'shoulder': -1.8})
+    link = FakeLink(plant, CAP)
+    rep = grasp.run(cfg, link, phase='descend', log=lambda *a: None)
+    assert rep['phases'] and rep['phases'][0][0] == 'descend', rep['phases']
+    why = rep['phases'][0][1]
+    assert why.startswith('扎到位'), rep['stopped']
+    assert '死区极限' in why, why                          # 必须走的是第二条判据

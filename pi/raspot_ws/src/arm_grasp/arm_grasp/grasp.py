@@ -608,9 +608,16 @@ def run(cfg, link, phase='aim', log=print):
         #   于是被 stall 判据误报成"发散"（爪尖其实就停在离目标 3mm 处）。
         #   容差用 `min_gain_m`（"小到算没进展"的那个尺度，0.5mm）：既覆盖 O 的抖动
         #   （几十微米，13 倍余量），又不会提前开闸（实测在 3.016mm 处断，不是 4.8mm）。
-        if cur == 'descend' and s_ach <= cfg.s_stop_m + cfg.min_gain_m:
-            if not advance_or_stop('扎到位：实际余量 %.1fmm（爪尖离目标 %.1fmm）'
-                                   % (s_ach * 1000, err_act * 1000)):
+        # ★ 下扎到位 = 两种之一：① 沿轴留量真的到 s_stop（理想）；② **回读落进舵机死区量级
+        #   连续 3 拍**（= 硬件给得出的极限）。第二条是 2026-10-01 第六跑补的：那次 `s_ach` 停在
+        #   **5.7mm**，离 3.5mm 的判据只差 2mm，而舵机死区让它**再也动不了** ⇒ 25 拍后
+        #   被"卡住"判死、白跑一整轮。接近相**一直**用第二种判据（`tol_m` 那条比硬件还细，
+        #   真机永远满足不了），下扎相漏了。**别再把这条删掉。**
+        if cur == 'descend' and (s_ach <= cfg.s_stop_m + cfg.min_gain_m or near >= 3):
+            if not advance_or_stop('扎到位：实际余量 %.1fmm（爪尖离目标 %.1fmm；%s）'
+                                   % (s_ach * 1000, err_act * 1000,
+                                      '留量到 s_stop' if s_ach <= cfg.s_stop_m + cfg.min_gain_m
+                                      else '回读已达舵机死区极限 %d 拍' % near)):
                 break
             continue
         if cur == 'close' and close_cmd is not None and close_cmd >= cfg.close_field - 1.0 \
