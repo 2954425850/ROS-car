@@ -90,3 +90,29 @@ _arm_probe.py / l150pro_start_*.sh / k230_camera.sh
 `~/old-20260930/` 是一次改名归档的旧副本，**没有任何东西引用它，不要编辑**。
 
 回退（任一目录）：`rm ~/raspot_ws && mv ~/old-20260930/raspot_ws ~/raspot_ws`
+
+## ⚠️ 千万别在这个目录跑 `git clean`
+
+**这个仓库目录就是 Pi 的运行目录**，而 `git clean -x` 删的是所有**被忽略**的文件 ——
+那里面不只是构建产物。2026-09-30 实测 `git clean -xdn` 列出的 84 项里包括：
+
+| 会被删掉 | 后果 |
+|---|---|
+| `pi/voice-chatbot/config.yaml` | **3 个 api_key + qweather_key + QQ音乐 cookie 全没，要重新扫码登录** |
+| `pi/voice-chatbot/config.yaml.bak-*`（17 个） | 配置历史 |
+| `pi/voice-chatbot/logs/` | 历史日志 |
+| `pi/raspot_ws/src/arm_grasp/docs/*.json`（21 项） | 实测数据 |
+| `pi/raspot_ws/docs/shots/` | `rec_sample.py` 拍的照 |
+| `pi/k230-vision/*.png` / `*.raw` / `*.bin` | FOV 分析图与原始抓帧 |
+| `build/` `install/` `log/` | 可重建，但要重跑 colcon |
+
+**要清理构建产物，只删工作区：**
+
+```bash
+rm -rf pi/raspot_ws/{build,install,log} pi/l150pro_ws/{build,install,log}
+```
+
+**动手前先看清单（dry-run，安全）：** `git clean -xdn`
+
+同理，`git checkout -- .` / `git stash` 不会碰到上面这些（它们是 untracked/ignored），
+**但会还原你改过的源码** —— 要撤销改动就指名道姓 `git checkout -- <文件>`。

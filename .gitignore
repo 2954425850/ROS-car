@@ -1,4 +1,7 @@
 # ---- 密钥/凭据：绝不入库 ----
+# ⚠️ 注意：这个文件只存在于 Pi 磁盘上、不在库里的。
+#    而仓库目录就是 Pi 的运行目录 ⇒ `git clean -xfd` 会把它删掉。
+#    删掉 = 3 个 api_key + qweather_key + QQ音乐 cookie 全没（要重新扫码）。
 **/config.yaml
 **/config.yaml.bak-*
 **/config.yaml.orig
