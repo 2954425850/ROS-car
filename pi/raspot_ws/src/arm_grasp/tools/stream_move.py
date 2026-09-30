@@ -390,7 +390,12 @@ def main(argv=None):
                     help='连续几拍没进展就判发散。**真机默认 25（=2.5s）**：LX 舵机 + 固件轮询'
                          '读数，回读相对指令滞后几百毫秒，按假臂那套 4 拍（0.4s）会在动作'
                          '显示出来之前就判死（2026-09-30 第一次真跑就是这么停的）')
-    ap.add_argument('--max-step', type=float, default=1.5,
+    ap.add_argument('--max-step', type=float, default=6.0,
+                    help='每拍每关节最多走多少度。**真机默认 6.0**（=25 count/拍，60°/s）：'
+                         '`limit_step` 按"最大行程那个关节"等比缩放 ⇒ 小行程关节的每拍步长'
+                         '= max_step × (小行程/大行程)。实测肩/腕行程比 ~3.5:1，max_step=0.5 时'
+                         '腕每拍只有 2 count、**落进舵机死区一动不动**，姿态永远到不了'
+                         '（2026-09-30 真跑两次都栽在这）。6.0 下最慢的关节也有 ~7 count/拍。')
                     help='每拍每关节最多多少度（默认 1.5）')
     ap.add_argument('--t-ms', type=int, default=100,
                     help='arm_t_ms：每条 0xAC 的移动时长（默认 100 ≈ 10Hz 一拍）')
@@ -497,6 +502,9 @@ def main(argv=None):
         print('\n[aim] %s' % rep['stopped'])
         _print_rows(rep)
         _print_trace(link)
+        if rep.get('target') is not None:
+            print('   目标姿态 field=[%s]（α=%.1f°）'
+                  % (' '.join('%5.1f' % v for v in rep['target'].fields), rep['target'].alpha))
         # 帧间增量：**第一帧可能因为把 field 夹进 [125,875] 而"看起来超速"**（实机起手肘 p4=121
         # 在限位之下，第一帧一步夹到 125 ⇒ 0.96°/拍）。那不是限速失效 ⇒ 判定**从第 2 帧起**。
         deltas = [max(abs(c[k] - p[k]) for k in range(6)) / 4.1667

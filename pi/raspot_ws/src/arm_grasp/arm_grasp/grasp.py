@@ -272,7 +272,7 @@ def run(cfg, link, phase='aim', log=print):
            'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None,
            'target': None, 's_ach_m': None, 'rows': []}
     dt = 1.0 / cfg.hz
-    j_ref, cmd_sent = None, None
+    j_ref, cmd_sent, f_prev = None, None, None
     prev_alpha = cfg.alpha0
     stall, best = 0, None
     s_cmd = cfg.s_pre_m
@@ -370,8 +370,20 @@ def run(cfg, link, phase='aim', log=print):
                             0.0 if obs is None else 1.0))
 
         # ⑤ 判据 / 阶段切换（全用实际量）
-        if best is None or err_act < best - cfg.min_gain_m:
-            best, stall = err_act, 0
+        # ★★ "发散"判的是**臂有没有在动**，不是"到目标的距离有没有单调下降"。
+        #   2026-09-30 实机实测：`limit_step` 按"最大行程那个关节"等比缩放 ⇒ 小行程关节每拍
+        #   只走 ~1 count（**落进舵机死区 ⇒ 它一动不动**）；于是肩/肘在按时腕卡住，爪尖走成
+        #   一条弧线，**到目标点的距离反而从 27.8 → 30.2mm 涨** ⇒ 旧判据把它误报成"发散"、
+        #   在第 25 拍停手（臂其实还在动）。多关节 + 每拍限速下"距离先增后减"是**正常**的。
+        #   正确判据：**回读的 field 有没有超过 1 count 地变化**（= 臂还在不在跟）。
+        f_now = to_fields(j_cur, cfg.gripper, cfg.wrist_roll)
+        moved = (999.0 if f_prev is None
+                 else max(abs(f_now[k] - f_prev[k]) for k in range(6)))
+        f_prev = f_now
+        if moved >= 1.0:                      # 1 count = 回读的量化单位 ⇒ 任何真实运动都能清掉它
+            stall = 0
+            if best is None or err_act < best:
+                best = err_act
         else:
             stall += 1
         if phase == 'aim' and err_act <= cfg.tol_m:
@@ -390,8 +402,8 @@ def run(cfg, link, phase='aim', log=print):
                 s_ach * 1000, err_act * 1000)
             break
         if stall >= cfg.patience:
-            rep['stopped'] = '发散：连续 %d 拍没进展（现在 %.1fmm，最好 %.1fmm）' % (
-                stall, err_act * 1000, best * 1000)
+            rep['stopped'] = '卡住：连续 %d 拍**臂没动**（回读 field 变化 <1 count；现在 %.1fmm，最好 %.1fmm）' % (
+                stall, err_act * 1000, (best or 0.0) * 1000)
             break
         if phase in ('aim', 'descend') and obs_age is not None \
                 and obs_age > cfg.obs_lost_s:
