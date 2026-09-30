@@ -149,6 +149,7 @@ class ArmLink:
         self.n = 0                   # 已发观测条数
         self.miss = 0                # 投影失败（点跑到相机后面）的拍数
         self._last = None            # 上一拍**可信**的回读（见 fb() 的闩锁）
+        self.log = []                # 每帧：(时刻, 发出去的 field, 当时的回读) —— 上机诊断就看它
 
     def now(self):
         return time.monotonic()
@@ -191,6 +192,8 @@ class ArmLink:
         msg.name = list(JOINT_NAMES)
         msg.position = [float(v) for v in fields]
         self.io.pub.publish(msg)
+        self.log.append((time.monotonic(), [float(v) for v in fields],
+                         None if self._last is None else list(self._last)))
 
 
 # --------------------------------------------------------------------------
@@ -212,6 +215,24 @@ def _print_rows(rep, n=10):
               'slack=%4.0f  观测=%s'
               % (t - t00, err * 1000.0, s_ach * 1000.0, alpha, slack,
                  '有' if has_obs else '无'))
+
+
+def _print_trace(link, n=14):
+    """打印"**发出去的** field vs 当时**回读的** field"。
+
+    ★ 这是上机诊断的核心：残差不变时，一眼看出是"指令没发出去"还是"发出去但臂没跟"。
+    （2026-09-30 第一次真跑就是靠缺这条而只能猜。）
+    """
+    rows = link.log[-n:]
+    if not rows:
+        print('   （一帧都没发过）')
+        return
+    t00 = rows[0][0]
+    for t, cmd, fb in rows:
+        print('   t=%5.2fs  发 [%s]   读 [%s]'
+              % (t - t00, ' '.join('%5.1f' % v for v in cmd),
+                 '（还没读到）' if fb is None
+                 else ' '.join('%5.1f' % v for v in fb)))
 
 
 # --------------------------------------------------------------------------
@@ -365,6 +386,10 @@ def main(argv=None):
     ap.add_argument('--dry-run', action='store_true',
                     help='只读：算一遍打出来，不发任何指令')
     ap.add_argument('--yes', action='store_true', help='跳过回车确认（真跑）')
+    ap.add_argument('--patience', type=int, default=25,
+                    help='连续几拍没进展就判发散。**真机默认 25（=2.5s）**：LX 舵机 + 固件轮询'
+                         '读数，回读相对指令滞后几百毫秒，按假臂那套 4 拍（0.4s）会在动作'
+                         '显示出来之前就判死（2026-09-30 第一次真跑就是这么停的）')
     ap.add_argument('--max-step', type=float, default=1.5,
                     help='每拍每关节最多多少度（默认 1.5）')
     ap.add_argument('--t-ms', type=int, default=100,
@@ -383,7 +408,8 @@ def main(argv=None):
         return 2
 
     # ★ `--s` 必须真的进 cfg：`run()` 的接近阶段用的就是 `cfg.s_pre_m`。
-    cfg = grasp.GraspConfig(max_step_deg=args.max_step, s_pre_m=args.s)
+    cfg = grasp.GraspConfig(max_step_deg=args.max_step, s_pre_m=args.s,
+                            patience=args.patience)
     if args.max_seconds is not None:
         cfg = cfg._replace(max_seconds=args.max_seconds)
 
@@ -470,10 +496,17 @@ def main(argv=None):
         rep = grasp.run(cfg, link, phase='aim', log=print)
         print('\n[aim] %s' % rep['stopped'])
         _print_rows(rep)
-        print('   实际最大帧间增量 %.2f°（上限 %.2f°）  拍了 %d 拍  观测 %d 条'
-              '（投影失败 %d 次）'
-              % (rep['max_step_deg_actual'], cfg.max_step_deg, rep['ticks'],
-                 link.n, link.miss))
+        _print_trace(link)
+        # 帧间增量：**第一帧可能因为把 field 夹进 [125,875] 而"看起来超速"**（实机起手肘 p4=121
+        # 在限位之下，第一帧一步夹到 125 ⇒ 0.96°/拍）。那不是限速失效 ⇒ 判定**从第 2 帧起**。
+        deltas = [max(abs(c[k] - p[k]) for k in range(6)) / 4.1667
+                  for p, c in zip([r[1] for r in link.log], [r[1] for r in link.log][1:])]
+        d1 = deltas[0] if deltas else 0.0
+        dmax = max(deltas[1:]) if len(deltas) > 1 else 0.0
+        print('   拍了 %d 拍  观测 %d 条（投影失败 %d 次）'
+              % (rep['ticks'], link.n, link.miss))
+        print('   帧间增量：第1帧 %.2f°（含钳位，正常）  第2帧起最大 %.2f°（上限 %.2f°）'
+              % (d1, dmax, cfg.max_step_deg))
         if rep['err_m'] is not None:
             print('   最终 爪尖→目标点 %.2fmm  沿轴留量 %.1fmm  余量 slack=%s'
                   % (rep['err_m'] * 1000.0, rep['s_ach_m'] * 1000.0,
@@ -483,9 +516,9 @@ def main(argv=None):
             print('✅ 走到位（≤2mm）')
         else:
             print('❌ 没走到位：%s' % rep['stopped'])
-        if rep['max_step_deg_actual'] > cfg.max_step_deg + 1e-6:
-            print('❌ 限速没生效：实际 %.2f° > 上限 %.2f°'
-                  % (rep['max_step_deg_actual'], cfg.max_step_deg))
+        if dmax > cfg.max_step_deg + 1e-6:
+            print('❌ 限速没生效（第2帧起仍有 %.2f° > %.2f°）' % (dmax, cfg.max_step_deg))
+            return 1
         return 0 if rep['ok'] else 1
     except KeyboardInterrupt:
         print('\n⚠️ Ctrl-C 中断')
