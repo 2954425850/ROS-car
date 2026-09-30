@@ -169,7 +169,7 @@ class ArmLink:
         闩锁只让姿态陈旧一点点（10Hz 下最坏 100ms），比喂垃圾安全得多。
         """
         fbf = self.io.fb
-        if fbf is not None and len(fbf) >= 6 and all(fbf[i] != 0.0 for i in (2, 3, 4)):
+        if fbf is not None and len(fbf) >= 6 and all(fbf[i] != 0.0 for i in (1, 2, 3, 4)):
             self._last = [float(v) for v in fbf]
         return self._last
 
