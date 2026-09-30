@@ -160,7 +160,7 @@ class FakeLink:
 
     def __init__(self, plant, O_true, hz=10.0, noise_px=0.0, cut_after=None,
                  seed=1, grip_block=None, grip_rate=300.0, grip_lag_s=0.0,
-                 fb_none=0):
+                 fb_none=0, grip_noise=0.0):
         self.p = plant
         self.O = O_true
         self.hz = hz
@@ -181,10 +181,15 @@ class FakeLink:
         # `grip_lag_s` = 回读**滞后**（真机实测：指令 240→354 走了 0.4s，读回还趴在 234）。
         # 上报的是 `grip` 在 (t − lag) 时刻的值。
         self.grip_lag_s = grip_lag_s
+        self.grip_noise = grip_noise
         self.fb_none = fb_none
         self._ghist = [(0.0, 240.0)]
 
     def _fb_grip(self):
+        return self._fb_grip_raw() + (self.rng.gauss(0, self.grip_noise)
+                                      if self.grip_noise else 0.0)
+
+    def _fb_grip_raw(self):
         if self.grip_lag_s <= 0.0:
             return self.grip
         tt = self.t - self.grip_lag_s
@@ -589,3 +594,19 @@ def test_apply_bias_radial_moves_along_the_radius_not_a_fixed_vector():
     # 零偏置 = 原样
     assert grasp.apply_bias((0.1, 0.2, 0.3)) == (0.1, 0.2, 0.3)
     assert grasp.apply_bias((0.1, 0.2, 0.3), (0.01, 0.0, 0.0)) == (0.11, 0.2, 0.3)
+
+
+def test_close_arming_gate_survives_a_noisy_gripper_readback():
+    """★ 起振门必须扛得住**回读噪声**。
+
+    真机 2026-10-01 第六跑：`close` 报"p1 令 510 / 读 240 ⇒ 碰上东西"，可爪子根本没动
+    —— 读回那点噪声蹭过了 10 count 的门，起振门形同虚设。门槛该按"**真的跟了一步**"
+    （close_step=30 count）算，不是按死区宽度（10）。
+    变异（已实测）：把门槛退回 `deadband_counts` ⇒ 这条红。
+    """
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900)
+    plant = Plant(_start_joints(s_m=0.10))
+    link = FakeLink(plant, CAP, grip_lag_s=0.6, grip_noise=8.0, seed=7)
+    rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
+    why = _close_reason(rep)
+    assert '碰上东西' not in why, why

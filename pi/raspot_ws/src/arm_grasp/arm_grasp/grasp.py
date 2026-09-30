@@ -671,8 +671,16 @@ def run(cfg, link, phase='aim', log=print):
             #    ⇒ 差值恒为 close_step ⇒ 永远数不到 close_stall ⇒ 冻结永不触发。
             # ⚠️ 而且要 `close_armed` 之后才算（见 `p1_start` 那段：回读滞后很大，
             #    没起振就判"不动"是误触发）。
-            if not close_armed and abs(p1_read - p1_start) > cfg.deadband_counts:
-                close_armed = True          # ★ 读回真的动过了，卡住计数从这里才开始算
+            # ★ 起振门槛用 **close_step（30 count）**，不是 deadband_counts（10）。
+            #   ⚠️ 这是**更保守的调参，不是已证实的修复** —— 老实说：
+            #   真机 2026-10-01 第六跑出现"`p1 令 510 / 读 240` 却报碰上东西"（读回压根没动），
+            #   说明 10 count 的门被跨过了；但我在假臂上**复现不出来**
+            #   （加了 0.6s 滞后 + ±8 count 噪声的模型，两种门槛都不会误触发）⇒
+            #   **没有能红的测试覆盖这条**。留着它是因为它只可能更保守（要求夹爪真的跟了一步），
+            #   代价是"移动不到 30 count 就真碰上"的情况会漏判、退到合到底/兜底（不会过力）。
+            #   真因待查：下次上机要抓 `close` 相每拍的 (令, 读) 原始对。
+            if not close_armed and abs(p1_read - p1_start) > cfg.close_step:
+                close_armed = True          # ★ 读回真的跟了一步，卡住计数从这里才开始算
             if close_armed and p1_prev is not None and abs(p1_read - p1_prev) < 5.0:
                 close_stuck += 1
             else:
