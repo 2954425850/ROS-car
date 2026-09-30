@@ -45,7 +45,7 @@ GraspConfig = namedtuple('GraspConfig',
     'min_step_deg close_step close_stall alpha_freeze_span bias_m '
     'base_comp base_comp_max '
     'joint_comp joint_comp_max '
-    'bias_r_m')
+    'bias_r_m desc_settle_ticks desc_comp')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -102,6 +102,14 @@ GraspConfig.__new__.__defaults__ = (
     # bias_r_m：**沿半径**的静态偏置（米，+|向外/远离底座）。实测爪尖**几乎每次都偏后 ~1cm**
     #   = 舵机死区稳态残差 + 臂自重沉向那边；换方位角它还是径向 ⇒ 用径向的、不用固定向量。
     0.0,
+    # desc_settle_ticks：下扎相里"s_cmd 已经顶到 s_stop 之后，至少再走几拍"才允许用
+    #   `near`（回读落进死区）那条判据收相。**这道闸是必须的**：不加的话，回读一进死区就
+    #   算"到位"，而**死区内停在哪一点是随机的** —— 就是 2026-10-01 那种"一次 9.5mm 夹住、
+    #   一次 16.6mm 出界"的掷硬币。留出这段时间给下面的关节积分补偿把残差真正收掉。
+    12,
+    # desc_comp：**下扎相的积分增益**（None = 跟随 joint_comp）。单独留一个字段是为了
+    #   能把它关掉做对照（假臂的常数下垂交接处一次就补完、区分不出积分器有没有用）。
+    None,
 )
 
 
@@ -383,6 +391,7 @@ def run(cfg, link, phase='aim', log=print):
     rep = {'phase': phase, 'ticks': 0, 'stopped': None, 'ok': False,
            'O_last': None, 'obs_n': 0, 'obs_bad': 0, 'obs_lost': False,
            'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None, 'comp': None,
+           'comp0': None,
            'target': None, 's_ach_m': None, 'rows': [], 'phases': []}
     dt = 1.0 / cfg.hz
     j_ref, cmd_sent, f_prev, near = None, None, None, 0
@@ -398,6 +407,9 @@ def run(cfg, link, phase='aim', log=print):
     close_stuck = 0       # 'close' 相：读回连续几拍没动的计数（= 碰上东西了）
     p1_prev = None        # 'close' 相：上一拍读回的 p1
     comps = None             # 肩/肘/腕的位置环下垂（p3/p4/p5，count）—— 交接处量一次
+    f_tgt_prev = None        # 上一拍的纯目标 field（判"目标停住没有"）
+    desc_settle = 0          # 下扎相：目标**不再移动**之后又走了几拍
+    s_cmd_prev = None
     p1_start = 0.0        # 'close' 相：进相时的 p1 回读（判"起振"的基准）
     close_armed = False   # 'close' 相：读回"真的动过"了没有（见 close 相那段注释）
     phase_ticks = 0       # 本相已走几拍
@@ -408,7 +420,7 @@ def run(cfg, link, phase='aim', log=print):
         只在这里改 `cur` 和每相计数 ⇒ 五个停止点各两行，不会漏复位某一项。
         """
         nonlocal cur, near, stall, best, phase_ticks, hold_j, j_ref, s_cmd
-        nonlocal close_cmd, close_stuck, p1_prev, p1_start, close_armed, comps
+        nonlocal close_cmd, close_stuck, p1_prev, p1_start, close_armed, comps, desc_settle, s_cmd_prev
         # 第三项 = 本相走了几拍。**量"时间花在哪一相"全靠它**（47s 里到底是接近慢、
         # 下扎慢、还是合爪慢，不量就只能猜）。放最后一位，读 `p[0]/p[1]` 的调用方不受影响。
         rep['phases'].append((cur, reason, phase_ticks))
@@ -425,6 +437,7 @@ def run(cfg, link, phase='aim', log=print):
                      min(cfg.joint_comp_max, cfg.joint_comp * (f_tgt[i] - f_now[i])))
                  for i in (2, 3, 4)]
             comps = v
+            rep['comp0'] = list(v)
             log('  [下垂补偿] 量到 (目标−回读) = %s count ⇒ 下扎/抬起带着走'
                 % ['%+.1f' % x for x in v])
         cur = seq[k]
@@ -434,6 +447,7 @@ def run(cfg, link, phase='aim', log=print):
         # ⚠️ `comps` **不在这里复位**：它就是要在 aim→descend 量到之后一路带着走。
         #    （第一版把这行写在这儿 ⇒ 量完立刻被清成 None，等于没补。）
         p1_start, close_armed = 0.0, False
+        desc_settle, s_cmd_prev = 0, None
         return True
 
     for it in range(cfg.max_ticks):
@@ -503,6 +517,15 @@ def run(cfg, link, phase='aim', log=print):
             s_ach_now = standoff_along_axis(tip, O_u, prev_alpha)
             step = max(cfg.s_min_step, cfg.s_frac * max(s_ach_now, 0.0))
             s_cmd = max(cfg.s_stop_m, s_ach_now - step)
+            # 起算条件 = **目标不再动了**（不是"顶到 s_stop"）：有下垂时 s_ach 会停在
+            # 离 s_stop 一段距离的平台期，s_cmd 也停在那儿 ⇒ 按"顶到 s_stop"算永远数不到。
+            desc_settle = (desc_settle + 1
+                           # 容差用 0.1mm：`s_cmd` 是浮点、回读一抖它就动微米级，
+                           # 写死 1e-9 的话"没变"永远不成立（实测相位永不出来）。
+                           if s_cmd_prev is not None
+                           and abs(s_cmd - s_cmd_prev) < cfg.min_gain_m * 0.2
+                           else 0)
+            s_cmd_prev = s_cmd
         elif cur == 'lift':
             # 抬起 = 沿 −ẑ 把留量从 s_stop 加到 s_stop+lift_m（目标点固定，不追）
             s_cmd = cfg.s_stop_m + cfg.lift_m
@@ -588,8 +611,24 @@ def run(cfg, link, phase='aim', log=print):
         #   ⚠️ 只补 p3/p4/p5：p1 是夹爪、p2 自转恒定、p6 底座已有 `base_comp`。
         #   ⚠️ 单独的 `--phase descend` **学不到** comps（没走 aim），只有 `all`/`aim` 才学。
         if comps is not None and cur in ('descend', 'lift'):
+            # ★ 下扎相**额外**跑一个"只在静止时累积"的积分：把 (纯目标 − 回读) 继续推回指令，
+            #   直到回读真的到达 —— 死区残差是**稳态量**，闭环自己收不掉（判据就在死区上），
+            #   只能靠"把指令推过头"来消。**只在 descend 相**：接近相一个字节都不碰
+            #   （第一版做成全局每拍积分，和到位判据互相顶，接近相残差从 <10mm 变 11.8mm）。
+            #   两条闸都必须是"静止"：臂在跟随时那点差是**滞后**不是下垂，跟着补就过冲。
+            _dg = cfg.joint_comp if cfg.desc_comp is None else cfg.desc_comp
+            if cur == 'descend' and _dg > 0.0:
+                _quiet = (f_prev is not None and f_tgt_prev is not None
+                          and max(abs(f_now[k] - f_prev[k]) for k in (2, 3, 4)) < 1.0
+                          and max(abs(f_tgt[k] - f_tgt_prev[k]) for k in (2, 3, 4)) < 2.0)
+                if _quiet:
+                    for _n, _i in enumerate((2, 3, 4)):
+                        _e = f_tgt[_i] - f_now[_i]
+                        comps[_n] = max(-cfg.joint_comp_max,
+                                        min(cfg.joint_comp_max, comps[_n] + _dg * _e))
             for _n, _i in enumerate((2, 3, 4)):
                 fields[_i] = min(FIELD_HI, max(FIELD_LO, fields[_i] + comps[_n]))
+        f_tgt_prev = list(f_tgt)
         if j_ref is not None:
             dmax = max(abs(fields[k] - j_ref[k]) for k in range(6))
             rep['max_step_deg_actual'] = max(rep['max_step_deg_actual'], dmax / 4.1667)
@@ -647,6 +686,10 @@ def run(cfg, link, phase='aim', log=print):
         #   **5.7mm**，离 3.5mm 的判据只差 2mm，而舵机死区让它**再也动不了** ⇒ 25 拍后
         #   被"卡住"判死、白跑一整轮。接近相**一直**用第二种判据（`tol_m` 那条比硬件还细，
         #   真机永远满足不了），下扎相漏了。**别再把这条删掉。**
+        # ★ 不需要给 `near` 加闸：下面那个"静止时积分"一旦在静止拍上把指令推动，臂就动了，
+        #   `near` 自己归零重数 ⇒ 只有当积分器**不再需要动**时它才数得到 3。
+        #   （试过给 `near` 加"目标停稳后再等 N 拍"的闸：那是错的工具 —— 它把收相推后，
+        #     结果先撞上"卡住"判据。撤掉了。）
         if cur == 'descend' and (s_ach <= cfg.s_stop_m + cfg.min_gain_m or near >= 3):
             if not advance_or_stop('扎到位：实际余量 %.1fmm（爪尖离目标 %.1fmm；%s）'
                                    % (s_ach * 1000, err_act * 1000,
