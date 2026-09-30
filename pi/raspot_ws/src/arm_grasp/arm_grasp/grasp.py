@@ -412,7 +412,17 @@ def run(cfg, link, phase='aim', log=print):
         O_u = tuple(est.O[i] + cfg.bias_m[i] for i in range(3))
 
         # ③ 目标（按**当前相** `cur`）
-        j_cur_m = from_fields(trace.at(link.now(), 'auto'))
+        # ★★ `f_raw` = 这一拍时间对齐后的 6 个 field（回读优先）。**p1 的真值只在 `f_raw[0]`**：
+        #   `from_fields` 把 p1/p2 丢掉，`to_fields(j, grip_cmd, …)` 又把 grip_cmd 写回第 0 位
+        #   ⇒ 下面 ④ 的 `f_now[0]` **恒等于"我这一拍刚下发的指令"**。
+        #   2026-10-01 真抓（桌面目标）踩到：拿 `f_now[0]` 当"读回"用 ⇒ ① 合爪收尾报
+        #   "夹空了——盖不在爪子里"，其实手里**正握着那个白条**；② `close_stuck`
+        #   （"读回停住 = 碰上东西"）拿指令跟自己比，永远为 0 ⇒ **慢合的柔性冻结从未触发**，
+        #   每次都一路合到 close_field —— 用户明确否决过的"全力抓"其实一直没被修掉。
+        #   合爪相的一切判据**只许用 `p1_read`**。
+        f_raw = trace.at(link.now(), 'auto')
+        j_cur_m = from_fields(f_raw)
+        p1_read = float(f_raw[0])
         if cur == 'descend':
             tip = tip_open_m(j_cur_m)
             s_ach_now = standoff_along_axis(tip, O_u, prev_alpha)
@@ -429,7 +439,7 @@ def run(cfg, link, phase='aim', log=print):
                 if hold_j is None:
                     hold_j = dict(j_cur_m)
                 if close_cmd is None:
-                    close_cmd = float(f_now[0]) if f_now is not None else cfg.gripper
+                    close_cmd = p1_read          # 起点 = **真回读**（不是上一拍的指令）
                 close_cmd = min(cfg.close_field, close_cmd + cfg.close_step)
                 tgt = Target(prev_alpha, cfg.s_stop_m, dict(hold_j),
                              to_fields(hold_j, close_cmd, cfg.wrist_roll),
@@ -541,21 +551,30 @@ def run(cfg, link, phase='aim', log=print):
                 break
             continue
         if cur == 'close' and close_cmd is not None and close_cmd >= cfg.close_field - 1.0:
-            if not advance_or_stop('合爪完成：p1 指令到 %.0f、读回 %.0f（**夹空了**——盖不在爪子里）'
-                                   % (close_cmd, f_now[0])):
+            # ★ 读回贴到指令 ⇒ **分不出**"夹空"和"夹着一个细物体"（2026-10-01 实测：白条
+            #   被夹住了、读回照样走到 578）。这里只报事实，**不许下"夹空了"的结论**；
+            #   要判到底有没有夹到，只能用抬升后回看（`--verify` 那一套）。
+            if not advance_or_stop('合爪完成：p1 令 %.0f / **读 %.0f**%s'
+                                   % (close_cmd, p1_read,
+                                      '（读回停在中途 ⇒ 爪里有东西、已冻结）'
+                                      if p1_read < cfg.close_field - cfg.deadband_counts else
+                                      '（读回贴到指令 ⇒ 爪里没东西 / 夹着一个细物体**都可能**，'
+                                      '本判据分不出来）')):
                 break
             continue
         if cur == 'close':
             # 读回连续 close_stall 拍几乎不动（每拍变化 <5 count）= 指尖碰上东西了 ⇒ **冻结**
-            if p1_prev is not None and abs(f_now[0] - p1_prev) < 5.0:
+            # ⚠️ 这里比的必须是 `p1_read`（真回读）。用 `f_now[0]`（= 每拍 +close_step 的指令）
+            #    ⇒ 差值恒为 close_step ⇒ 永远数不到 close_stall ⇒ 冻结永不触发。
+            if p1_prev is not None and abs(p1_read - p1_prev) < 5.0:
                 close_stuck += 1
             else:
                 close_stuck = 0
-            p1_prev = f_now[0]
+            p1_prev = p1_read
             if close_stuck >= cfg.close_stall:
                 if not advance_or_stop('合爪完成：读回连续 %d 拍不动（p1 令 %.0f/读 %.0f）'
                                        '⇒ 碰上东西、冻结不再加压'
-                                       % (close_stuck, close_cmd, f_now[0])):
+                                       % (close_stuck, close_cmd, p1_read)):
                     break
                 continue
         if phase_ticks >= cfg.close_ticks and cur == 'close':

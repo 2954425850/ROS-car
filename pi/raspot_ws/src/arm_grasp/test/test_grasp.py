@@ -153,7 +153,7 @@ class FakeLink:
     """实现 Link 协议：假臂 + 用 geom 当"真"相机。"""
 
     def __init__(self, plant, O_true, hz=10.0, noise_px=0.0, cut_after=None,
-                 seed=1):
+                 seed=1, grip_block=None, grip_rate=300.0):
         self.p = plant
         self.O = O_true
         self.hz = hz
@@ -164,6 +164,13 @@ class FakeLink:
         self.noise = noise_px
         self.cut_after = cut_after
         self.rng = __import__('random').Random(seed)
+        # ★ 夹爪那一路的**真回读**（2026-10-01 补）：以前 `fb()` 恒报 240 ⇒ 假臂里
+        #   "读回"和"指令"永远分不开 ⇒ `close_stuck`（合爪碰上东西就冻结）这条
+        #   在假臂上**不可能红**，真机上坏了也测不出来。现在它按 `grip_rate` 追指令，
+        #   `grip_block` 是"爪里有东西"时卡住的位置（count）。
+        self.grip = 240.0
+        self.grip_block = grip_block
+        self.grip_rate = grip_rate
 
     def now(self):
         return self.t
@@ -172,7 +179,7 @@ class FakeLink:
         self.t += dt
 
     def fb(self):
-        return to_fields(self.p.j, 240.0, 496.0)
+        return to_fields(self.p.j, self.grip, 496.0)
 
     def obs(self):
         if self.cut_after is not None and self.pub_n > self.cut_after:
@@ -193,6 +200,12 @@ class FakeLink:
         self.pub = list(fields)
         self.pubs.append(list(fields))
         self.pub_n += 1
+        # 夹爪那一路：按速率追指令，追不动就卡在 grip_block（= 爪里有东西）
+        step = self.grip_rate / self.hz
+        d = float(fields[0]) - self.grip
+        self.grip += max(-step, min(step, d))
+        if self.grip_block is not None:
+            self.grip = min(self.grip, float(self.grip_block))
         self.p.j = from_fields(fields)                # 用 arm_kin 的，不要绕 grasp
         self.p.step(self.p.j, 1.0 / self.hz)
 
@@ -342,3 +355,51 @@ def test_run_all_phases_closes_and_lifts():
     assert cfg.close_field - 20.0 <= link.pub[0] <= cfg.close_field + 20.0, link.pub[0]
     assert rep['s_ach_m'] >= cfg.lift_m * 0.8, rep['s_ach_m']
     assert rep['s_ach_m'] > cfg.s_stop_m * 5.0, rep['s_ach_m']
+
+
+def _close_reason(rep):
+    r = [p[1] for p in rep['phases'] if p[0] == 'close']
+    assert r, rep['phases']
+    return r[0]
+
+
+def test_close_freezes_on_contact_not_reported_as_empty():
+    """★ 爪里有东西（读回卡在 400）⇒ 必须走"碰上东西、冻结"这条，**不许报"夹空"**。
+
+    这条盯的是 2026-10-01 真抓暴露的那个 bug：`f_now[0]` 其实是**指令**
+    （`to_fields(j, grip_cmd, …)` 把 grip_cmd 写进第 0 位），于是
+      ① 收尾拿指令当"读回" ⇒ 明明握着东西却报"夹空了"；
+      ② `close_stuck` 拿指令跟自己比（每拍恒差 close_step=30）⇒ 永远数不到 close_stall
+         ⇒ **柔性冻结从不触发**、每次都一路合到底（用户明确否决过的"全力抓"）。
+    变异（已实测）：把两处 `p1_read` 换回 `f_now[0]` ⇒ 这条立刻红。
+    """
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900)
+    plant = Plant(_start_joints(s_m=0.10))
+    link = FakeLink(plant, CAP, grip_block=400.0)
+    rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
+    why = _close_reason(rep)
+    assert '碰上东西' in why, why
+    assert '夹空' not in why, why
+    # 物理量：真回读**确实**卡在被挡的位置，没跟到 578
+    assert 395.0 <= link.grip <= 405.0, link.grip
+    # 而且必须是在**还没合到底**的时候就冻结的（否则"冻结"没有意义）。
+    # ⚠️ 不能用 `link.pub`：那是**全程最后一帧**（lift 相本来就要求 p1 = close_field）。
+    #    冻结点上的指令值只能从理由字符串里取。
+    import re
+    cmd_at_freeze = float(re.search(r'p1 令 (-?[\d.]+)', why).group(1))
+    assert cmd_at_freeze < cfg.close_field - 20.0, why
+
+
+def test_close_full_travel_admits_it_cannot_tell_empty_from_thin():
+    """读回一路贴到指令（爪里可能真没东西）⇒ 只许报"分不出来"，**不许下"夹空了"的结论**。
+
+    理由：2026-10-01 实测白条**被夹住了**、读回照样走到 578 ⇒ "读回到底"推不出"夹空"。
+    """
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900)
+    plant = Plant(_start_joints(s_m=0.10))
+    link = FakeLink(plant, CAP)                 # grip_block=None ⇒ 爪子能一路合到底
+    rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
+    why = _close_reason(rep)
+    assert '夹空' not in why, why
+    assert '读回贴到指令' in why, why
+    assert abs(link.grip - cfg.close_field) < 10.0, link.grip
