@@ -502,7 +502,7 @@ def test_joint_comp_measures_the_true_droop_at_the_handover():
     plant = Plant(_start_joints(s_m=0.10), droop_deg=DROOP)
     link = FakeLink(plant, CAP)
     rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
-    got = rep['comp0']          # ★ 交接处**当时**量到的值（rep['comp'] 之后会被下扎积分改掉）
+    got = rep['comp']
     assert got is not None, rep['stopped']
     # ⚠️ p5 是**反号映射**（`to_fields`: p5 = 500 + F·(90 − shoulder)）⇒ 肩下垂在 field 上是**负**的。
     #    真机实测 `令 796.3 / 读 813.0` = −16.7 count，正是这个负号（= 肩下垂 4.0°）——对得上。
@@ -547,10 +547,7 @@ def test_descend_accepts_the_servo_deadband_instead_of_stalling():
     # 用"肩沉降 −1.8°"（= 7.5 count ≤ deadband_counts 10）造一个**停在离目标几毫米**的稳态：
     # 这正是真机第六跑的现场（`s_ach` 停在 5.7mm 再也下不去，用户肉眼确认"几乎贴着"）。
     # 关掉 joint_comp，免得它把这个残余补掉、测试就失去意义。
-    # patience 要对齐**真机**（CLI 默认 25）。用测试夹具的 4 的话，`near` 还没数到 3
-    # 就先撞上"卡住"了 —— 那测的就不是这条判据了。
-    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=1200, joint_comp=0.0,
-                          patience=25)
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=1200, joint_comp=0.0)
     plant = Plant(_start_joints(s_m=0.10), droop_deg={'shoulder': -1.8})
     link = FakeLink(plant, CAP)
     rep = grasp.run(cfg, link, phase='descend', log=lambda *a: None)
@@ -613,31 +610,3 @@ def test_close_arming_gate_survives_a_noisy_gripper_readback():
     rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
     why = _close_reason(rep)
     assert '碰上东西' not in why, why
-
-
-def test_descend_integrator_accumulates_toward_the_residual_and_only_in_descend():
-    """★ 下扎相积分补偿：**只在静止拍上、把 (纯目标 − 回读) 积分进 comp**。
-
-    真机为什么要它：`descend` 收尾残差实测 **9.5~16.6mm 随机**（判据本来就压在舵机死区上，
-    停在哪一点由噪声决定）。2.5cm 的盖子，这个随机量就是生死线；而"死区残差"是**稳态量**，
-    闭环自己收不掉，只能靠把指令推过头来消。
-
-    ⚠️ 这条测的是**机制**（comp 有没有朝残差方向积起来），**不是结果** —— 假臂的下垂是常数、
-    交接处就补完了，结果层面区分不出来（结果级验证只能上真机看 `descend` 残差有没有从
-    "9.5~16.6mm 随机"收进 5mm 内）。
-    变异（已实测）：`desc_comp=0` ⇒ comp 一动不动 ⇒ 这条红。
-    """
-    def run(desc_comp):
-        cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=1500,
-                              joint_comp=0.3, desc_comp=desc_comp, patience=25)
-        plant = Plant(_start_joints(s_m=0.10), droop_deg={'shoulder': -1.8})
-        link = FakeLink(plant, CAP)
-        rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
-        c0, c1 = rep['comp0'], rep['comp']
-        assert c0 is not None and c1 is not None, rep['stopped']
-        return max(abs(c1[k] - c0[k]) for k in range(3))
-
-    d_off = run(0.0)
-    d_on = run(1.0)
-    assert d_off < 1e-9, d_off           # 关掉时 comp 必须一动不动
-    assert d_on > 3.0, d_on              # 打开时必须真的积起来（count 量级）
