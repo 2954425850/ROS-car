@@ -1,20 +1,38 @@
 # /sdcard/k230vision/config.py
-"""全部可调参数集中在这里。"""
+"""全部可调参数集中在这里。
 
-WIFI_SSID = "TP-LINK_EE82"
-WIFI_PASS = "123456789"
+## 环境相关的真值**不在**本文件里（2026-10-01 起）
+
+本仓库是**公开**的，所以 WiFi 凭据与局域网地址不入库，拆到同目录的
+`config_local.py` 里：
+
+    本文件（入库）     占位符 + 与机器无关的参数（分辨率/阈值/端口号…）
+    config_local.py    真值：WiFi SSID/密码、各主机地址 —— **不入库**（见 .gitignore）
+
+覆盖机制就是文件**末尾**那句 `from config_local import *`。
+
+⚠️ **板上必须有 config_local.py**，否则连不上 WiFi。症状是 app.py 一直打
+`WIFI FAILED, retry`，**看起来像板子坏了，其实只是配置文件缺了**（见
+`5.K230/README.md` §7.5）。所以缺文件时末尾会大声报一句。
+
+**换网络 / 换车 / 换接收端，只改 config_local.py，本文件不用动。**
+"""
+
+# ---- 环境相关：这里只是占位符，真值在 config_local.py（文件末尾 import 覆盖）----
+WIFI_SSID = "REPLACE_ME"
+WIFI_PASS = "REPLACE_ME"
 
 # 云端推流目标（先用 Pi 做验证，云端就绪后改成云端公网 IP）
-PUSH_HOST = "114.215.188.147"   # 云端（2026-09-18 起，视频去云端）
+PUSH_HOST = "REPLACE_ME"
 PUSH_PORT = 8555
 
 # 结构化结果上报目标
-RESULT_HOST = "192.168.1.108"
+RESULT_HOST = "REPLACE_ME"
 RESULT_PORT = 8556
 
 # 云端结果上报目标。**云端未就绪，留空串表示不启用**。
 # 主循环里用 `if config.CLOUD_RESULT_HOST:` 判断 —— 绝不让本地（Pi）路径因此失败。
-CLOUD_RESULT_HOST = "114.215.188.147"   # 结果也发云端（Pi 那路保留，两边都收）
+CLOUD_RESULT_HOST = ""
 CLOUD_RESULT_PORT = 8556
 
 # 视频规格
@@ -34,6 +52,20 @@ PUSH_CHN = 0             # chn0 -> 推云端
 RTSP_CHN = 1             # chn1 -> 局域网给 Pi
 RTSP_PORT = 8554
 RTSP_SESSION = "k230"
+
+# ---- 整机朝向：相机实物是**倒装**的，画面应当在 sensor 根上翻 180°（2026-09-29 加）----
+#
+# 实现：cam.py 的 Camera.start() 里 hmirror+vflip 同时开（sensor 根开关，
+# chn0(推流)/chn1(RTSP)/chn2(AI) 一起转）。
+#
+# ⚠️ 别把它当"设计选择"，它是**待实测确认的假设**：判据是抓三路画面落盘、
+# 在 PC 侧与 `np.rot90(img, 2)` 逐像素对照（板上探针 t_rot_off.py / t_rot_on.py）。
+# 只翻一路 / 压根没翻，都不会抛异常 —— **"函数没报错"不是证据**。
+# 实测结论记在 `5.K230/README.md`；改这里之前先读那份实测。
+#
+# **只改这一处。** 一旦实测通过，app.py / vision.py / 前端 / 下游**任何地方都不许
+# 再做 ±180° 补偿**，否则二次翻转（不会报错，只会让画面又倒回去）。
+ROTATE_180 = True
 
 # 看门狗
 PUSH_STALL_WARN_MS = 3000   # 连续这么久没成功发出帧就告警
@@ -78,7 +110,7 @@ AI_HEIGHT = 180
 # ⚠️ 这只是一个**临时的框来源** —— 只能覆盖检测器认识的那 80 类。
 # 检测器不认识的物体（桃、辣椒……）需要**人给框**，那条路（点屏/语音）**还没做**。
 # 见 docs/plans/2026-09-19-tracker-integration.md §5。
-TRACK_CLASS = "orange"
+TRACK_CLASS = "chair"
 TRACK_THRESH = 0.1      # nanotracker_head 的阈值（照抄官方例程）
 TRACK_AR_TOL = 0.5      # 长宽比偏离阈值（暂定，只有一轮数据）
 TRACK_IOU_MIN = 0.3     # 与检测框的 IoU 下限（暂定）
@@ -123,3 +155,31 @@ FACE_DB_MAX = 40              # 每人最多存多少条（超了丢最早的，
                               #      20KB/条 = 1.6MB/人，装不下两个）
 FACE_SAVE_EVERY_MS = 30000    # 落盘间隔（别每帧写 SD）
 FACE_SEED_SECONDS = 4.0       # **种子**注册的时间预算（之后靠增量长）
+
+
+# ============================================================================
+# 本地环境覆盖 —— **必须在文件末尾**（前面全是默认值/占位符）
+# ============================================================================
+#
+# 真值放同目录的 `config_local.py`，那个文件**不入库**（仓库是公开的，
+# 里面是 WiFi 凭据和局域网地址）。换网络/换接收端只改它，本文件不用动。
+#
+# MicroPython 的 `from x import *` 会覆盖本模块里已有的同名名字 —— 这正是要的：
+# 谁被写进 config_local.py，谁就以那边为准。
+#
+# ⚠️ 缺文件的后果是**看起来像硬件坏了**：板子连不上 WiFi → app.py 一直打
+#    `WIFI FAILED, retry` → 不进主循环 → 没有 RTSP、没有 8556 上报。
+#    所以这里不做静默兜底，直接大声报。
+try:
+    from config_local import *
+    _LOCAL_OK = True
+except ImportError:
+    _LOCAL_OK = False
+
+if (not _LOCAL_OK) or WIFI_SSID == "REPLACE_ME":
+    print("!!! ------------------------------------------------------------")
+    print("!!! config_local.py 缺失，或没覆盖 WIFI_SSID/WIFI_PASS")
+    print("!!! 板子将连不上 WiFi（且看起来像硬件故障）。")
+    print("!!! 把 config_local.py 放到 /sdcard/k230vision/ 下再上电。")
+    print("!!! 该文件不入库；模板见 pi/k230-board/config_local.py.example")
+    print("!!! ------------------------------------------------------------")

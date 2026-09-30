@@ -1,0 +1,36 @@
+# /sdcard/k230vision/config_local.py  ——  **模板**（入库；真文件不入库）
+"""本机环境真值。换网络 / 换车 / 换接收端**只改这个文件**。
+
+## 用法
+
+把这个文件**去掉 `.example` 后缀**、改成自己的值，放到板子的
+`/sdcard/k230vision/config_local.py`。
+
+只需要写出**要覆盖的那几个名字**；没写的就用 `config.py` 里的默认值
+（`config.py` 末尾 `from config_local import *` 会把同名值覆盖过去）。
+
+## 为什么拆成两个文件
+
+仓库是**公开**的，而这里有 WiFi 密码和局域网地址。所以 `config.py`（入库）
+只留 `REPLACE_ME` 占位符，真值放本文件（`.gitignore` 里已排除）。
+
+## ⚠️ 没有这个文件会怎样
+
+板子连不上 WiFi → `app.py` 一直打 `WIFI FAILED, retry` → **不进主循环**：
+没有 RTSP、没有 8556 上报、没有任何端口。**看起来像硬件坏了，其实是少了个文件。**
+（`config.py` 在缺文件时会大声报一句，别忽略那行。）
+"""
+
+# ---- WiFi：板子自己连的那个 ----
+WIFI_SSID = "REPLACE_ME_SSID"
+WIFI_PASS = "REPLACE_ME_PASSWORD"
+
+# ---- 推流接收端（K230 主动推裸 H.264/TCP 的目标）----
+# ⚠️ 连不上会把帧率从 ~30 拖到 ~5 fps（见 5.K230/README.md §3）
+PUSH_HOST = "192.168.1.100"
+
+# ---- 结构化结果上报目标（Pi 侧 k230-resultd 监听 8556）----
+RESULT_HOST = "192.168.1.100"
+
+# ---- 云端结果上报。留空串 = 不启用（2026-09-28 起关掉：连不上会拖主循环）----
+CLOUD_RESULT_HOST = ""

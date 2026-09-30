@@ -11,6 +11,13 @@
 *.key
 *.env
 
+# K230 板子侧的本地环境真值（WiFi SSID/密码 + 局域网地址）。
+# config.py 入库、只留占位符；真值在这个文件里，由 config.py 末尾
+# `from config_local import *` 覆盖过去。模板 config_local.py.example 入库。
+# 理由与 config.yaml 同源：这是公开仓库。见 pi/k230-board/config.py 文件头。
+**/config_local.py
+!**/config_local.py.example
+
 # ---- Python ----
 __pycache__/
 *.py[cod]

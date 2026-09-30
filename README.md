@@ -28,6 +28,9 @@ pi/                     # 树莓派（nepu）上的东西
 ## 不入库的东西
 
 - `voice-chatbot/config.yaml*` —— 里面是 LLM 的 `api_key` 和 `qweather_key`，**这个仓库是公开的，别往里放**。
+- `k230-board/config_local.py` —— K230 的 **WiFi 密码**与局域网地址。
+  `config.py` 入库、只留 `REPLACE_ME` 占位符，末尾 `from config_local import *` 覆盖过去。
+  只入库 `config_local.py.example`。**板子上没有这个文件就连不上 WiFi**（见下）。
 - `logs/`、`build/`、`install/`、`log/`、`__pycache__/`、`*.tar.gz`
 - `*.raw` / `*.bin` —— 抓图原始数据
 
@@ -52,6 +55,12 @@ ROS 工作区需要用 `rosdep`/`colcon` 在 `raspot_ws` / `l150pro_ws` 下构�
 - `k230-vision/*.png` —— `fov_analyze.py` / `t_camcalib.py` 画的分析图
 - 日志、`build/`、`install/`、`*.tar.gz`、`*.raw`、`*.bin`
 - `voice-chatbot/config.yaml`（含 `api_key` 等密钥，只入库 `config.yaml.example`）
+- `k230-board/config_local.py`（含 WiFi 密码，只入库 `config_local.py.example`）
+
+> ℹ️ `k230-board/config_local.py` 是 **2026-10-01** 加的。此前 `config.py` 里的
+> `WIFI_SSID` / `WIFI_PASS` 是**直接入着库**的（一个已废弃的热点名 + 它的密码，
+> 值见 `git log`，这里不再抄一遍）。这次把真值拆出去，但**旧值仍在 git 历史里** ——
+> 要清得走 `git filter-repo`，那属于另一件事，本次没做。
 
 **判据**：这文件是脚本「写」的，还是人「写」的？脚本写的就不入库。
 （`people.json` 虽是 .json，但它是人脸库配置、由人维护，**入库**。）
