@@ -290,6 +290,17 @@ def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
         session['complete'] = True
     except BaseException as e:
         session['reason'] = str(e) or type(e).__name__
+        if isinstance(e, Exception) and session['views']:
+            # Leave the arm where the scan started: the service restart homes
+            # the other joints but not the base, so an abandoned excursion
+            # silently re-aims the next run (live: base crept 36 -> 114).
+            try:
+                move_to(io, reference, fields, cfg, publish=publish, floor_z=floor_z,
+                        require_margin=False)
+                session['returned_to_reference'] = True
+            except Exception as back:
+                session['returned_to_reference'] = False
+                log('测高中止后返回起始姿态失败：%s' % back)
         raise
     finally:
         session['acquisition_seconds'] = time.monotonic() - start

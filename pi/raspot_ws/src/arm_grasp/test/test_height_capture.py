@@ -1,3 +1,4 @@
+import json
 import time
 
 import numpy as np
@@ -189,6 +190,25 @@ def test_scan_holds_planned_command_not_sagged_reading(tmp_path):
         planned = bounded_fields(to_fields(pose, reference_fields[0], reference_fields[1]))
         assert commands
         assert all(c == pytest.approx(planned) for c in commands)
+
+
+def test_failed_scan_returns_to_reference(tmp_path):
+    io = SaggingArm()
+    commands = []
+    publish = lambda arm, fields: (commands.append(bounded_fields(fields)), io.publish(arm, fields))
+    shots = []
+    def capture(path, host, timeout):
+        shots.append(path)
+        time.sleep(.05)
+        return len(shots) < 2
+    reference_fields = list(io.fb)
+    with pytest.raises(HeightRefused, match='capture failed'):
+        capture_scan(io, 'fake', [.4, .35, .6, .6], tmp_path / 'scan',
+                     ScanConfig(stationary_seconds=.03), capture, log=lambda *_: None,
+                     publish=publish)
+    assert commands[-1] == pytest.approx(bounded_fields(reference_fields))
+    session = json.loads((tmp_path / 'scan' / 'session.json').read_text())
+    assert session['returned_to_reference'] is True
 
 
 def test_snapshot_rejects_motion_during_capture(tmp_path):
