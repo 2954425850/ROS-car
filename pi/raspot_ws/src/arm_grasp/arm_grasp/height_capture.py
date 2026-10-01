@@ -28,11 +28,12 @@ class ScanConfig:
     max_joint_travel_deg: float = 12.0
     max_step_deg: float = 1.5
     min_field_margin: float = 8.0
+    max_feedback_undershoot: float = 8.0
     max_feedback_drift: float = 2.0
     arrived_tolerance: float = 12.0
     stationary_seconds: float = .6
     move_timeout_s: float = 12.0
-    shot_timeout_s: float = 2.5
+    shot_timeout_s: float = 4.0
 
 
 def valid_feedback(fields):
@@ -47,19 +48,34 @@ def validate_path(start, finish, fields, config=None, floor_z=None, require_marg
     floor_z = origin[2] - .002 if floor_z is None else floor_z
     if max(abs(finish[k] - start[k]) for k in start) > cfg.max_joint_travel_deg:
         raise HeightRefused('scan joint travel too large')
+    reference_fields = np.asarray(fields, dtype=float)
+    if (np.min(reference_fields[2:5]) < FIELD_LO - cfg.max_feedback_undershoot
+            or np.max(reference_fields[2:5]) > FIELD_HI + cfg.max_feedback_undershoot):
+        raise HeightRefused('feedback far outside firmware limits')
+    low = np.minimum(reference_fields[2:5], FIELD_LO)
+    high = np.maximum(reference_fields[2:5], FIELD_HI)
     for t in np.linspace(0, 1, 41):
         j = {k: start[k] + float(t) * (finish[k] - start[k]) for k in start}
         f = to_fields(j, fields[0], fields[1])
         margin = cfg.min_field_margin if require_margin and t == 1 else 0.0
-        if (min(f[2:5]) < FIELD_LO + margin
-                or max(f[2:5]) > FIELD_HI - margin
+        if (np.any(np.array(f[2:5]) < low - 1e-7)
+                or np.any(np.array(f[2:5]) > high + 1e-7)
                 or abs(f[5]) > 1000):
             raise HeightRefused('scan path near firmware limit')
-        tip = np.array(geom.gripper_tip(j, closed=False))
-        if tip[2] < floor_z:
-            raise HeightRefused('scan path would lower tip below observation floor')
-        if np.linalg.norm(tip - origin) > cfg.max_tip_travel_m:
-            raise HeightRefused('scan tip travel too large')
+        if margin and (min(f[2:5]) < FIELD_LO + margin or max(f[2:5]) > FIELD_HI - margin):
+            raise HeightRefused('scan endpoint near firmware limit')
+        if (t == 1 and not require_margin and (min(f[2:5]) < FIELD_LO or max(f[2:5]) > FIELD_HI)
+                and not np.allclose(f[2:5], reference_fields[2:5], atol=1e-6, rtol=0)):
+            raise HeightRefused('out-of-range endpoint is not recorded reference pose')
+        bounded = bounded_fields(f)
+        # Check both measured-pose interpolation and the actual legal command
+        # interpolation; a slightly low resting pot reading is not a command.
+        for pose in (j, from_fields(bounded)):
+            tip = np.array(geom.gripper_tip(pose, closed=False))
+            if tip[2] < floor_z:
+                raise HeightRefused('scan path would lower tip below observation floor')
+            if np.linalg.norm(tip - origin) > cfg.max_tip_travel_m:
+                raise HeightRefused('scan tip travel too large')
 
 
 def plan_scan(joints, fields, config=None):
@@ -83,17 +99,22 @@ def plan_scan(joints, fields, config=None):
         # Small pitch changes can move the elbow away from the resting limit
         # while keeping the tip at/above the observation height. Actual camera
         # translations and rotations will be measured at each stationary view.
-        for da in (0., -4., 4., -8., 8.):
-            try:
-                candidate = ik_open_m(*(tip + delta), alpha + da)
-                validate_path(joints, candidate, fields, cfg, tip[2] - .002)
-                validate_path(candidate, joints, fields, cfg, tip[2] - .002,
-                              require_margin=False)
-            except ValueError as e:
-                skipped.append(str(e))
-                continue
-            poses.append(candidate)
-            break
+        found = False
+        for scale in (1., .9, .75, .6):
+            for da in (0., -4., 4., -8., 8.):
+                try:
+                    candidate = ik_open_m(*(tip + delta * scale), alpha + da)
+                    validate_path(joints, candidate, fields, cfg, tip[2] - .002)
+                    validate_path(candidate, joints, fields, cfg, tip[2] - .002,
+                                  require_margin=False)
+                except ValueError as e:
+                    skipped.append(str(e))
+                    continue
+                poses.append(candidate)
+                found = True
+                break
+            if found:
+                break
         if len(poses) == 4:
             break
     if len(poses) < 3:
@@ -104,10 +125,16 @@ def plan_scan(joints, fields, config=None):
     return poses
 
 
+def bounded_fields(fields):
+    result = list(map(float, fields))
+    result[2:5] = [max(FIELD_LO, min(FIELD_HI, x)) for x in result[2:5]]
+    return result
+
+
 def publish_fields(io, fields):
     from .collect import JOINT_NAMES
     msg = io._js()
-    msg.name, msg.position = list(JOINT_NAMES), list(map(float, fields))
+    msg.name, msg.position = list(JOINT_NAMES), bounded_fields(fields)
     io.pub.publish(msg)
 
 

@@ -111,7 +111,7 @@ def run_auto_height(args):
         if args.scan_preview:
             print('只读预检结束：没有发指令或更改服务；小范围路径检查不等于碰撞检测。')
             return 0
-        host = collect.k230_host_from_result()
+        host = args.k230_host or collect.k230_host_from_result()
         if not args.yes:
             print('将动臂观察并%s；结束恢复服务时会归位。'
                   % ('仅测高' if args.measure_only else '按指定相位抓取'))

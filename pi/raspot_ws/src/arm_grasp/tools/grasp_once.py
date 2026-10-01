@@ -344,6 +344,8 @@ def main(argv=None):
                     help='配合 --auto-height：只读当前回读并打印扫描路径，不动臂')
     ap.add_argument('--height-out', default=None,
                     help='自动测高数据根目录；每次创建独立会话，默认 /tmp/arm-height')
+    ap.add_argument('--k230-host', default=None,
+                    help='显式指定 K230 当前地址；默认从结果流来源读取')
     ap.add_argument('--dry-run', action='store_true',
                     help='只读：锁框 → 读关节 → 算 O/S0 → 打印；不发 /arm/command、不停服务')
     ap.add_argument('--phase', choices=('aim', 'descend', 'close', 'lift', 'all'), default='aim',
@@ -435,7 +437,7 @@ def main(argv=None):
 
         # ---------------------------------------------------------------- ① 锁框
         try:
-            host = collect.k230_host_from_result()
+            host = args.k230_host or collect.k230_host_from_result()
         except Exception as e:                                # noqa: BLE001
             print('❌ 拿不到板子地址：%s' % e)
             return 2

@@ -49,6 +49,28 @@ def test_legal_resting_pose_near_limit_can_observe_without_lowering_tip():
         validate_path(pose, j, fields, floor_z=floor, require_margin=False)
 
 
+def test_actual_pi_undershoot_never_produces_illegal_commands():
+    from arm_grasp.arm_kin import from_fields
+    from arm_grasp.height_capture import bounded_fields
+    fields = [240, 498, 176, 121, 512, 10]
+    j = from_fields(fields)
+    poses = plan_scan(j, fields)
+    assert len(poses) >= 3
+    floor = geom.gripper_tip(j, False)[2] - .002
+    for pose in poses[1:]:
+        validate_path(j, pose, fields, floor_z=floor)
+        validate_path(pose, j, fields, floor_z=floor, require_margin=False)
+        for t in np.linspace(0, 1, 21):
+            state = {k: j[k] + t * (pose[k] - j[k]) for k in j}
+            command = bounded_fields(to_fields(state, fields[0], fields[1]))
+            assert all(125 <= x <= 875 for x in command[2:5])
+            assert geom.gripper_tip(from_fields(command), False)[2] >= floor
+    bad = list(fields)
+    bad[3] = 110
+    with pytest.raises(HeightRefused, match='far outside'):
+        plan_scan(from_fields(bad), bad)
+
+
 class FakeIO:
     def __init__(self):
         self.fb = observer()[1]
