@@ -8,7 +8,7 @@ from arm_grasp import geom
 from arm_grasp.arm_kin import from_fields, to_fields
 from arm_grasp.height import HeightRefused, measurement_target
 from arm_grasp.height_capture import (ScanConfig, bounded_fields, capture_scan, move_to,
-                                      plan_scan, snapshot, validate_path)
+                                      plan_scan, restore_pose, snapshot, validate_path)
 from arm_grasp.servo import ik_open_m
 
 
@@ -231,6 +231,55 @@ def test_return_from_sagged_view_is_allowed():
     io.fb = list(sagged)
     move_to(io, ref_joints, reference, ScanConfig(stationary_seconds=.03),
             publish=io.publish, floor_z=floor, require_margin=False)
+
+
+def test_blank_startup_frame_is_retried_then_refused(tmp_path):
+    import cv2
+    grey = np.full((720, 1280, 3), 128, np.uint8)
+    scene = np.random.default_rng(0).integers(0, 255, (720, 1280, 3), dtype=np.uint8)
+    frames = [grey, scene]
+    def capture(path, host, timeout):
+        time.sleep(.05)
+        cv2.imwrite(path, frames.pop(0) if frames else grey)
+        return True
+    io = FakeIO()
+    snapshot(io, 'fake', tmp_path / 'raw.jpg', list(io.fb),
+             ScanConfig(stationary_seconds=.03), capture, publish=lambda *_: None)
+    assert cv2.imread(str(tmp_path / 'raw.jpg')).std() > 3
+    with pytest.raises(HeightRefused, match='capture failed'):
+        snapshot(io, 'fake', tmp_path / 'raw2.jpg', list(io.fb),
+                 ScanConfig(stationary_seconds=.03), capture, publish=lambda *_: None)
+
+
+class HomingArm:
+    """Reports 0 (unread) while the firmware homes, then follows commands."""
+
+    def __init__(self, home, homing_spins=8):
+        self.fb, self.fb_n, self.home = [0.0] * 6, 0, list(home)
+        self.homing_spins, self.commands = homing_spins, []
+
+    def publish(self, io, fields):
+        self.commands.append(bounded_fields(fields))
+        self.fb = bounded_fields(fields)
+
+    def spin(self, seconds):
+        time.sleep(.002)
+        self.fb_n += 1
+        if self.fb_n == self.homing_spins:
+            self.fb = list(self.home)
+
+
+def test_restore_pose_returns_to_start_after_rehome():
+    start = list(observer()[1])
+    home = to_fields(ik_open_m(.12, 0., .10, -80), 226, 500)
+    arm = HomingArm(home)
+    back = restore_pose(arm, start, ScanConfig(stationary_seconds=.03),
+                        publish=arm.publish, min_wait=0.)
+    assert back == pytest.approx(bounded_fields(start), abs=1e-6)
+    assert arm.commands[0] != pytest.approx(bounded_fields(start))   # stepped, not jumped
+    steps = [from_fields(c) for c in arm.commands]
+    for a, b in zip(steps, steps[1:]):
+        assert max(abs(a[k] - b[k]) for k in a) <= ScanConfig().max_step_deg + 1e-6
 
 
 def test_snapshot_rejects_motion_during_capture(tmp_path):

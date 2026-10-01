@@ -7,7 +7,7 @@ import uuid
 from arm_grasp import geom, grasp, observe
 from arm_grasp.arm_kin import from_fields
 from arm_grasp.height import HeightRefused, measurement_target
-from arm_grasp.height_capture import capture_scan, plan_scan, stationary_feedback
+from arm_grasp.height_capture import capture_scan, plan_scan, restore_pose, stationary_feedback
 from arm_grasp.height_vision import load_session, measure_session, save_diagnostic
 
 
@@ -17,6 +17,8 @@ def measured_cfg(args, report):
     cfg = build_cfg(point[2], max_step=args.max_step, patience=args.patience,
                     alpha0=args.alpha0, joint_comp=args.joint_comp, hz=args.hz,
                     bias_r=args.bias_r, max_seconds=args.max_seconds)
+    # Hold the object clear of the support after closing (operator: 5-6 cm).
+    cfg = cfg._replace(lift_m=.055)
     if args.alpha0 is None:
         # An unknown plane may be much lower than the old cap fixture. Search
         # the full configured angle range instead of requiring a new manual seed.
@@ -100,10 +102,19 @@ def run_auto_height(args):
     from arm_grasp import collect
     io, driver, stopped, locked, host = None, None, False, False, None
     directory = None
+    # The arm must end where the flow left it, but the hand-back to the
+    # service moves it (live: shoulder 566 -> 624 between our driver stopping
+    # and the service's coming up). So once the service is back, re-command:
+    # measure-only -> the operator's start pose (state 1, its readings);
+    # successful grasp -> the last grasp COMMAND (lifted, jaws closed - a
+    # closed-on-object gripper reads wider than commanded, so its reading
+    # would loosen the grip). A failed grasp or Ctrl-C leaves the arm alone.
+    start_fields, end_fields = None, None
     try:
         io = collect.ArmIO()
         io.wait_feedback()
         fields = stationary_feedback(io)
+        start_fields = list(fields)
         poses = plan_scan(from_fields(fields), fields)
         print('扫描预检：%d 个观察姿态；每次从起始姿态小范围平移，再返回。' % len(poses))
         for i, j in enumerate(poses):
@@ -113,9 +124,10 @@ def run_auto_height(args):
             return 0
         host = args.k230_host or collect.k230_host_from_result()
         if not args.yes:
-            print('将动臂观察并%s；结束恢复服务时会归位。'
-                  % ('仅测高' if args.measure_only else '按指定相位抓取'))
+            print('将动臂观察并%s；结束恢复服务时会归位%s。'
+                  % (('仅测高', '，随后回到当前起始姿态') if args.measure_only else ('按指定相位抓取', '')))
             input('确认起始观察范围无碰撞、场景保持静止，回车开始：')
+        end_fields = start_fields
         rc = collect._svc('stop')
         if rc.returncode:
             raise RuntimeError('cannot stop teleop service: %s' % (rc.stderr or rc.stdout))
@@ -155,8 +167,11 @@ def run_auto_height(args):
             raise HeightRefused('cannot reacquire measured target')
         if one_obs(want) is None:
             raise HeightRefused('no fresh observation of measured target')
+        end_fields = None
         link = GraspLink(io, host, want, hz=cfg.hz)
         result = grasp.run(cfg, link, phase=args.phase, initial_point=point, log=print)
+        if result['ok'] and link.log:
+            end_fields = list(link.log[-1][1])
         summary = {key: result[key] for key in ('ok', 'stopped', 'ticks', 'obs_n', 'obs_bad',
                                                'O_last', 'err_m', 'phases')}
         (directory / 'grasp-report.json').write_text(
@@ -164,6 +179,7 @@ def run_auto_height(args):
         print('抓取结果：%s' % result['stopped'])
         return 0 if result['ok'] else 1
     except (KeyboardInterrupt, EOFError):
+        end_fields = None
         print('已取消；不继续抓取。')
         return 1
     except (ValueError, OSError, RuntimeError, ImportError) as e:
@@ -192,6 +208,14 @@ def run_auto_height(args):
                 print('服务恢复状态：%s；恢复服务会归位。' % collect._svc_active())
             except Exception as e:
                 cleanup_errors.append('恢复服务：%s' % e)
+            if end_fields is not None and io is not None and not cleanup_errors:
+                try:
+                    print('服务接管后回到结束姿态……')
+                    back = restore_pose(io, end_fields)
+                    print('已回到结束姿态：%s（目标 %s）'
+                          % ([round(x) for x in back], [round(x) for x in end_fields]))
+                except Exception as e:
+                    cleanup_errors.append('回到结束姿态：%s' % e)
         if io is not None:
             try:
                 io.close()

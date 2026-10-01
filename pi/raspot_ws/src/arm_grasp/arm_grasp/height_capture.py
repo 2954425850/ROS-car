@@ -52,9 +52,12 @@ class ScanConfig:
 def valid_feedback(fields):
     return (fields is not None and len(fields) == 6
             and all(math.isfinite(float(x)) for x in fields)
-            # Firmware polls servos 1-5; 0 means that servo was not read this
-            # cycle (seen live: one wrist-roll 0 among steady 497 readings).
-            and all(fields[i] != 0 for i in range(1, 6)))
+            # The five position servos (fields 0-4) are polled; 0 means that
+            # servo was not read this cycle (seen live: one wrist-roll 0 among
+            # steady 497 readings). The base field is the firmware's tracker
+            # estimate, never an unread marker, and 0 is car front - exactly
+            # where re-homing parks it.
+            and all(fields[i] != 0 for i in range(5)))
 
 
 def validate_path(start, finish, fields, config=None, floor_z=None, require_margin=True):
@@ -254,6 +257,24 @@ def _drift_diagnostics(hold_fields, values):
             'feedback_samples': values.tolist()}
 
 
+def _blank(path):
+    """True for the uniform grey frame the RTSP stream can hand out on start."""
+    if not Path(path).exists():
+        return False  # nothing to judge; a missing image is refused on load
+    import cv2
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    return image is None or float(image.std()) < 3.0
+
+
+def _capture_nonblank(capture, path, host, timeout, attempts=2):
+    # Live: one grab returned a flat grey frame (brightness std ~0; a real
+    # desk scene is ~26). Retry once inside the monitored exposure.
+    for _ in range(attempts):
+        if capture(path, host, timeout=timeout) and not _blank(path):
+            return True
+    return False
+
+
 def snapshot(io, host, path, hold_fields, config=None, capture=None,
              publish=publish_fields):
     cfg = config or ScanConfig()
@@ -265,7 +286,7 @@ def snapshot(io, host, path, hold_fields, config=None, capture=None,
     last_n = io.fb_n
     fresh_count, last_fresh = 0, time.monotonic()
     with ThreadPoolExecutor(max_workers=1) as pool:
-        shot = pool.submit(capture, str(path), host, timeout=cfg.shot_timeout_s)
+        shot = pool.submit(_capture_nonblank, capture, str(path), host, cfg.shot_timeout_s)
         while not shot.done():
             publish(io, hold_fields)
             io.spin(.05)
@@ -295,6 +316,34 @@ def snapshot(io, host, path, hold_fields, config=None, capture=None,
     return {'image': Path(path).name, 'fields': fields, 'joints': from_fields(fields),
             'feedback_samples': fresh_count,
             'feedback_span_counts': np.ptp(np.array(values), axis=0).tolist()}
+
+
+def restore_pose(io, fields, config=None, publish=publish_fields, home_timeout=40.0,
+                 min_wait=3.0, move_timeout=60.0):
+    """Drive back to the recorded start readings after the service restart.
+
+    Restarting the teleop service makes the firmware re-run its power-up
+    homing (five joints to the factory pose, base re-centred to car front),
+    so the camera no longer sees the object the operator aimed at. The joints
+    report 0 while homing, which valid_feedback rejects, so "stationary valid
+    feedback" means homing has finished. The way back is streamed in small
+    joint steps like the scan; gripper and wrist roll go to their start values.
+    """
+    cfg = config or ScanConfig()
+    io.spin(min_wait)
+    current = stationary_feedback(io, config=cfg, timeout=home_timeout)
+    target = from_fields(fields)
+    joints = from_fields(current)
+    start = time.monotonic()
+    while True:
+        joints, _, reached = limit_step(joints, target, cfg.max_step_deg)
+        publish(io, to_fields(joints, fields[0], fields[1]))
+        io.spin(.1)
+        if reached:
+            break
+        if time.monotonic() - start > move_timeout:
+            raise HeightRefused('return to start pose timed out')
+    return stationary_feedback(io, list(map(float, fields)), cfg, publish=publish)
 
 
 def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
