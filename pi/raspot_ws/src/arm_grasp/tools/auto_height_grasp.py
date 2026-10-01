@@ -125,7 +125,7 @@ def run_auto_height(args):
         driver = collect._start_driver(args.t_ms)
         io.spin(2.0)
         io.wait_feedback()
-        directory = Path(args.height_out or '/tmp/arm-height') / (
+        directory = Path(args.height_out or '~/arm-height').expanduser() / (
             time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
         # Snapshot supports raw imaging without locking a potentially stale ROI.
         session_path = capture_scan(io, host, box, directory)

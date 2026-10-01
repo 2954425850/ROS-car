@@ -107,12 +107,24 @@ def mutual_matches(desc_ref, desc_other, ratio=.7):
     return {i: j for i, j in forward.items() if backward.get(j) == i}
 
 
-def reconstruct_tracks(images, views, box, config=None):
+def reconstruct_tracks(images, views, box, config=None, contrast_threshold=None):
     cfg = config or HeightConfig()
     cv2.setRNGSeed(cfg.seed)
     foreground, support_mask = region_masks(images[0], box)
     mask = cv2.bitwise_or(foreground, support_mask)
-    sift = cv2.SIFT_create(nfeatures=3500, contrastThreshold=.025)
+    threshold = .025 if contrast_threshold is None else float(contrast_threshold)
+    sift = cv2.SIFT_create(nfeatures=3500, contrastThreshold=threshold)
+    gray_reference = cv2.cvtColor(images[0], cv2.COLOR_BGR2GRAY)
+    strong, _ = sift.detectAndCompute(gray_reference, support_mask)
+    if len(strong) < cfg.min_support_points:
+        # Shallow wood grain is real texture but often below the default SIFT
+        # contrast threshold. Only generate more candidates; all matching,
+        # parallax, reprojection and plane acceptance gates remain unchanged.
+        threshold = .01
+        sift = cv2.SIFT_create(nfeatures=3500, contrastThreshold=threshold)
+        weak, _ = sift.detectAndCompute(gray_reference, support_mask)
+        if len(weak) < cfg.min_support_points:
+            raise HeightRefused('support has insufficient texture (%d candidate features)' % len(weak))
     keypoints, descriptors = [], []
     for i, image in enumerate(images):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -160,6 +172,7 @@ def reconstruct_tracks(images, views, box, config=None):
                        'views': [j for j, _ in visible], 'reprojection_px': max(errors),
                        'parallax_deg': result['parallax_deg'], 'ray_rms_m': result['ray_rms_m']})
     return tracks, {'reference_features': len(keypoints[0]),
+                    'sift_contrast_threshold': threshold,
                     'pair_matches': [len(m) for m in mappings],
                     'rejected_geometric_tracks': rejected}
 
@@ -184,6 +197,12 @@ def measure_session(path, config=None):
     cfg, start = config or HeightConfig(), time.monotonic()
     session, images = load_session(path)
     tracks, counts = reconstruct_tracks(images, session['views'], session['reference_box'], cfg)
+    if (sum(t['kind'] == 'support' for t in tracks) < cfg.min_support_points
+            and counts['sift_contrast_threshold'] > .01):
+        strong_support = sum(t['kind'] == 'support' for t in tracks)
+        tracks, counts = reconstruct_tracks(images, session['views'], session['reference_box'], cfg,
+                                             contrast_threshold=.01)
+        counts.update(detector_retries=1, strong_pass_support_tracks=strong_support)
     try:
         return _finish_measurement(path, cfg, start, session, tracks, counts)
     except HeightRefused as e:

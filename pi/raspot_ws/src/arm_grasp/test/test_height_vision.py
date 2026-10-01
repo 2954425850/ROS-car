@@ -51,10 +51,12 @@ def render(joints, background, top):
     return bg
 
 
-def make_session(tmp_path, textured=True):
+def make_session(tmp_path, textured=True, weak_support=False):
     poses = [ik_open_m(*p, -75) for p in [( .16, -.02, .04), (.16, .005, .04),
                                           (.16, -.045, .04), (.15, -.02, .06)]]
     bg = texture(10) if textured else np.full((900, 900, 3), 180, np.uint8)
+    if weak_support:
+        bg = np.uint8(140 + .18 * (bg.astype(float) - 140))
     top = texture(20, True) if textured else np.full((900, 900, 3), (30, 125, 230), np.uint8)
     views = []
     for i, j in enumerate(poses):
@@ -87,6 +89,12 @@ def test_textured_images_recover_metric_height(tmp_path):
 def test_untextured_scene_refuses_instead_of_guessing(tmp_path):
     with pytest.raises(HeightRefused, match='texture|tracks'):
         measure_session(make_session(tmp_path, textured=False))
+
+
+def test_weak_real_texture_can_supply_support_evidence(tmp_path):
+    report = measure_session(make_session(tmp_path, weak_support=True))
+    assert report['object_height_m'] == pytest.approx(.03, abs=.002)
+    assert report['quality']['support_inliers'] >= 24
 
 
 def test_changed_calibration_and_upright_frames_are_refused(tmp_path):
