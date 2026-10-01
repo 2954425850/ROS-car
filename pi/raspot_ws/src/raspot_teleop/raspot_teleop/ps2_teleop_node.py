@@ -90,6 +90,7 @@ CFG = {
     'RATE_STICK': 300.0,          # 摇杆关节速率 raw/s（大臂/底座，满偏约 3.3s 走完）
     'RATE_BTN': 250.0,            # 按键关节速率 raw/s（夹爪/腕/小臂）
     'ARM_TAIL_S': 0.30,           # 停止输入后继续发布 N 秒（走完坡道）
+    'ARM_SYNC_TOL': 30.0,         # 空闲时回读与目标偏差超过它才同步（count / 底座 field）
     'ARM_DEBOUNCE_TICKS': 2,      # 臂通道去抖：连续 N 拍有效才生效（滤鬼影事件）
 }
 
@@ -160,10 +161,16 @@ class Ps2TeleopNode(Node):
             return
         if time.monotonic() - self.last_arm_input < 1.0:
             return   # 用户正在操作，别让回读覆盖目标
+        # ★ 2026-10-01：只在【偏差大】时才同步（回中 / 别的程序动过臂）。
+        #   原来是无条件覆盖：带载关节的回读比指令低几~十几 count（重力下垂），
+        #   松手 1s 后目标被改成"垂下去的位置"，下次一推摇杆第一帧就是往下走 ⇒ 起步先沉一下。
+        #   小偏差保留上次指令目标，固件插补从原指令平滑续走。
+        tol = CFG['ARM_SYNC_TOL']
         for i in range(5):
-            if pos[i] != 0.0:   # 0 = 该拍没读到，保持上次目标
+            if pos[i] != 0.0 and abs(pos[i] - self.targets[i]) > tol:   # 0 = 该拍没读到
                 self.targets[i] = clamp(pos[i], 0, CFG['GRIP_MAX'] if i == 0 else 1000)
-        self.base_t = clamp(pos[5], -1000, 1000)
+        if abs(pos[5] - self.base_t) > tol:
+            self.base_t = clamp(pos[5], -1000, 1000)
 
     # —— 主循环 ——
     def tick(self):
