@@ -29,13 +29,13 @@ def test_inconsistent_rays_and_behind_camera_are_refused():
         triangulate([[0, 0, 0], [.05, 0, 0]], [[0, 0, -1], [.2, 0, -1]])
 
 
-def clouds(tilt=0.0, height=.03, seed=42):
+def clouds(tilt=0.0, height=.03, seed=42, support_noise=.0003, n_support=180):
     rng = np.random.default_rng(seed)
-    xy = rng.uniform([.14, -.07], [.28, .07], (180, 2))
+    xy = rng.uniform([.14, -.07], [.28, .07], (n_support, 2))
     xy = xy[(np.abs(xy[:, 0] - .21) > .025) | (np.abs(xy[:, 1]) > .025)]
     n = np.array([-tilt, 0, 1.0])
     n /= np.linalg.norm(n)
-    z = -.12 + tilt * (xy[:, 0] - .21) + rng.normal(0, .0003, len(xy))
+    z = -.12 + tilt * (xy[:, 0] - .21) + rng.normal(0, support_noise, len(xy))
     support = np.column_stack([xy, z])
     top_xy = rng.uniform([.195, -.015], [.225, .015], (45, 2))
     top_z = -.12 + tilt * (top_xy[:, 0] - .21) + height / n[2]
@@ -71,3 +71,17 @@ def test_scattered_target_points_do_not_become_a_top_plane():
     top[:, 2] += np.linspace(-.015, .035, len(top))
     with pytest.raises(HeightRefused, match='top'):
         measure_cloud(support, top, HeightConfig(min_top_fraction=.65))
+
+
+def test_noisy_wood_grain_support_still_defines_the_plane():
+    # Real desk: ~40 support points scattering +-5 mm, a precise top.
+    support, top = clouds(support_noise=.003, n_support=55)
+    report = measure_cloud(support, top)
+    assert report['object_height_m'] == pytest.approx(.03, abs=.0015)
+    assert report['quality']['support_z_se_m'] < .0015
+
+
+def test_support_height_uncertainty_is_a_refusal():
+    support, top = clouds(support_noise=.003, n_support=55)
+    with pytest.raises(HeightRefused, match='uncertain'):
+        measure_cloud(support, top, HeightConfig(max_support_se_m=.0003))

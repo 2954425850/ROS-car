@@ -26,6 +26,13 @@ class HeightConfig:
     min_range_m: float = .07
     max_range_m: float = .65
     plane_tol_m: float = .0025
+    # Support features on wood grain localize poorly along the grain: on the
+    # real desk single support points scattered +-5 mm while the plane they
+    # define was ~0.7 mm certain. The support consensus band is therefore
+    # wider, and the guard is the standard error of the support height at
+    # the target instead (precision only; pose/calibration bias not included).
+    support_tol_m: float = .006
+    max_support_se_m: float = .0015
     min_support_points: int = 24
     min_top_points: int = 10
     min_support_fraction: float = .65
@@ -95,7 +102,7 @@ def _svd_plane(points):
     return normal, -float(normal @ centre)
 
 
-def fit_plane(points, config=None, normal_hint=None, support_plane=None):
+def fit_plane(points, config=None, normal_hint=None, support_plane=None, tol=None):
     """RANSAC plane, constrained by upward normal / a measured support plane."""
     cfg = config or HeightConfig()
     top = normal_hint is not None
@@ -104,6 +111,7 @@ def fit_plane(points, config=None, normal_hint=None, support_plane=None):
     hint = np.array(normal_hint if top else [0., 0., 1.])
     cos_limit = math.cos(math.radians(cfg.max_top_tilt_deg if top
                                      else cfg.max_support_tilt_deg))
+    tol = cfg.plane_tol_m if tol is None else tol
     rng, best = np.random.default_rng(cfg.seed), None
     for _ in range(cfg.ransac_iterations):
         q = p[rng.choice(len(p), 3, replace=False)]
@@ -117,7 +125,7 @@ def fit_plane(points, config=None, normal_hint=None, support_plane=None):
         if n @ hint < cos_limit:
             continue
         offset = -float(n @ q[0])
-        mask = np.abs(p @ n + offset) <= cfg.plane_tol_m
+        mask = np.abs(p @ n + offset) <= tol
         if support_plane is not None:
             sn, sd = support_plane
             height = float(sn @ np.median(p[mask], axis=0) + sd)
@@ -133,7 +141,7 @@ def fit_plane(points, config=None, normal_hint=None, support_plane=None):
     mask = best[1]
     for _ in range(2):
         n, offset = _svd_plane(p[mask])
-        mask = np.abs(p @ n + offset) <= cfg.plane_tol_m
+        mask = np.abs(p @ n + offset) <= tol
     if n @ hint < cos_limit or mask.sum() < max(minimum, math.ceil(len(p) * fraction)):
         raise HeightRefused('%s plane unstable after refinement' % label)
     inliers = p[mask]
@@ -175,11 +183,20 @@ def _inside_hull(points, query):
                for a, b in zip(hull, hull[1:] + hull[:1]))
 
 
+def _plane_height_se(points, normal, offset, xy):
+    """Standard error of a fitted plane's height at xy, from its own residuals."""
+    residual = points @ normal + offset
+    a = np.column_stack([points[:, :2], np.ones(len(points))])
+    sigma2 = float(residual @ residual) / max(1, len(points) - 3)
+    x0 = np.array([xy[0], xy[1], 1.0])
+    return float(math.sqrt(sigma2 * float(x0 @ np.linalg.solve(a.T @ a, x0))) / abs(normal[2]))
+
+
 def measure_cloud(support, target, config=None):
     """Measure a supported flat top from foreground and local background points."""
     cfg = config or HeightConfig()
     s, t = _points(support, cfg.min_support_points), _points(target, cfg.min_top_points)
-    plane = fit_plane(s, cfg)
+    plane = fit_plane(s, cfg, tol=cfg.support_tol_m)
     n, offset = plane['normal'], plane['offset_m']
     top = fit_plane(t, cfg, n, (n, offset))
     top_points = t[top['mask']]
@@ -197,6 +214,10 @@ def measure_cloud(support, target, config=None):
     if not _inside_hull(s[plane['mask'], :2], point[:2]):
         raise HeightRefused('support coverage does not surround target')
     support_z = -float(offset + n[:2] @ point[:2]) / n[2]
+    support_se = _plane_height_se(s[plane['mask']], n, offset, point[:2])
+    if support_se > cfg.max_support_se_m:
+        raise HeightRefused('support plane too uncertain at target (%.1f mm standard error)'
+                            % (support_se * 1000))
     height = float(n @ point + offset)
     if not cfg.min_object_height_m <= height <= cfg.max_object_height_m:
         raise HeightRefused('top height outside measurable range')
@@ -209,6 +230,7 @@ def measure_cloud(support, target, config=None):
             'quality': {'support_inliers': int(plane['mask'].sum()),
                         'top_inliers': int(top['mask'].sum()),
                         'support_rms_m': plane['rms_m'], 'top_rms_m': top['rms_m'],
+                        'support_z_se_m': support_se,
                         'accuracy_verified': False,
                         'meaning': 'geometric consistency; pose/calibration bias is unbounded'}}
 
