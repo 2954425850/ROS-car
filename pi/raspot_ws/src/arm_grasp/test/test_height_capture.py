@@ -7,8 +7,8 @@ import pytest
 from arm_grasp import geom
 from arm_grasp.arm_kin import from_fields, to_fields
 from arm_grasp.height import HeightRefused, measurement_target
-from arm_grasp.height_capture import (ScanConfig, bounded_fields, capture_scan, plan_scan,
-                                      snapshot, validate_path)
+from arm_grasp.height_capture import (ScanConfig, bounded_fields, capture_scan, move_to,
+                                      plan_scan, snapshot, validate_path)
 from arm_grasp.servo import ik_open_m
 
 
@@ -215,6 +215,22 @@ def test_failed_scan_returns_to_reference(tmp_path):
     assert commands[-1] == pytest.approx(bounded_fields(reference_fields))
     session = json.loads((tmp_path / 'scan' / 'session.json').read_text())
     assert session['returned_to_reference'] is True
+
+
+def test_return_from_sagged_view_is_allowed():
+    # Real session reference; the loaded shoulder reading 6 counts low (it
+    # hunted 610-614 on another run) puts the tip 2.1 mm under it.
+    reference = [238.0, 496.0, 138.0, 143.0, 588.0, 61.0]
+    sagged = [238.0, 496.0, 138.0, 143.0, 594.0, 61.0]
+    ref_joints = from_fields(reference)
+    floor = geom.gripper_tip(ref_joints, False)[2] - .002
+    with pytest.raises(HeightRefused, match='floor'):
+        validate_path(from_fields(sagged), ref_joints, reference, floor_z=floor,
+                      require_margin=False)
+    io = SaggingArm()
+    io.fb = list(sagged)
+    move_to(io, ref_joints, reference, ScanConfig(stationary_seconds=.03),
+            publish=io.publish, floor_z=floor, require_margin=False)
 
 
 def test_snapshot_rejects_motion_during_capture(tmp_path):

@@ -205,7 +205,19 @@ def move_to(io, joints, hold_fields, config=None, publish=publish_fields, floor_
     if not valid_feedback(io.fb):
         raise HeightRefused('no valid feedback before scan motion')
     current = from_fields(io.fb)
-    validate_path(current, joints, hold_fields, cfg, floor_z, require_margin)
+    if floor_z is not None:
+        # The floor bounds commanded descent, measured from where the arm
+        # actually is: returning from a view that sagged 1 mm (live: elbow
+        # 172 vs 177 commanded) dipped the joint path past the reference
+        # floor, and the scan could not even go home.
+        floor_z = min(floor_z, geom.gripper_tip(current, closed=False)[2] - .002)
+    try:
+        validate_path(current, joints, hold_fields, cfg, floor_z, require_margin)
+    except HeightRefused as e:
+        e.diagnostics.update(start_fields=list(map(float, io.fb)),
+                             target_fields=to_fields(joints, hold_fields[0], hold_fields[1]),
+                             floor_z_m=floor_z)
+        raise
     start = time.monotonic()
     while time.monotonic() - start < cfg.move_timeout_s:
         current, _, reached = limit_step(current, joints, cfg.max_step_deg)
