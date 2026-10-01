@@ -33,6 +33,9 @@ class HeightConfig:
     # the target instead (precision only; pose/calibration bias not included).
     support_tol_m: float = .006
     max_support_se_m: float = .0015
+    # With a known support plane the support points only fix the depth
+    # gauge during pose refinement; the plane itself is not fitted.
+    min_known_support_points: int = 10
     min_support_points: int = 24
     min_top_points: int = 10
     min_support_fraction: float = .65
@@ -192,12 +195,24 @@ def _plane_height_se(points, normal, offset, xy):
     return float(math.sqrt(sigma2 * float(x0 @ np.linalg.solve(a.T @ a, x0))) / abs(normal[2]))
 
 
-def measure_cloud(support, target, config=None):
-    """Measure a supported flat top from foreground and local background points."""
+def measure_cloud(support, target, config=None, known_support_z=None):
+    """Measure a supported flat top from foreground and local background points.
+
+    known_support_z: operator-measured horizontal support height (m, mount
+    frame). The plane is then taken as given instead of fitted.
+    """
     cfg = config or HeightConfig()
-    s, t = _points(support, cfg.min_support_points), _points(target, cfg.min_top_points)
-    plane = fit_plane(s, cfg, tol=cfg.support_tol_m)
-    n, offset = plane['normal'], plane['offset_m']
+    known = known_support_z is not None
+    s = _points(support, cfg.min_known_support_points if known else cfg.min_support_points)
+    t = _points(target, cfg.min_top_points)
+    if known:
+        n, offset = np.array([0., 0., 1.]), -float(known_support_z)
+        residual = s @ n + offset
+        plane = {'normal': n, 'offset_m': offset, 'mask': np.ones(len(s), bool),
+                 'rms_m': float(np.sqrt(np.mean(residual ** 2)))}
+    else:
+        plane = fit_plane(s, cfg, tol=cfg.support_tol_m)
+        n, offset = plane['normal'], plane['offset_m']
     top = fit_plane(t, cfg, n, (n, offset))
     top_points = t[top['mask']]
     point = np.median(top_points, axis=0)
@@ -211,10 +226,10 @@ def measure_cloud(support, target, config=None):
             pass
         else:
             raise HeightRefused('top ambiguous: multiple elevated surfaces')
-    if not _inside_hull(s[plane['mask'], :2], point[:2]):
+    if not known and not _inside_hull(s[plane['mask'], :2], point[:2]):
         raise HeightRefused('support coverage does not surround target')
     support_z = -float(offset + n[:2] @ point[:2]) / n[2]
-    support_se = _plane_height_se(s[plane['mask']], n, offset, point[:2])
+    support_se = 0.0 if known else _plane_height_se(s[plane['mask']], n, offset, point[:2])
     if support_se > cfg.max_support_se_m:
         raise HeightRefused('support plane too uncertain at target (%.1f mm standard error)'
                             % (support_se * 1000))
@@ -231,6 +246,7 @@ def measure_cloud(support, target, config=None):
                         'top_inliers': int(top['mask'].sum()),
                         'support_rms_m': plane['rms_m'], 'top_rms_m': top['rms_m'],
                         'support_z_se_m': support_se,
+                        'support_plane_source': 'known' if known else 'measured',
                         'accuracy_verified': False,
                         'meaning': 'geometric consistency; pose/calibration bias is unbounded'}}
 

@@ -34,6 +34,19 @@ class RefineConfig:
     prior_deg: tuple = (4.0, 1.5, 1.5, 1.5)     # weak priors, per KEYS
     max_offset_deg: tuple = (8.0, 3.0, 3.0, 3.0)
     loss_scale_px: float = 2.0
+    # Known support plane (operator-measured). Without it the small-baseline
+    # scan leaves a depth/attitude ambiguity: real repeated sessions put the
+    # desk anywhere from 13 to 36 mm too high while fitting the images to
+    # 0.5 px. Support points are pulled onto the plane (robustly - wood grain
+    # scatters single points by several mm) and a wrist-pitch offset COMMON
+    # to every view is freed: real sessions all wanted the same-signed 4-9 deg
+    # (camera mounting / wrist zero), which per-view corrections can only
+    # share out until they hit their bounds. Offline on real sessions: top z
+    # within 2-3 mm instead of 13-36.
+    support_sigma_mm: float = 2.0
+    support_weight: float = 3.0
+    common_prior_deg: float = 10.0
+    max_common_offset_deg: float = 12.0
     loss_schedule_px: tuple = (32.0, 8.0, 2.0)
     min_tracks: int = 12
 
@@ -128,15 +141,30 @@ class _Problem:
         return np.nan_to_num(err, nan=1e3)
 
 
-def refine_poses(views, observations, config=None):
-    """Return (corrected views, diagnostics). Refuses implausible corrections."""
+def refine_poses(views, observations, config=None, support=None, support_z=None):
+    """Return (corrected views, diagnostics). Refuses implausible corrections.
+
+    support/support_z: per-track support flags and a known horizontal support
+    plane height (m, mount frame). Given both, support points are constrained
+    to that plane and the reference view's wrist pitch is refined too.
+    """
     from scipy.optimize import least_squares
     cfg = config or RefineConfig()
     if not observations or len({t for t, _, _ in observations}) < cfg.min_tracks:
         raise HeightRefused('too few multiview tracks for pose refinement')
     problem = _Problem(views, observations, cfg.free)
     n = len(cfg.free)
-    prior = np.tile(cfg.per_free(cfg.prior_deg), len(views) - 1)
+    known = support_z is not None
+    n0 = 1 if known else 0
+    prior = np.concatenate([[cfg.common_prior_deg] * n0,
+                            np.tile(cfg.per_free(cfg.prior_deg), len(views) - 1)])
+    support = np.asarray(support, dtype=bool) if known else None
+
+    def poses(x):
+        js = problem.views_for(x[n0:])
+        if known:
+            js = [offset_joints(j, x[:1], ('wrist_pitch',)) for j in js]
+        return js
 
     def residuals(x, f):
         # Cauchy loss on reprojection only. Points are re-triangulated by
@@ -145,27 +173,34 @@ def refine_poses(views, observations, config=None):
         # perfect synthetic fit from 0.06 to 3.2 px. A redescending loss caps
         # their pull. Priors stay quadratic (with the loss on them too, a
         # shoulder/elbow pair ran to -27/+41 deg on real data).
-        r = problem.reprojection(problem.views_for(x)).ravel()
+        js = poses(x)
+        r = problem.reprojection(js).ravel()
         robust = np.sign(r) * f * np.sqrt(np.log1p((r / f) ** 2))
-        return np.concatenate([robust, cfg.loss_scale_px * x / prior])
+        parts = [robust, cfg.loss_scale_px * x / prior]
+        if known:
+            dz = (problem.points(js)[support, 2] - support_z) * 1000 / cfg.support_sigma_mm
+            parts.insert(1, cfg.support_weight * np.sign(dz) * np.sqrt(np.log1p(dz ** 2)))
+        return np.concatenate(parts)
 
-    x = np.zeros(n * (len(views) - 1))
-    before = np.hypot(*problem.reprojection(problem.views_for(x)).T)
+    x = np.zeros(n0 + n * (len(views) - 1))
+    before = np.hypot(*problem.reprojection(poses(x)).T)
     # Coarse to fine: real poses start ~24 px off, inside the 32 px basin.
     for f in cfg.loss_schedule_px:
         x = least_squares(residuals, x, args=(f,), diff_step=1e-4, max_nfev=100).x
     sol_x = x
-    after = np.hypot(*problem.reprojection(problem.views_for(sol_x)).T)
-    offsets = sol_x.reshape(-1, n)
+    after = np.hypot(*problem.reprojection(poses(sol_x)).T)
+    offsets = sol_x[n0:].reshape(-1, n)
     diagnostics = {'offsets_deg': [dict(zip(cfg.free, map(float, o))) for o in offsets],
                    'reprojection_px_median_before': float(np.median(before)),
                    'reprojection_px_median_after': float(np.median(after)),
                    'reprojection_px_p90_after': float(np.percentile(after, 90)),
                    'tracks': problem.n_tracks, 'observations': len(problem.track)}
+    if known:
+        diagnostics['common_wrist_pitch_deg'] = float(sol_x[0])
+        diagnostics['known_support_z_m'] = float(support_z)
     limit = cfg.per_free(cfg.max_offset_deg)
-    if np.any(np.abs(offsets) > limit):
+    if (np.any(np.abs(offsets) > limit)
+            or (known and abs(sol_x[0]) > cfg.max_common_offset_deg)):
         raise HeightRefused('pose refinement needs corrections beyond bounds', diagnostics)
-    corrected = [dict(views[0])]
-    for view, pose in zip(views[1:], problem.views_for(sol_x)[1:]):
-        corrected.append(dict(view, joints=pose))
+    corrected = [dict(view, joints=pose) for view, pose in zip(views, poses(sol_x))]
     return corrected, diagnostics

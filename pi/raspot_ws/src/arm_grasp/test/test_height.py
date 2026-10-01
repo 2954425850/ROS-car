@@ -85,3 +85,13 @@ def test_support_height_uncertainty_is_a_refusal():
     support, top = clouds(support_noise=.003, n_support=55)
     with pytest.raises(HeightRefused, match='uncertain'):
         measure_cloud(support, top, HeightConfig(max_support_se_m=.0003))
+
+
+def test_known_support_plane_is_used_instead_of_fitted():
+    support, top = clouds(support_noise=.004, n_support=30)
+    report = measure_cloud(support[:12], top, known_support_z=-.12)
+    assert report['support_z_m'] == pytest.approx(-.12, abs=1e-12)
+    assert report['object_height_m'] == pytest.approx(.03, abs=.001)
+    assert report['quality']['support_plane_source'] == 'known'
+    with pytest.raises(HeightRefused, match='invalid/insufficient'):
+        measure_cloud(support[:12], top)        # a fitted plane needs 24 points

@@ -51,7 +51,8 @@ def render(joints, background, top):
     return bg
 
 
-def make_session(tmp_path, textured=True, weak_support=False, reading_bias=None):
+def make_session(tmp_path, textured=True, weak_support=False, reading_bias=None,
+                 known_support_z=None):
     poses = [ik_open_m(*p, -75) for p in [( .16, -.02, .04), (.16, .005, .04),
                                           (.16, -.045, .04), (.15, -.02, .06)]]
     bg = texture(10) if textured else np.full((900, 900, 3), 180, np.uint8)
@@ -77,6 +78,8 @@ def make_session(tmp_path, textured=True, weak_support=False, reading_bias=None)
            (corners[:, 0].max() + 6) / 1280, (corners[:, 1].max() + 6) / 720]
     session = {'schema': 'arm_grasp.height_session/v1', 'coordinate_frame': 'raw_stream',
                'complete': True, 'calibration_id': calibration_id(), 'reference_box': box, 'views': views}
+    if known_support_z is not None:
+        session['known_support_z_m'] = known_support_z
     path = tmp_path / 'session.json'
     path.write_text(json.dumps(session), encoding='utf-8')
     return path
@@ -147,3 +150,29 @@ def test_wrong_image_resolution_is_refused(tmp_path):
     cv2.imwrite(str(tmp_path / 'view-0.jpg'), np.zeros((180, 320, 3), np.uint8))
     with pytest.raises(HeightRefused, match='dimensions'):
         load_session(path)
+
+
+# Real sessions: every view's wrist pitch (the reference included) read a few
+# degrees off in the same direction, on top of the base errors.
+COMMON_PITCH_BIAS = [(b, p - 3.0) for b, p in REAL_BIAS]
+
+
+def test_known_support_plane_fixes_absolute_top_under_common_pitch_error(tmp_path):
+    report = measure_session(make_session(tmp_path, reading_bias=COMMON_PITCH_BIAS,
+                                          known_support_z=-.07))
+    assert report['top_z_m'] == pytest.approx(-.04, abs=.002)
+    assert report['object_height_m'] == pytest.approx(.03, abs=.002)
+    assert report['support_z_m'] == pytest.approx(-.07, abs=1e-9)
+    assert report['quality']['support_plane_source'] == 'known'
+    refinement = report['quality']['pose_refinement']
+    assert refinement['common_wrist_pitch_deg'] == pytest.approx(3.0, abs=.5)
+
+
+def test_common_pitch_error_biases_absolute_top_without_known_plane(tmp_path):
+    # Why the known plane exists: the same images measured freely put the
+    # whole scene at the wrong depth (the height itself may still look fine).
+    try:
+        report = measure_session(make_session(tmp_path, reading_bias=COMMON_PITCH_BIAS))
+    except HeightRefused:
+        return
+    assert abs(report['top_z_m'] - (-.04)) > .002

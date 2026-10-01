@@ -34,6 +34,7 @@ def test_height_replay_dry_run_never_touches_robot(cli, monkeypatch, tmp_path):
     ['--auto-height', '--h', '.016'],
     ['--height-session', 'old.json'],
     ['--measure-only'],
+    ['--support-z-mm', '-135.5'],
     ['--auto-height', '--phase', 'lift'],
 ])
 def test_invalid_modes_stop_before_robot_io(cli, monkeypatch, arguments):

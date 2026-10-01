@@ -358,3 +358,14 @@ def test_failed_or_nonfinite_report_has_no_fallback_height():
         measurement_target({'schema': 'arm_grasp.height/v1', 'ok': True,
                             'target_point_m': [0.2, 0, float('nan')],
                             'object_height_m': .03, 'support_z_m': -.07, 'top_z_m': -.04})
+
+
+def test_known_support_plane_is_recorded_for_replay(tmp_path):
+    io = SaggingArm()
+    def capture(path, host, timeout):
+        time.sleep(.05)
+        return True
+    path = capture_scan(io, 'fake', [.4, .35, .6, .6], tmp_path / 'scan',
+                        ScanConfig(stationary_seconds=.03), capture, log=lambda *_: None,
+                        publish=io.publish, known_support_z=-.1355)
+    assert json.loads(path.read_text())['known_support_z_m'] == pytest.approx(-.1355)

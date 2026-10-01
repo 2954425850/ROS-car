@@ -372,7 +372,7 @@ def restore_pose(io, fields, config=None, publish=publish_fields, home_timeout=4
 
 
 def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
-                 publish=publish_fields, reference_command=None):
+                 publish=publish_fields, reference_command=None, known_support_z=None):
     cfg, start = config or ScanConfig(), time.monotonic()
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=False)
@@ -390,6 +390,9 @@ def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
                'calibration_id': calibration_id(), 'calibration': calibration_record(),
                'reference_box': list(box), 'views': [], 'scan_config': asdict(cfg),
                'complete': False, 'reason': None}
+    if known_support_z is not None:
+        # Operator-measured plane the object stands on; replay uses it too.
+        session['known_support_z_m'] = float(known_support_z)
     path = directory / 'session.json'
     try:
         for i, pose in enumerate(poses):

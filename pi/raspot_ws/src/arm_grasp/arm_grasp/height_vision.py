@@ -205,14 +205,18 @@ def reconstruct_tracks(images, views, box, config=None, contrast_threshold=None)
     return tracks, counts
 
 
-def refined_tracks(images, views, box, config=None, contrast_threshold=None, refine=True):
+def refined_tracks(images, views, box, config=None, contrast_threshold=None, refine=True,
+                   support_z=None):
     """Match, optionally refine the measured poses from the images, then gate."""
     candidates, counts = match_tracks(images, box, config, contrast_threshold)
     if refine:
         observations = [(t, j, tuple(p)) for t, cand in enumerate(candidates)
                         for j, p in cand['visible']]
+        support = [cand['kind'] == 'support' for cand in candidates]
         try:
-            views, counts['pose_refinement'] = refine_poses(views, observations)
+            views, counts['pose_refinement'] = refine_poses(views, observations,
+                                                            support=support,
+                                                            support_z=support_z)
         except HeightRefused as e:
             e.diagnostics.update(counts)
             raise
@@ -220,14 +224,15 @@ def refined_tracks(images, views, box, config=None, contrast_threshold=None, ref
     return tracks, counts
 
 
-def _measure_tracks(tracks, cfg, field='point_m'):
+def _measure_tracks(tracks, cfg, field='point_m', support_z=None):
     support = [t[field] for t in tracks if t['kind'] == 'support']
     target = [t[field] for t in tracks if t['kind'] == 'target']
-    if len(support) < cfg.min_support_points:
+    minimum = cfg.min_support_points if support_z is None else cfg.min_known_support_points
+    if len(support) < minimum:
         raise HeightRefused('support has too few reliable multiview tracks (%d)' % len(support))
     if len(target) < cfg.min_top_points:
         raise HeightRefused('top has too few reliable multiview tracks (%d)' % len(target))
-    report = measure_cloud(support, target, cfg)
+    report = measure_cloud(support, target, cfg, known_support_z=support_z)
     # Validate top coverage against the measured top model, not every foreground feature.
     n = np.array(report['top_plane']['normal'])
     offset = report['top_plane']['offset_m']
@@ -240,12 +245,14 @@ def measure_session(path, config=None, refine=True):
     cfg, start = config or HeightConfig(), time.monotonic()
     session, images = load_session(path)
     views, box = session['views'], session['reference_box']
-    tracks, counts = refined_tracks(images, views, box, cfg, refine=refine)
-    if (sum(t['kind'] == 'support' for t in tracks) < cfg.min_support_points
+    support_z = session.get('known_support_z_m')
+    minimum = cfg.min_support_points if support_z is None else cfg.min_known_support_points
+    tracks, counts = refined_tracks(images, views, box, cfg, refine=refine, support_z=support_z)
+    if (sum(t['kind'] == 'support' for t in tracks) < minimum
             and counts['sift_contrast_threshold'] > .01):
         strong_support = sum(t['kind'] == 'support' for t in tracks)
         tracks, counts = refined_tracks(images, views, box, cfg, contrast_threshold=.01,
-                                        refine=refine)
+                                        refine=refine, support_z=support_z)
         counts.update(detector_retries=1, strong_pass_support_tracks=strong_support)
     try:
         return _finish_measurement(path, cfg, start, session, tracks, counts)
@@ -258,15 +265,16 @@ def measure_session(path, config=None, refine=True):
 
 
 def _finish_measurement(path, cfg, start, session, tracks, counts):
-    report, top_pixels = _measure_tracks(tracks, cfg)
+    support_z = session.get('known_support_z_m')
+    report, top_pixels = _measure_tracks(tracks, cfg, support_z=support_z)
     area = cv2.contourArea(cv2.convexHull(top_pixels))
     box = session['reference_box']
     box_area = (box[2] - box[0]) * geom.STREAM_W * (box[3] - box[1]) * geom.STREAM_H
     coverage = float(area / box_area)
     if coverage < cfg.min_image_coverage:
         raise HeightRefused('top feature image coverage insufficient (%.1f%%)' % (coverage * 100))
-    a, _ = _measure_tracks(tracks, cfg, 'split_a')
-    b, _ = _measure_tracks(tracks, cfg, 'split_b')
+    a, _ = _measure_tracks(tracks, cfg, 'split_a', support_z)
+    b, _ = _measure_tracks(tracks, cfg, 'split_b', support_z)
     height_diff = abs(a['object_height_m'] - b['object_height_m'])
     top_diff = abs(a['top_z_m'] - b['top_z_m'])
     support_diff = abs(a['support_z_m'] - b['support_z_m'])

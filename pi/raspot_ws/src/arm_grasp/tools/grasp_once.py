@@ -342,6 +342,9 @@ def main(argv=None):
                     help='配合 --auto-height：采集并测高后结束，不下扎/合爪')
     ap.add_argument('--scan-preview', action='store_true',
                     help='配合 --auto-height：只读当前回读并打印扫描路径，不动臂')
+    ap.add_argument('--support-z-mm', type=float, default=None,
+                    help='自动测高：物体所在平面相对车体安装面的高度（mm，向下为负，'
+                         '如桌面 -135.5）。给出后按已知水平面测量，绝对高度更稳')
     ap.add_argument('--height-out', default=None,
                     help='自动测高数据根目录；每次创建独立会话，默认 ~/arm-height（重启不丢）')
     ap.add_argument('--k230-host', default=None,
@@ -401,8 +404,8 @@ def main(argv=None):
         except ImportError as e:
             print('❌ 自动测高依赖不可用：%s；见 requirements-height.txt。' % e)
             return 2
-    if args.measure_only or args.scan_preview or args.height_out:
-        print('❌ --measure-only / --scan-preview / --height-out 需要 --auto-height。')
+    if args.measure_only or args.scan_preview or args.height_out or args.support_z_mm is not None:
+        print('❌ --measure-only / --scan-preview / --height-out / --support-z-mm 需要 --auto-height。')
         return 2
     if args.h is None:
         args.h = DEFAULT_H_M
