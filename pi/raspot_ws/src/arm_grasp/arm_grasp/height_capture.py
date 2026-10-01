@@ -22,7 +22,10 @@ from .servo import ik_open_m, limit_step
 
 @dataclass(frozen=True)
 class ScanConfig:
-    lateral_m: float = .025
+    # Left/right is a pure base rotation: on the folded resting pose the tip
+    # is ~8 cm from the axis, so a 25 mm tip move needs 17 deg of base, while
+    # the camera (~15 cm out) already moves >20 mm for 8 deg.
+    lateral_base_deg: float = 8.0
     # Forward/back at constant tip height: shoulder/elbow/wrist are accurate
     # (<2 deg on real data) and the move is across the line of sight. The old
     # lift moved mostly along it (<2 deg parallax), and the base alone stalls
@@ -97,11 +100,18 @@ def plan_scan(joints, fields, config=None):
     validate_path(joints, joints, fields, cfg, require_margin=False)
     tip = np.array(geom.gripper_tip(joints, closed=False))
     yaw = math.radians(joints['base'])
-    lateral = np.array([-math.sin(yaw), math.cos(yaw), 0.])
     radial = np.array([math.cos(yaw), math.sin(yaw), 0.])
     alpha = joints['shoulder'] + joints['elbow'] + joints['wrist_pitch']
-    offsets = [cfg.radial_m * radial, -cfg.radial_m * radial,
-               cfg.lateral_m * lateral, -cfg.lateral_m * lateral]
+    def radial_move(sign):
+        for scale in (1., .9, .75, .6):
+            for da in (0., -4., 4., -8., 8.):
+                yield lambda: ik_open_m(*(tip + sign * cfg.radial_m * scale * radial), alpha + da)
+
+    def base_move(sign):
+        for scale in (1., .75, .5):
+            yield lambda: dict(joints, base=joints['base'] + sign * cfg.lateral_base_deg * scale)
+
+    moves = [radial_move(1), radial_move(-1), base_move(1), base_move(-1)]
     poses = [dict(joints)]
     skipped = []
     centre0 = np.array(geom.camera_center(joints))
@@ -113,7 +123,7 @@ def plan_scan(joints, fields, config=None):
         return float(np.linalg.norm(d - (d @ axis0) * axis0))
     # Every excursion returns through the reference pose: larger opposite-side
     # moves must not sneak through a 35 mm per-segment constraint.
-    for delta in offsets:
+    for move in moves:
         # Small pitch changes can move the elbow away from the resting limit
         # while keeping the tip at/above the observation height. Among all
         # candidates that pass every safety check, keep the one that moves the
@@ -122,21 +132,20 @@ def plan_scan(joints, fields, config=None):
         # candidate there mostly rotated the camera). Actual camera poses
         # are measured at each stationary view.
         best = None
-        for scale in (1., .9, .75, .6):
-            for da in (0., -4., 4., -8., 8.):
-                try:
-                    candidate = ik_open_m(*(tip + delta * scale), alpha + da)
-                    if (max(abs(candidate[k] - joints[k]) for k in joints)
-                            > cfg.max_joint_travel_deg - cfg.plan_travel_margin_deg):
-                        raise HeightRefused('scan joint travel leaves no return margin')
-                    validate_path(joints, candidate, fields, cfg, tip[2] - .002)
-                    validate_path(candidate, joints, fields, cfg, tip[2] - .002,
-                                  require_margin=False)
-                except ValueError as e:
-                    skipped.append(str(e))
-                    continue
-                if best is None or sideways(candidate) > sideways(best):
-                    best = candidate
+        for make in move:
+            try:
+                candidate = make()
+                if (max(abs(candidate[k] - joints[k]) for k in joints)
+                        > cfg.max_joint_travel_deg - cfg.plan_travel_margin_deg):
+                    raise HeightRefused('scan joint travel leaves no return margin')
+                validate_path(joints, candidate, fields, cfg, tip[2] - .002)
+                validate_path(candidate, joints, fields, cfg, tip[2] - .002,
+                              require_margin=False)
+            except ValueError as e:
+                skipped.append(str(e))
+                continue
+            if best is None or sideways(candidate) > sideways(best):
+                best = candidate
         if best is not None:
             poses.append(best)
     if len(poses) < 3:
