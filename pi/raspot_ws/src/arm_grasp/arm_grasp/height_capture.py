@@ -96,7 +96,30 @@ def validate_path(start, finish, fields, config=None, floor_z=None, require_marg
                 raise HeightRefused('scan tip travel too large')
 
 
-def plan_scan(joints, fields, config=None):
+def target_stays_in_frame(reference, candidate, box, depths=(.10, .17, .25, .35, .45)):
+    """The reference box, at any plausible depth along its rays, stays inside
+    the usable image of the candidate view (same limits as segmentation).
+
+    Live: a backward view moved the image up so far that the cap was half
+    cut off, which starved the top of tracks. The depth is unknown before
+    measuring, so every depth in the working range must stay in frame.
+    """
+    w, h = geom.STREAM_W, geom.STREAM_H
+    for u in (box[0], box[2]):
+        for v in (box[1], box[3]):
+            c, d = geom.pixel_ray(reference, *geom.to_ai(u * w, v * h))
+            for t in depths:
+                point = tuple(c[i] + t * d[i] for i in range(3))
+                try:
+                    x, y = geom.to_stream(*geom.project(candidate, point))
+                except ValueError:
+                    return False
+                if not (8 <= x <= w - 8 and 8 <= y <= h * .86):
+                    return False
+    return True
+
+
+def plan_scan(joints, fields, config=None, box=None):
     cfg = config or ScanConfig()
     if not valid_feedback(fields) or abs(fields[1] - 496) > 8:
         raise HeightRefused('scan needs valid feedback and calibrated wrist roll')
@@ -144,6 +167,8 @@ def plan_scan(joints, fields, config=None):
                 validate_path(joints, candidate, fields, cfg, tip[2] - .002)
                 validate_path(candidate, joints, fields, cfg, tip[2] - .002,
                               require_margin=False)
+                if box is not None and not target_stays_in_frame(joints, candidate, box):
+                    raise HeightRefused('target would leave the image')
             except ValueError as e:
                 skipped.append(str(e))
                 continue
@@ -353,7 +378,7 @@ def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
     directory.mkdir(parents=True, exist_ok=False)
     fields = stationary_feedback(io, config=cfg)
     reference = from_fields(fields)
-    poses = plan_scan(reference, fields, cfg)
+    poses = plan_scan(reference, fields, cfg, box)
     floor_z = geom.gripper_tip(reference, closed=False)[2] - .002
     session = {'schema': 'arm_grasp.height_session/v1', 'coordinate_frame': 'raw_stream',
                'calibration_id': calibration_id(), 'calibration': calibration_record(),

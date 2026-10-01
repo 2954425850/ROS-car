@@ -115,7 +115,7 @@ def run_auto_height(args):
         io.wait_feedback()
         fields = stationary_feedback(io)
         start_fields = list(fields)
-        poses = plan_scan(from_fields(fields), fields)
+        poses = plan_scan(from_fields(fields), fields, box=box)
         print('扫描预检：%d 个观察姿态；每次从起始姿态小范围平移，再返回。' % len(poses))
         for i, j in enumerate(poses):
             print('  %d：光心 (%.4f, %.4f, %.4f) m' % ((i + 1,) + geom.camera_center(j)))

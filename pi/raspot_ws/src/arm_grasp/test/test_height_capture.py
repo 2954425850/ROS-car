@@ -8,7 +8,8 @@ from arm_grasp import geom
 from arm_grasp.arm_kin import from_fields, to_fields
 from arm_grasp.height import HeightRefused, measurement_target
 from arm_grasp.height_capture import (ScanConfig, bounded_fields, capture_scan, move_to,
-                                      plan_scan, restore_pose, snapshot, validate_path)
+                                      plan_scan, restore_pose, snapshot, target_stays_in_frame,
+                                      validate_path)
 from arm_grasp.servo import ik_open_m
 
 
@@ -85,6 +86,18 @@ def test_scan_tolerates_imperfect_return_to_reference():
         returned = dict(j, base=j['base'] + base_error)
         for pose in poses[1:]:
             validate_path(returned, pose, fields, floor_z=floor - .002)
+
+
+def test_scan_keeps_the_target_in_frame():
+    # Real state 1 and box: the backward view pushed the cap off the image.
+    fields = [238.0, 497.0, 185.0, 137.0, 599.0, 47.0]
+    box = [.405, .22, .525, .45]
+    j = from_fields(fields)
+    unconstrained = plan_scan(j, fields)
+    assert not all(target_stays_in_frame(j, p, box) for p in unconstrained)
+    poses = plan_scan(j, fields, box=box)
+    assert len(poses) >= 4
+    assert all(target_stays_in_frame(j, p, box) for p in poses)
 
 
 class FakeIO:
@@ -192,7 +205,7 @@ def test_scan_holds_planned_command_not_sagged_reading(tmp_path):
         exposures.append(io.exposure_commands)
         return True
     reference_fields = list(io.fb)
-    poses = plan_scan(observer()[0], reference_fields)
+    poses = plan_scan(observer()[0], reference_fields, box=[.4, .35, .6, .6])
     capture_scan(io, 'fake', [.4, .35, .6, .6], tmp_path / 'scan',
                  ScanConfig(stationary_seconds=.03), capture, log=lambda *_: None,
                  publish=io.publish)
