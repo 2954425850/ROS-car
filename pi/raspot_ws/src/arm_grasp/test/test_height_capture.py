@@ -102,10 +102,13 @@ def test_snapshot_rejects_motion_during_capture(tmp_path):
         io.drift = True
         time.sleep(.08)
         return True
-    with pytest.raises(HeightRefused, match='drift'):
+    with pytest.raises(HeightRefused, match='drift') as refused:
         snapshot(io, 'fake', tmp_path / 'raw.jpg', list(io.fb),
                  ScanConfig(stationary_seconds=.03), capture,
                  publish=lambda *_: None)
+    diagnostics = refused.value.diagnostics
+    assert max(diagnostics['feedback_span_counts'][1:]) > 2
+    assert len(diagnostics['feedback_samples']) >= 2
 
 
 def test_failed_or_nonfinite_report_has_no_fallback_height():

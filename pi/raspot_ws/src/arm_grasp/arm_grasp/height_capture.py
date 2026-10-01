@@ -184,6 +184,14 @@ def move_to(io, joints, hold_fields, config=None, publish=publish_fields, floor_
     raise HeightRefused('scan motion timeout')
 
 
+def _drift_diagnostics(hold_fields, values):
+    values = np.array(values, dtype=float)
+    return {'hold_fields': list(map(float, hold_fields)),
+            'commanded_fields': bounded_fields(hold_fields),
+            'feedback_span_counts': np.ptp(values, axis=0).tolist(),
+            'feedback_samples': values.tolist()}
+
+
 def snapshot(io, host, path, hold_fields, config=None, capture=None,
              publish=publish_fields):
     cfg = config or ScanConfig()
@@ -207,7 +215,8 @@ def snapshot(io, host, path, hold_fields, config=None, capture=None,
                     fresh_count += 1
                     last_fresh = time.monotonic()
                     if np.max(np.ptp(np.array(values)[:, 1:], axis=0)) > cfg.max_feedback_drift:
-                        raise HeightRefused('feedback drift during exposure; image discarded')
+                        raise HeightRefused('feedback drift during exposure; image discarded',
+                                            _drift_diagnostics(hold_fields, values))
             if time.monotonic() - last_fresh > .5:
                 raise HeightRefused('feedback stale during exposure; image discarded')
         if not shot.result():
@@ -217,7 +226,8 @@ def snapshot(io, host, path, hold_fields, config=None, capture=None,
     after = stationary_feedback(io, hold_fields, cfg, publish=publish)
     values.append(after)
     if np.max(np.ptp(np.array(values)[:, 1:], axis=0)) > cfg.max_feedback_drift:
-        raise HeightRefused('feedback changed across exposure; image discarded')
+        raise HeightRefused('feedback changed across exposure; image discarded',
+                            _drift_diagnostics(hold_fields, values))
     fields = np.median(np.array(values), axis=0).tolist()
     return {'image': Path(path).name, 'fields': fields, 'joints': from_fields(fields),
             'feedback_samples': fresh_count,
