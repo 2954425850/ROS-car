@@ -158,7 +158,9 @@ def test_snapshot_skips_unread_servo_sample(tmp_path):
 
 
 class SaggingArm:
-    """Servos settle 4 counts short of every command on the shoulder."""
+    """Shoulder settles 4 counts under every command; the base velocity loop
+    stalls 3 counts short of a target it has to move to, and stays put when
+    the target is within its deadband."""
 
     def __init__(self):
         self.fb = list(observer()[1])
@@ -170,7 +172,10 @@ class SaggingArm:
         command = bounded_fields(fields)
         if self.capturing:
             self.exposure_commands.append(command)
-        self.fb = command[:4] + [command[4] - 4.0, command[5]]
+        base, error = self.fb[5], command[5] - self.fb[5]
+        if abs(error) > 3.0:
+            base = command[5] - 3.0 * np.sign(error)
+        self.fb = command[:4] + [command[4] - 4.0, base]
 
     def spin(self, seconds):
         time.sleep(.002)
@@ -195,7 +200,11 @@ def test_scan_holds_planned_command_not_sagged_reading(tmp_path):
     for pose, commands in list(zip(poses, exposures))[1:]:
         planned = bounded_fields(to_fields(pose, reference_fields[0], reference_fields[1]))
         assert commands
-        assert all(c == pytest.approx(planned) for c in commands)
+        # Position servos: the planned command. Base: where it stalled.
+        assert all(c[:5] == pytest.approx(planned[:5]) for c in commands)
+        stalled = planned[5] - 3.0 * np.sign(planned[5] - reference_fields[5])
+        if abs(planned[5] - reference_fields[5]) > 3.0:
+            assert all(c[5] == pytest.approx(stalled) for c in commands)
 
 
 def test_failed_scan_returns_to_reference(tmp_path):

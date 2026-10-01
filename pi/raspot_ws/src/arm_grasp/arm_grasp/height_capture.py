@@ -365,12 +365,17 @@ def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
             if i:
                 move_to(io, reference, fields, cfg, publish=publish, floor_z=floor_z,
                         require_margin=False)
-                move_to(io, pose, fields, cfg, publish=publish, floor_z=floor_z)
-                # Keep holding the command that reached this pose. Re-commanding
-                # the sagged reading moves the target and the servo sags again
-                # mid-exposure (seen live: shoulder 555 -> 559 after settling).
-                # The camera pose is still the measured feedback from snapshot.
+                settled = move_to(io, pose, fields, cfg, publish=publish, floor_z=floor_z)
+                # Position servos keep the command that reached this pose:
+                # re-commanding the sagged reading moves the target and they
+                # sag again mid-exposure (live: shoulder 555 -> 559). The base
+                # is the opposite: its velocity loop stalls short (live: 35 vs
+                # 32.8 commanded, beyond the 0.5 deg deadband) and keeps pushing
+                # until it slips mid-exposure (35 -> 28). It has no gravity sag,
+                # so hold it where it settled. The camera pose is still the
+                # measured feedback from snapshot.
                 hold = to_fields(pose, fields[0], fields[1])
+                hold[5] = settled[5]
             else:
                 hold = fields
             log('测高观察 %d/%d：停稳拍摄' % (i + 1, len(poses)))
