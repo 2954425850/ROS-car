@@ -137,6 +137,11 @@ def run_auto_height(args):
         driver = collect._start_driver(args.t_ms)
         io.spin(2.0)
         io.wait_feedback()
+        # The hand-over itself lets the loaded shoulder droop (live: 594 ->
+        # 629, the target left the operator's box). Scan from state 1 itself.
+        back = restore_pose(io, start_fields, min_wait=.5)
+        print('驱动接管后回到状态 1：%s（记录 %s）'
+              % ([round(x) for x in back], [round(x) for x in start_fields]))
         directory = Path(args.height_out or '~/arm-height').expanduser() / (
             time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
         # Snapshot supports raw imaging without locking a potentially stale ROI.

@@ -68,11 +68,11 @@ def test_failed_live_measurement_restores_driver_and_service(cli, monkeypatch, t
     monkeypatch.setattr(wiring, 'measure_session', refuse)
     monkeypatch.setattr(grasp, 'run', forbidden)
     monkeypatch.setattr(wiring, 'restore_pose',
-                        lambda _io, start: calls.append(('restore', list(start))) or start)
+                        lambda _io, start, **_: calls.append(('restore', list(start))) or start)
     assert cli.main(['--auto-height', '--yes', '--box', '.4,.4,.6,.6',
                      '--height-out', str(tmp_path)]) == 1
-    # The service restart re-homes the arm; it then goes back to where it started.
-    assert calls == ['stop', 'driver-start', 'driver-stop', 'start',
+    # Both hand-overs move the arm: back to state 1 before scanning and after.
+    assert calls == ['stop', 'driver-start', ('restore', list(fields)), 'driver-stop', 'start',
                      ('restore', list(fields)), 'close']
     reports = list(tmp_path.glob('*/height-report.json'))
     assert len(reports) == 1
@@ -120,12 +120,13 @@ def test_successful_grasp_ends_lifted_with_last_command(cli, monkeypatch, tmp_pa
         'ok': grasp_ok, 'stopped': 'lifted' if grasp_ok else 'lost', 'ticks': 1, 'obs_n': 1,
         'obs_bad': 0, 'O_last': None, 'err_m': 0.0, 'phases': []})
     monkeypatch.setattr(wiring, 'restore_pose',
-                        lambda _io, target: calls.append(('restore', list(target))) or target)
+                        lambda _io, target, **_: calls.append(('restore', list(target))) or target)
     cli.main(['--auto-height', '--yes', '--phase', 'all', '--box', '.4,.4,.6,.6',
               '--height-out', str(tmp_path)])
     restores = [c for c in calls if isinstance(c, tuple)]
+    assert restores[0] == ('restore', list(fields))   # scan starts from state 1
     if grasp_ok:
-        assert restores == [('restore', lifted)]
-        assert calls.index('start') < calls.index(restores[0])
+        assert restores[1:] == [('restore', lifted)]
+        assert calls.index('start') < calls.index(restores[1])
     else:
-        assert restores == []
+        assert restores[1:] == []
