@@ -6,7 +6,8 @@ import pytest
 from arm_grasp import geom
 from arm_grasp.arm_kin import to_fields
 from arm_grasp.height import HeightRefused, measurement_target
-from arm_grasp.height_capture import ScanConfig, plan_scan, snapshot, validate_path
+from arm_grasp.height_capture import (ScanConfig, bounded_fields, capture_scan, plan_scan,
+                                      snapshot, validate_path)
 from arm_grasp.servo import ik_open_m
 
 
@@ -130,6 +131,47 @@ def test_snapshot_skips_unread_servo_sample(tmp_path):
                     publish=lambda *_: None)
     assert io.fb_n > io.glitch_at
     assert max(view['feedback_span_counts'][1:]) == 0
+
+
+class SaggingArm:
+    """Servos settle 4 counts short of every command on the shoulder."""
+
+    def __init__(self):
+        self.fb = list(observer()[1])
+        self.fb_n = 0
+        self.capturing = False
+        self.exposure_commands = []
+
+    def publish(self, io, fields):
+        command = bounded_fields(fields)
+        if self.capturing:
+            self.exposure_commands.append(command)
+        self.fb = command[:4] + [command[4] - 4.0, command[5]]
+
+    def spin(self, seconds):
+        time.sleep(.002)
+        self.fb_n += 1
+
+
+def test_scan_holds_planned_command_not_sagged_reading(tmp_path):
+    io = SaggingArm()
+    exposures = []
+    def capture(path, host, timeout):
+        io.capturing, io.exposure_commands = True, []
+        time.sleep(.05)
+        io.capturing = False
+        exposures.append(io.exposure_commands)
+        return True
+    reference_fields = list(io.fb)
+    poses = plan_scan(observer()[0], reference_fields)
+    capture_scan(io, 'fake', [.4, .35, .6, .6], tmp_path / 'scan',
+                 ScanConfig(stationary_seconds=.03), capture, log=lambda *_: None,
+                 publish=io.publish)
+    assert len(exposures) == len(poses)
+    for pose, commands in list(zip(poses, exposures))[1:]:
+        planned = bounded_fields(to_fields(pose, reference_fields[0], reference_fields[1]))
+        assert commands
+        assert all(c == pytest.approx(planned) for c in commands)
 
 
 def test_snapshot_rejects_motion_during_capture(tmp_path):

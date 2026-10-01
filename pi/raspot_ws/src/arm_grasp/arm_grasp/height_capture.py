@@ -247,7 +247,8 @@ def snapshot(io, host, path, hold_fields, config=None, capture=None,
             'feedback_span_counts': np.ptp(np.array(values), axis=0).tolist()}
 
 
-def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print):
+def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
+                 publish=publish_fields):
     cfg, start = config or ScanConfig(), time.monotonic()
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=False)
@@ -263,14 +264,22 @@ def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print):
     try:
         for i, pose in enumerate(poses):
             if i:
-                move_to(io, reference, fields, cfg, floor_z=floor_z, require_margin=False)
-                hold = move_to(io, pose, fields, cfg, floor_z=floor_z)
+                move_to(io, reference, fields, cfg, publish=publish, floor_z=floor_z,
+                        require_margin=False)
+                move_to(io, pose, fields, cfg, publish=publish, floor_z=floor_z)
+                # Keep holding the command that reached this pose. Re-commanding
+                # the sagged reading moves the target and the servo sags again
+                # mid-exposure (seen live: shoulder 555 -> 559 after settling).
+                # The camera pose is still the measured feedback from snapshot.
+                hold = to_fields(pose, fields[0], fields[1])
             else:
                 hold = fields
             log('测高观察 %d/%d：停稳拍摄' % (i + 1, len(poses)))
-            view = snapshot(io, host, directory / ('view-%02d.jpg' % i), hold, cfg, capture)
+            view = snapshot(io, host, directory / ('view-%02d.jpg' % i), hold, cfg, capture,
+                            publish=publish)
             session['views'].append(view)
-        move_to(io, reference, fields, cfg, floor_z=floor_z, require_margin=False)
+        move_to(io, reference, fields, cfg, publish=publish, floor_z=floor_z,
+                require_margin=False)
         session['complete'] = True
     except BaseException as e:
         session['reason'] = str(e) or type(e).__name__
