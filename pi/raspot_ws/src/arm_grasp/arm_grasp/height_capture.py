@@ -26,6 +26,9 @@ class ScanConfig:
     lift_m: float = .018
     max_tip_travel_m: float = .035
     max_joint_travel_deg: float = 12.0
+    # Planned excursions leave room for the arm not returning exactly to the
+    # reference (live: base back +0.7 deg pushed an 11.3 deg plan over 12).
+    plan_travel_margin_deg: float = 2.0
     max_step_deg: float = 1.5
     min_field_margin: float = 8.0
     max_feedback_undershoot: float = 8.0
@@ -106,6 +109,9 @@ def plan_scan(joints, fields, config=None):
             for da in (0., -4., 4., -8., 8.):
                 try:
                     candidate = ik_open_m(*(tip + delta * scale), alpha + da)
+                    if (max(abs(candidate[k] - joints[k]) for k in joints)
+                            > cfg.max_joint_travel_deg - cfg.plan_travel_margin_deg):
+                        raise HeightRefused('scan joint travel leaves no return margin')
                     validate_path(joints, candidate, fields, cfg, tip[2] - .002)
                     validate_path(candidate, joints, fields, cfg, tip[2] - .002,
                                   require_margin=False)

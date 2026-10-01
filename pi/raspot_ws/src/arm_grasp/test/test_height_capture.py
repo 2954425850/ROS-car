@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from arm_grasp import geom
-from arm_grasp.arm_kin import to_fields
+from arm_grasp.arm_kin import from_fields, to_fields
 from arm_grasp.height import HeightRefused, measurement_target
 from arm_grasp.height_capture import (ScanConfig, bounded_fields, capture_scan, plan_scan,
                                       snapshot, validate_path)
@@ -70,6 +70,20 @@ def test_actual_pi_undershoot_never_produces_illegal_commands():
     bad[3] = 110
     with pytest.raises(HeightRefused, match='far outside'):
         plan_scan(from_fields(bad), bad)
+
+
+def test_scan_tolerates_imperfect_return_to_reference():
+    # Real resting pose whose 25 mm lateral plan needed 11.3 deg of base travel;
+    # the arm came back slightly off and the next live move exceeded 12 deg.
+    fields = [240.0, 498.0, 154.0, 149.0, 605.0, 89.0]
+    j = from_fields(fields)
+    poses = plan_scan(j, fields)
+    assert len(poses) == 4
+    floor = geom.gripper_tip(j, False)[2] - .002
+    for base_error in (-1.0, 1.0):
+        returned = dict(j, base=j['base'] + base_error)
+        for pose in poses[1:]:
+            validate_path(returned, pose, fields, floor_z=floor - .002)
 
 
 class FakeIO:
