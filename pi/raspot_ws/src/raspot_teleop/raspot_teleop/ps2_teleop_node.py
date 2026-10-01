@@ -90,7 +90,8 @@ CFG = {
     'RATE_STICK': 300.0,          # 摇杆关节速率 raw/s（大臂/底座，满偏约 3.3s 走完）
     'RATE_BTN': 250.0,            # 按键关节速率 raw/s（夹爪/腕/小臂）
     'ARM_TAIL_S': 0.30,           # 停止输入后继续发布 N 秒（走完坡道）
-    'ARM_SYNC_TOL': 30.0,         # 空闲时回读与目标偏差超过它才同步（count / 底座 field）
+    'ARM_ACC': 2500.0,            # 臂通道加速度 raw/s²（250 raw/s 约 0.1s 起停）
+    'ARM_SYNC_TOL': 30.0,        # 空闲时回读与目标偏差超过它才同步（count / 底座 field）
     'ARM_DEBOUNCE_TICKS': 2,      # 臂通道去抖：连续 N 拍有效才生效（滤鬼影事件）
 }
 
@@ -144,6 +145,7 @@ class Ps2TeleopNode(Node):
         self.base_t = None
         self.last_arm_input = 0.0
         self.arm_hold_cnt = {}        # 臂通道去抖计数
+        self.arm_vel = [0.0] * 6      # 各臂通道当前速度 raw/s（加速度限幅后的）
 
         self.get_logger().info(
             f'ps2_teleop_node 启动：手柄 {js_dev} @ {hz:.0f}Hz，默认档 {self.gear:.2f} m/s')
@@ -272,15 +274,29 @@ class Ps2TeleopNode(Node):
             in_wr, in_wp, in_sh, in_bs, in_fu, in_gr = (
                 chans[k] for k in ('wr', 'wp', 'sh', 'bs', 'fu', 'gr'))
 
+            # ★ 2026-10-01：速度带加速度限幅（梯形起停）。
+            #   原来按键一按就是 0→250 raw/s 的速度阶跃、一松就是 250→0 —— 带载的
+            #   大臂/小臂被这一下"踢"起来，到位后像果冻一样晃（舵机自身阻尼很弱）。
+            #   现在每个通道的速度以 ARM_ACC 爬升/回落：起步 ~0.1s、松手多滑 ~3°。
             dt = self.period
-            self.targets[0] = clamp(self.targets[0] + in_gr * c['RATE_BTN'] * dt, 0, c['GRIP_MAX'])
-            self.targets[1] = clamp(self.targets[1] + in_wr * c['RATE_BTN'] * dt, 0, 1000)
-            self.targets[2] = clamp(self.targets[2] + in_wp * c['RATE_BTN'] * dt, 0, 1000)
-            self.targets[3] = clamp(self.targets[3] + in_fu * c['RATE_BTN'] * dt, 0, 1000)
-            self.targets[4] = clamp(self.targets[4] + in_sh * c['RATE_STICK'] * dt, 0, 1000)
-            self.base_t = clamp(self.base_t + in_bs * c['RATE_STICK'] * dt, -1000, 1000)
+            want = [in_gr * c['RATE_BTN'], in_wr * c['RATE_BTN'], in_wp * c['RATE_BTN'],
+                    in_fu * c['RATE_BTN'], in_sh * c['RATE_STICK'], in_bs * c['RATE_STICK']]
+            dv = c['ARM_ACC'] * dt
+            for k in range(6):
+                self.arm_vel[k] += clamp(want[k] - self.arm_vel[k], -dv, dv)
+            hi = [c['GRIP_MAX'], 1000, 1000, 1000, 1000]
+            for k in range(5):
+                t = self.targets[k] + self.arm_vel[k] * dt
+                self.targets[k] = clamp(t, 0, hi[k])
+                if self.targets[k] != t:
+                    self.arm_vel[k] = 0.0      # 顶到限位就停，别在限位上"攒速度"
+            t = self.base_t + self.arm_vel[5] * dt
+            self.base_t = clamp(t, -1000, 1000)
+            if self.base_t != t:
+                self.arm_vel[5] = 0.0
 
-            active = any(abs(x) > 1e-9 for x in (in_wr, in_wp, in_sh, in_bs, in_fu, in_gr))
+            active = (any(abs(x) > 1e-9 for x in (in_wr, in_wp, in_sh, in_bs, in_fu, in_gr))
+                      or any(abs(v) > 1e-6 for v in self.arm_vel))
             if active:
                 self.last_arm_input = now
 
@@ -300,6 +316,8 @@ class Ps2TeleopNode(Node):
                 js.name = list(ARM_JOINT_NAMES)
                 js.position = [float(t) for t in self.targets] + [float(self.base_t)]
                 self.pub_arm.publish(js)
+        else:
+            self.arm_vel = [0.0] * 6           # 急停 / 手柄失联：速度立即清零，不滑行
 
         self.prev_buttons = buttons
 
