@@ -79,7 +79,7 @@ def test_scan_tolerates_imperfect_return_to_reference():
     fields = [240.0, 498.0, 154.0, 149.0, 605.0, 89.0]
     j = from_fields(fields)
     poses = plan_scan(j, fields)
-    assert len(poses) == 4
+    assert len(poses) == 5
     floor = geom.gripper_tip(j, False)[2] - .002
     for base_error in (-1.0, 1.0):
         returned = dict(j, base=j['base'] + base_error)

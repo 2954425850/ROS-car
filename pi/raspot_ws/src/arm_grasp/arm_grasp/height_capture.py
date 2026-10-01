@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 from . import geom
-from .arm_kin import FIELD_HI, FIELD_LO, from_fields, to_fields
+from .arm_kin import FIELD_HI, FIELD_LO, fk, from_fields, to_fields
 from .height import HeightRefused
 from .height_vision import calibration_id, calibration_record
 from .servo import ik_open_m, limit_step
@@ -23,7 +23,11 @@ from .servo import ik_open_m, limit_step
 @dataclass(frozen=True)
 class ScanConfig:
     lateral_m: float = .025
-    lift_m: float = .018
+    # Forward/back at constant tip height: shoulder/elbow/wrist are accurate
+    # (<2 deg on real data) and the move is across the line of sight. The old
+    # lift moved mostly along it (<2 deg parallax), and the base alone stalls
+    # several degrees short (real +side move gave a 7.7 mm baseline).
+    radial_m: float = .02
     max_tip_travel_m: float = .035
     max_joint_travel_deg: float = 12.0
     # Planned excursions leave room for the arm not returning exactly to the
@@ -96,18 +100,28 @@ def plan_scan(joints, fields, config=None):
     lateral = np.array([-math.sin(yaw), math.cos(yaw), 0.])
     radial = np.array([math.cos(yaw), math.sin(yaw), 0.])
     alpha = joints['shoulder'] + joints['elbow'] + joints['wrist_pitch']
-    offsets = [cfg.lateral_m * lateral, -cfg.lateral_m * lateral,
-               -.01 * radial + np.array([0., 0., cfg.lift_m]),
-               cfg.lateral_m * .65 * lateral + np.array([0., 0., cfg.lift_m])]
+    offsets = [cfg.radial_m * radial, -cfg.radial_m * radial,
+               cfg.lateral_m * lateral, -cfg.lateral_m * lateral]
     poses = [dict(joints)]
     skipped = []
+    centre0 = np.array(geom.camera_center(joints))
+    axis0 = np.array(fk(joints)[1])
+    def sideways(candidate):
+        # Parallax comes from camera motion across the line of sight; motion
+        # along it (or a pure pitch rotation) adds little.
+        d = np.array(geom.camera_center(candidate)) - centre0
+        return float(np.linalg.norm(d - (d @ axis0) * axis0))
     # Every excursion returns through the reference pose: larger opposite-side
     # moves must not sneak through a 35 mm per-segment constraint.
     for delta in offsets:
         # Small pitch changes can move the elbow away from the resting limit
-        # while keeping the tip at/above the observation height. Actual camera
-        # translations and rotations will be measured at each stationary view.
-        found = False
+        # while keeping the tip at/above the observation height. Among all
+        # candidates that pass every safety check, keep the one that moves the
+        # camera most across its view (a folded resting pose cannot do a pure
+        # 20 mm radial move inside the joint-travel cap, and the first legal
+        # candidate there mostly rotated the camera). Actual camera poses
+        # are measured at each stationary view.
+        best = None
         for scale in (1., .9, .75, .6):
             for da in (0., -4., 4., -8., 8.):
                 try:
@@ -121,13 +135,10 @@ def plan_scan(joints, fields, config=None):
                 except ValueError as e:
                     skipped.append(str(e))
                     continue
-                poses.append(candidate)
-                found = True
-                break
-            if found:
-                break
-        if len(poses) == 4:
-            break
+                if best is None or sideways(candidate) > sideways(best):
+                    best = candidate
+        if best is not None:
+            poses.append(best)
     if len(poses) < 3:
         raise HeightRefused('too few bounded scan poses: %s' % '; '.join(skipped))
     centres = np.array([geom.camera_center(j) for j in poses])

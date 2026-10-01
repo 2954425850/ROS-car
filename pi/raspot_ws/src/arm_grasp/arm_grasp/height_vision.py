@@ -10,6 +10,7 @@ import numpy as np
 
 from . import geom, arm_kin
 from .height import HeightConfig, HeightRefused, measure_cloud, triangulate
+from .height_refine import refine_poses
 
 
 def calibration_record():
@@ -107,7 +108,8 @@ def mutual_matches(desc_ref, desc_other, ratio=.7):
     return {i: j for i, j in forward.items() if backward.get(j) == i}
 
 
-def reconstruct_tracks(images, views, box, config=None, contrast_threshold=None):
+def match_tracks(images, box, config=None, contrast_threshold=None):
+    """Reference features seen in at least three views; no geometry applied."""
     cfg = config or HeightConfig()
     cv2.setRNGSeed(cfg.seed)
     foreground, support_mask = region_masks(images[0], box)
@@ -134,7 +136,7 @@ def reconstruct_tracks(images, views, box, config=None, contrast_threshold=None)
     if descriptors[0] is None:
         raise HeightRefused('insufficient texture in object/support region')
     mappings = [mutual_matches(descriptors[0], other) for other in descriptors[1:]]
-    tracks, rejected, used = [], 0, set()
+    candidates, used = [], set()
     for index, kp in enumerate(keypoints[0]):
         cell = tuple(int(q // 4) for q in kp.pt)
         if cell in used:
@@ -143,6 +145,22 @@ def reconstruct_tracks(images, views, box, config=None, contrast_threshold=None)
                                  for j, mapping in enumerate(mappings) if index in mapping]
         if len(visible) < 3:
             continue
+        used.add(cell)
+        u, v = map(lambda q: int(round(q)), kp.pt)
+        candidates.append({'kind': 'target' if foreground[v, u] else 'support',
+                           'pixel': list(kp.pt), 'visible': visible})
+    return candidates, {'reference_features': len(keypoints[0]),
+                        'sift_contrast_threshold': threshold,
+                        'pair_matches': [len(m) for m in mappings]}
+
+
+def gate_tracks(candidates, views, config=None):
+    """Triangulate candidates with the given poses; keep geometrically sound ones."""
+    cfg = config or HeightConfig()
+    centres_all = [np.array(geom.camera_center(v['joints'])) for v in views]
+    tracks, rejected = [], 0
+    for cand in candidates:
+        visible = cand['visible']
         centres, directions = [], []
         for j, pixel in visible:
             c, d = geom.pixel_ray(views[j]['joints'], *geom.to_ai(*pixel))
@@ -156,25 +174,50 @@ def reconstruct_tracks(images, views, box, config=None, contrast_threshold=None)
                 errors.append(float(np.linalg.norm(np.array(predicted) - pixel)))
             if max(errors) > cfg.max_reprojection_px:
                 raise HeightRefused('reprojection error')
-            # Each pair is a separate depth estimate, sharing only the reference ray.
-            split_a = triangulate([centres[0], centres[1]], [directions[0], directions[1]], cfg)
-            split_b = triangulate([centres[0], centres[-1]], [directions[0], directions[-1]], cfg)
+            # Two separate two-view depth estimates that share at most one ray:
+            # the widest pair, then the widest pair not repeating it. Pairs
+            # need not include the reference - on the real arm every move
+            # from it was short (base stall, folded resting pose) while the
+            # left/right views were far apart.
+            pairs = sorted(((i, k) for i in range(len(visible)) for k in range(i + 1, len(visible))),
+                           key=lambda q: -np.linalg.norm(centres_all[visible[q[0]][0]]
+                                                         - centres_all[visible[q[1]][0]]))
+            pa = pairs[0]
+            pb = next(q for q in pairs[1:] if len(set(q) & set(pa)) <= 1)
+            split_a = triangulate([centres[i] for i in pa], [directions[i] for i in pa], cfg)
+            split_b = triangulate([centres[i] for i in pb], [directions[i] for i in pb], cfg)
             if np.linalg.norm(np.array(split_a['point_m']) - split_b['point_m']) > cfg.max_split_point_m:
                 raise HeightRefused('split-view point disagreement')
         except (HeightRefused, ValueError):
             rejected += 1
             continue
-        u, v = map(lambda q: int(round(q)), kp.pt)
-        kind = 'target' if foreground[v, u] else 'support'
-        used.add(cell)
-        tracks.append({'kind': kind, 'pixel': list(kp.pt), 'point_m': result['point_m'],
+        tracks.append({'kind': cand['kind'], 'pixel': cand['pixel'], 'point_m': result['point_m'],
                        'split_a': split_a['point_m'], 'split_b': split_b['point_m'],
                        'views': [j for j, _ in visible], 'reprojection_px': max(errors),
                        'parallax_deg': result['parallax_deg'], 'ray_rms_m': result['ray_rms_m']})
-    return tracks, {'reference_features': len(keypoints[0]),
-                    'sift_contrast_threshold': threshold,
-                    'pair_matches': [len(m) for m in mappings],
-                    'rejected_geometric_tracks': rejected}
+    return tracks, rejected
+
+
+def reconstruct_tracks(images, views, box, config=None, contrast_threshold=None):
+    candidates, counts = match_tracks(images, box, config, contrast_threshold)
+    tracks, rejected = gate_tracks(candidates, views, config)
+    counts['rejected_geometric_tracks'] = rejected
+    return tracks, counts
+
+
+def refined_tracks(images, views, box, config=None, contrast_threshold=None, refine=True):
+    """Match, optionally refine the measured poses from the images, then gate."""
+    candidates, counts = match_tracks(images, box, config, contrast_threshold)
+    if refine:
+        observations = [(t, j, tuple(p)) for t, cand in enumerate(candidates)
+                        for j, p in cand['visible']]
+        try:
+            views, counts['pose_refinement'] = refine_poses(views, observations)
+        except HeightRefused as e:
+            e.diagnostics.update(counts)
+            raise
+    tracks, counts['rejected_geometric_tracks'] = gate_tracks(candidates, views, config)
+    return tracks, counts
 
 
 def _measure_tracks(tracks, cfg, field='point_m'):
@@ -193,15 +236,16 @@ def _measure_tracks(tracks, cfg, field='point_m'):
     return report, top_pixels
 
 
-def measure_session(path, config=None):
+def measure_session(path, config=None, refine=True):
     cfg, start = config or HeightConfig(), time.monotonic()
     session, images = load_session(path)
-    tracks, counts = reconstruct_tracks(images, session['views'], session['reference_box'], cfg)
+    views, box = session['views'], session['reference_box']
+    tracks, counts = refined_tracks(images, views, box, cfg, refine=refine)
     if (sum(t['kind'] == 'support' for t in tracks) < cfg.min_support_points
             and counts['sift_contrast_threshold'] > .01):
         strong_support = sum(t['kind'] == 'support' for t in tracks)
-        tracks, counts = reconstruct_tracks(images, session['views'], session['reference_box'], cfg,
-                                             contrast_threshold=.01)
+        tracks, counts = refined_tracks(images, views, box, cfg, contrast_threshold=.01,
+                                        refine=refine)
         counts.update(detector_retries=1, strong_pass_support_tracks=strong_support)
     try:
         return _finish_measurement(path, cfg, start, session, tracks, counts)

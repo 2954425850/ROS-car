@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from arm_grasp import geom
-from arm_grasp.arm_kin import fk, to_fields
+from arm_grasp.arm_kin import BASE_SCALE, FACTOR, fk, from_fields, to_fields
 from arm_grasp.cam_model import tool_axes
 from arm_grasp.height import HeightRefused
 from arm_grasp.height_vision import calibration_id, load_session, measure_session
@@ -51,7 +51,7 @@ def render(joints, background, top):
     return bg
 
 
-def make_session(tmp_path, textured=True, weak_support=False):
+def make_session(tmp_path, textured=True, weak_support=False, reading_bias=None):
     poses = [ik_open_m(*p, -75) for p in [( .16, -.02, .04), (.16, .005, .04),
                                           (.16, -.045, .04), (.15, -.02, .06)]]
     bg = texture(10) if textured else np.full((900, 900, 3), 180, np.uint8)
@@ -62,7 +62,13 @@ def make_session(tmp_path, textured=True, weak_support=False):
     for i, j in enumerate(poses):
         name = 'view-%d.jpg' % i
         cv2.imwrite(str(tmp_path / name), render(j, bg, top))
-        views.append({'image': name, 'joints': j, 'fields': to_fields(j, 240, 496)})
+        fields = to_fields(j, 240, 496)
+        if reading_bias:
+            # Images come from the true pose; the recorded readback is off.
+            base_deg, pitch_deg = reading_bias[i]
+            fields[5] += base_deg * BASE_SCALE
+            fields[2] += pitch_deg * FACTOR
+        views.append({'image': name, 'joints': from_fields(fields), 'fields': fields})
     corners = [geom.to_stream(*geom.project(poses[0], p))
                for p in [(.202, -.038, -.04), (.238, -.038, -.04),
                          (.238, -.002, -.04), (.202, -.002, -.04)]]
@@ -84,6 +90,31 @@ def test_textured_images_recover_metric_height(tmp_path):
     assert report['top_z_m'] == pytest.approx(-.04, abs=.002)
     assert report['quality']['accuracy_verified'] is False
     assert report['quality']['top_inliers'] >= 10
+
+
+# Readback errors of the size seen on the real arm (base off 3-5 deg).
+REAL_BIAS = [(0., 0.), (3.4, -.4), (3.2, 0.), (5.3, -1.3)]
+
+
+def test_biased_base_readback_is_refused_without_refinement(tmp_path):
+    with pytest.raises(HeightRefused, match='tracks'):
+        measure_session(make_session(tmp_path, reading_bias=REAL_BIAS), refine=False)
+
+
+def test_pose_refinement_recovers_height_from_biased_readback(tmp_path):
+    report = measure_session(make_session(tmp_path, reading_bias=REAL_BIAS))
+    assert report['object_height_m'] == pytest.approx(.03, abs=.002)
+    refinement = report['quality']['pose_refinement']
+    for offsets, (base_deg, pitch_deg) in zip(refinement['offsets_deg'], REAL_BIAS[1:]):
+        assert offsets['base'] == pytest.approx(-base_deg, abs=.3)
+        assert offsets['wrist_pitch'] == pytest.approx(-pitch_deg, abs=.3)
+    assert refinement['reprojection_px_median_after'] < 1
+
+
+def test_pose_refinement_refuses_implausible_corrections(tmp_path):
+    bias = [(0., 0.), (12., 0.), (-12., 0.), (12., 0.)]
+    with pytest.raises(HeightRefused, match='beyond bounds|tracks'):
+        measure_session(make_session(tmp_path, reading_bias=bias))
 
 
 def test_untextured_scene_refuses_instead_of_guessing(tmp_path):
