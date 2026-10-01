@@ -32,8 +32,10 @@ class ScanConfig:
     max_step_deg: float = 1.5
     min_field_margin: float = 8.0
     max_feedback_undershoot: float = 8.0
-    # Stationary readout noise seen live: wrist roll 495-499 around 496.
-    max_feedback_drift: float = 3.0
+    # Motion = the median pose moving; noise = single readings scattering.
+    # Live stationary scatter: wrist roll 495-499, loaded shoulder 610-614.
+    max_feedback_drift: float = 2.0
+    max_feedback_spike: float = 6.0
     arrived_tolerance: float = 12.0
     stationary_seconds: float = .6
     move_timeout_s: float = 12.0
@@ -170,7 +172,9 @@ def stationary_feedback(io, hold_fields=None, config=None, timeout=None,
         window = [(t, f) for t, f in window if now - t <= cfg.stationary_seconds + .2]
         samples = np.array([f for _, f in window])
         if (len(window) >= 5 and now - window[0][0] >= cfg.stationary_seconds
-                and _max_deviation(samples) <= cfg.max_feedback_drift):
+                and _max_deviation(samples) <= cfg.max_feedback_spike
+                and _median_shift(samples[:len(samples) // 2],
+                                  samples[len(samples) // 2:]) <= cfg.max_feedback_drift):
             return np.median(samples, axis=0).tolist()
     raise HeightRefused('fresh stationary feedback timeout')
 
@@ -194,14 +198,20 @@ def move_to(io, joints, hold_fields, config=None, publish=publish_fields, floor_
 
 
 def _max_deviation(values):
-    """Largest joint reading distance from the median pose that will be recorded.
+    """Largest single joint reading distance from the median pose.
 
-    Stationary servos read +/-2-3 counts of noise (seen live: wrist pitch
-    153-157, wrist roll 495-499), so a peak-to-peak gate rejects good frames.
-    A sustained move still shifts samples away from the median and is refused.
+    Stationary servos scatter by several counts (live: wrist pitch 153-157,
+    wrist roll 495-499, loaded shoulder 610-614 around a 612.7 command), so
+    single readings only bound gross glitches/jumps. Motion is judged by the
+    median moving (_median_shift); the recorded pose is the median.
     """
     values = np.array(values, dtype=float)[:, 1:]
     return float(np.max(np.abs(values - np.median(values, axis=0))))
+
+
+def _median_shift(a, b):
+    a, b = np.array(a, dtype=float)[:, 1:], np.array(b, dtype=float)[:, 1:]
+    return float(np.max(np.abs(np.median(a, axis=0) - np.median(b, axis=0))))
 
 
 def _drift_diagnostics(hold_fields, values):
@@ -234,7 +244,7 @@ def snapshot(io, host, path, hold_fields, config=None, capture=None,
                     values.append(fields)
                     fresh_count += 1
                     last_fresh = time.monotonic()
-                    if _max_deviation(values) > cfg.max_feedback_drift:
+                    if _max_deviation(values) > cfg.max_feedback_spike:
                         raise HeightRefused('feedback drift during exposure; image discarded',
                                             _drift_diagnostics(hold_fields, values))
             if time.monotonic() - last_fresh > .5:
@@ -244,8 +254,9 @@ def snapshot(io, host, path, hold_fields, config=None, capture=None,
     if fresh_count < 3:
         raise HeightRefused('too few fresh feedback samples during exposure')
     after = stationary_feedback(io, hold_fields, cfg, publish=publish)
+    exposure = values[1:]
     values.append(after)
-    if _max_deviation(values) > cfg.max_feedback_drift:
+    if max(_median_shift(exposure, [before]), _median_shift([after], [before])) > cfg.max_feedback_drift:
         raise HeightRefused('feedback changed across exposure; image discarded',
                             _drift_diagnostics(hold_fields, values))
     fields = np.median(np.array(values), axis=0).tolist()

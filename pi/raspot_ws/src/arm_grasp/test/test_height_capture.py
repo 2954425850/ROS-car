@@ -96,6 +96,8 @@ class FakeIO:
         self.glitch_at = None
         self.base_pitch = self.fb[2]
         self.base_roll = self.fb[1]
+        self.base_shoulder = self.fb[4]
+        self.creep = False
 
     def spin(self, seconds):
         time.sleep(.01)
@@ -111,6 +113,10 @@ class FakeIO:
             self.fb[2] = self.base_pitch + (-1, 1, -2, 0, 1, -1)[self.fb_n % 6]
             # Real stationary wrist roll: 495-499 around 496.
             self.fb[1] = self.base_roll + (0, 0, -1, 1, 0, 3, 0, 0)[self.fb_n % 8]
+            # Real loaded shoulder: 610, 612, 610, 611, 614, 610.
+            self.fb[4] = self.base_shoulder + (-1, 1, -1, 0, 3, -1)[self.fb_n % 6]
+        if self.creep and self.fb_n % 3 == 0:
+            self.fb[4] += 1.0
 
 
 def test_snapshot_records_fresh_measured_pose(tmp_path):
@@ -215,7 +221,7 @@ def test_snapshot_rejects_motion_during_capture(tmp_path):
     io = FakeIO()
     def capture(path, host, timeout):
         io.drift = True
-        time.sleep(.08)
+        time.sleep(.2)
         return True
     with pytest.raises(HeightRefused, match='drift') as refused:
         snapshot(io, 'fake', tmp_path / 'raw.jpg', list(io.fb),
@@ -224,6 +230,19 @@ def test_snapshot_rejects_motion_during_capture(tmp_path):
     diagnostics = refused.value.diagnostics
     assert max(diagnostics['feedback_span_counts'][1:]) > 2
     assert len(diagnostics['feedback_samples']) >= 2
+
+
+def test_snapshot_rejects_slow_creep_without_spikes(tmp_path):
+    io = FakeIO()
+    def capture(path, host, timeout):
+        io.creep = True
+        time.sleep(.12)
+        io.creep = False
+        return True
+    with pytest.raises(HeightRefused, match='changed across exposure'):
+        snapshot(io, 'fake', tmp_path / 'raw.jpg', list(io.fb),
+                 ScanConfig(stationary_seconds=.03), capture,
+                 publish=lambda *_: None)
 
 
 def test_failed_or_nonfinite_report_has_no_fallback_height():
