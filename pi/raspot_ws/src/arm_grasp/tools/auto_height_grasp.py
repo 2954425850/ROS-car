@@ -169,7 +169,8 @@ def run_auto_height(args):
     except (ValueError, OSError, RuntimeError, ImportError) as e:
         print('自动测高流程失败：%s；不使用手填/默认高度继续抓取。' % e)
         if directory is not None and directory.exists() and not (directory / 'height-report.json').exists():
-            write_report(directory, {'schema': 'arm_grasp.height/v1', 'ok': False, 'reason': str(e)})
+            write_report(directory, {'schema': 'arm_grasp.height/v1', 'ok': False, 'reason': str(e),
+                                     'diagnostics': getattr(e, 'diagnostics', {})})
         return 1
     finally:
         cleanup_errors = []
