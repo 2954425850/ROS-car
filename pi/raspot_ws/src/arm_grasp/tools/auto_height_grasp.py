@@ -145,7 +145,7 @@ def run_auto_height(args):
         directory = Path(args.height_out or '~/arm-height').expanduser() / (
             time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
         # Snapshot supports raw imaging without locking a potentially stale ROI.
-        session_path = capture_scan(io, host, box, directory)
+        session_path = capture_scan(io, host, box, directory, reference_command=start_fields)
         try:
             report = measure_session(session_path)
             save_diagnostic(session_path, report, directory / 'height-report.jpg')

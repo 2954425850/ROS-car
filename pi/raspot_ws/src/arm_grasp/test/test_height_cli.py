@@ -57,7 +57,7 @@ def test_failed_live_measurement_restores_driver_and_service(cli, monkeypatch, t
     monkeypatch.setattr(collect, '_svc_active', lambda: 'inactive')
     monkeypatch.setattr(collect, '_start_driver', lambda _: calls.append('driver-start') or 'driver')
     monkeypatch.setattr(collect, '_stop_driver', lambda _: calls.append('driver-stop'))
-    def capture(io, host, box, directory):
+    def capture(io, host, box, directory, **_):
         directory.mkdir(parents=True)
         path = directory / 'session.json'
         path.write_text('{}')
@@ -96,7 +96,7 @@ def test_successful_grasp_ends_lifted_with_last_command(cli, monkeypatch, tmp_pa
     monkeypatch.setattr(collect, '_svc_active', lambda: 'inactive')
     monkeypatch.setattr(collect, '_start_driver', lambda _: 'driver')
     monkeypatch.setattr(collect, '_stop_driver', lambda _: None)
-    def capture(io, host, box, directory):
+    def capture(io, host, box, directory, **_):
         directory.mkdir(parents=True)
         return directory / 'session.json'
     monkeypatch.setattr(wiring, 'capture_scan', capture)

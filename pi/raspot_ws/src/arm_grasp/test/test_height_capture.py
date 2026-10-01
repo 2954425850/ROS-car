@@ -171,7 +171,8 @@ def test_snapshot_skips_unread_servo_sample(tmp_path):
 
 
 class SaggingArm:
-    """Shoulder settles 4 counts under every command; the base velocity loop
+    """Loaded shoulder reads 4 counts past every command (arm lower, as live:
+    605 commanded, 610 read); the base velocity loop
     stalls 3 counts short of a target it has to move to, and stays put when
     the target is within its deadband."""
 
@@ -188,7 +189,7 @@ class SaggingArm:
         base, error = self.fb[5], command[5] - self.fb[5]
         if abs(error) > 3.0:
             base = command[5] - 3.0 * np.sign(error)
-        self.fb = command[:4] + [command[4] - 4.0, base]
+        self.fb = command[:4] + [command[4] + 4.0, base]
 
     def spin(self, seconds):
         time.sleep(.002)
@@ -218,6 +219,24 @@ def test_scan_holds_planned_command_not_sagged_reading(tmp_path):
         stalled = planned[5] - 3.0 * np.sign(planned[5] - reference_fields[5])
         if abs(planned[5] - reference_fields[5]) > 3.0:
             assert all(c[5] == pytest.approx(stalled) for c in commands)
+
+
+def test_first_view_holds_the_reference_command(tmp_path):
+    io = SaggingArm()
+    command = list(io.fb)
+    command[4] -= 4.0           # the arm reads 4 counts past (lower than) it
+    io.publish(io, command)
+    exposures = []
+    def capture(path, host, timeout):
+        io.capturing, io.exposure_commands = True, []
+        time.sleep(.05)
+        io.capturing = False
+        exposures.append(io.exposure_commands)
+        return True
+    capture_scan(io, 'fake', [.4, .35, .6, .6], tmp_path / 'scan',
+                 ScanConfig(stationary_seconds=.03), capture, log=lambda *_: None,
+                 publish=io.publish, reference_command=command)
+    assert exposures[0] and all(c == pytest.approx(bounded_fields(command)) for c in exposures[0])
 
 
 def test_failed_scan_returns_to_reference(tmp_path):

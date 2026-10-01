@@ -372,12 +372,18 @@ def restore_pose(io, fields, config=None, publish=publish_fields, home_timeout=4
 
 
 def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
-                 publish=publish_fields):
+                 publish=publish_fields, reference_command=None):
     cfg, start = config or ScanConfig(), time.monotonic()
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=False)
     fields = stationary_feedback(io, config=cfg)
     reference = from_fields(fields)
+    # Hold the reference with the command that put the arm there, not with
+    # its sagged reading: re-commanding the reading lowers the target and the
+    # shoulder sags again mid-exposure (live: 610 -> 612.5 on the first view).
+    home_fields = list(map(float, reference_command if reference_command is not None
+                           else fields))
+    home = from_fields(home_fields)
     poses = plan_scan(reference, fields, cfg, box)
     floor_z = geom.gripper_tip(reference, closed=False)[2] - .002
     session = {'schema': 'arm_grasp.height_session/v1', 'coordinate_frame': 'raw_stream',
@@ -388,7 +394,7 @@ def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
     try:
         for i, pose in enumerate(poses):
             if i:
-                move_to(io, reference, fields, cfg, publish=publish, floor_z=floor_z,
+                move_to(io, home, home_fields, cfg, publish=publish, floor_z=floor_z,
                         require_margin=False)
                 settled = move_to(io, pose, fields, cfg, publish=publish, floor_z=floor_z)
                 # Position servos keep the command that reached this pose:
@@ -402,12 +408,12 @@ def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
                 hold = to_fields(pose, fields[0], fields[1])
                 hold[5] = settled[5]
             else:
-                hold = fields
+                hold = home_fields
             log('测高观察 %d/%d：停稳拍摄' % (i + 1, len(poses)))
             view = snapshot(io, host, directory / ('view-%02d.jpg' % i), hold, cfg, capture,
                             publish=publish)
             session['views'].append(view)
-        move_to(io, reference, fields, cfg, publish=publish, floor_z=floor_z,
+        move_to(io, home, home_fields, cfg, publish=publish, floor_z=floor_z,
                 require_margin=False)
         session['complete'] = True
     except BaseException as e:
@@ -417,7 +423,7 @@ def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
             # the other joints but not the base, so an abandoned excursion
             # silently re-aims the next run (live: base crept 36 -> 114).
             try:
-                move_to(io, reference, fields, cfg, publish=publish, floor_z=floor_z,
+                move_to(io, home, home_fields, cfg, publish=publish, floor_z=floor_z,
                         require_margin=False)
                 session['returned_to_reference'] = True
             except Exception as back:
