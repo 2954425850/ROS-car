@@ -94,6 +94,7 @@ class FakeIO:
         self.jitter = False
         self.glitch_at = None
         self.base_pitch = self.fb[2]
+        self.base_roll = self.fb[1]
 
     def spin(self, seconds):
         time.sleep(.01)
@@ -107,6 +108,8 @@ class FakeIO:
         if self.jitter:
             # Real stationary wrist pitch: 154-157 counts while holding 156.
             self.fb[2] = self.base_pitch + (-1, 1, -2, 0, 1, -1)[self.fb_n % 6]
+            # Real stationary wrist roll: 495-499 around 496.
+            self.fb[1] = self.base_roll + (0, 0, -1, 1, 0, 3, 0, 0)[self.fb_n % 8]
 
 
 def test_snapshot_records_fresh_measured_pose(tmp_path):

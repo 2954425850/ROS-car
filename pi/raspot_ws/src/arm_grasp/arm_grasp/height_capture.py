@@ -32,7 +32,8 @@ class ScanConfig:
     max_step_deg: float = 1.5
     min_field_margin: float = 8.0
     max_feedback_undershoot: float = 8.0
-    max_feedback_drift: float = 2.0
+    # Stationary readout noise seen live: wrist roll 495-499 around 496.
+    max_feedback_drift: float = 3.0
     arrived_tolerance: float = 12.0
     stationary_seconds: float = .6
     move_timeout_s: float = 12.0
@@ -195,8 +196,8 @@ def move_to(io, joints, hold_fields, config=None, publish=publish_fields, floor_
 def _max_deviation(values):
     """Largest joint reading distance from the median pose that will be recorded.
 
-    Stationary servos dither by +/-1-2 counts (seen on the real wrist pitch:
-    154-157 while holding 156), so a peak-to-peak gate rejects good frames.
+    Stationary servos read +/-2-3 counts of noise (seen live: wrist pitch
+    153-157, wrist roll 495-499), so a peak-to-peak gate rejects good frames.
     A sustained move still shifts samples away from the median and is refused.
     """
     values = np.array(values, dtype=float)[:, 1:]
