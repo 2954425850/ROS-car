@@ -161,7 +161,7 @@ def stationary_feedback(io, hold_fields=None, config=None, timeout=None,
         window = [(t, f) for t, f in window if now - t <= cfg.stationary_seconds + .2]
         samples = np.array([f for _, f in window])
         if (len(window) >= 5 and now - window[0][0] >= cfg.stationary_seconds
-                and np.max(np.ptp(samples[:, 1:], axis=0)) <= cfg.max_feedback_drift):
+                and _max_deviation(samples) <= cfg.max_feedback_drift):
             return np.median(samples, axis=0).tolist()
     raise HeightRefused('fresh stationary feedback timeout')
 
@@ -182,6 +182,17 @@ def move_to(io, joints, hold_fields, config=None, publish=publish_fields, floor_
             return stationary_feedback(io, to_fields(joints, hold_fields[0], hold_fields[1]),
                                        cfg, publish=publish)
     raise HeightRefused('scan motion timeout')
+
+
+def _max_deviation(values):
+    """Largest joint reading distance from the median pose that will be recorded.
+
+    Stationary servos dither by +/-1-2 counts (seen on the real wrist pitch:
+    154-157 while holding 156), so a peak-to-peak gate rejects good frames.
+    A sustained move still shifts samples away from the median and is refused.
+    """
+    values = np.array(values, dtype=float)[:, 1:]
+    return float(np.max(np.abs(values - np.median(values, axis=0))))
 
 
 def _drift_diagnostics(hold_fields, values):
@@ -214,7 +225,7 @@ def snapshot(io, host, path, hold_fields, config=None, capture=None,
                     values.append(fields)
                     fresh_count += 1
                     last_fresh = time.monotonic()
-                    if np.max(np.ptp(np.array(values)[:, 1:], axis=0)) > cfg.max_feedback_drift:
+                    if _max_deviation(values) > cfg.max_feedback_drift:
                         raise HeightRefused('feedback drift during exposure; image discarded',
                                             _drift_diagnostics(hold_fields, values))
             if time.monotonic() - last_fresh > .5:
@@ -225,7 +236,7 @@ def snapshot(io, host, path, hold_fields, config=None, capture=None,
         raise HeightRefused('too few fresh feedback samples during exposure')
     after = stationary_feedback(io, hold_fields, cfg, publish=publish)
     values.append(after)
-    if np.max(np.ptp(np.array(values)[:, 1:], axis=0)) > cfg.max_feedback_drift:
+    if _max_deviation(values) > cfg.max_feedback_drift:
         raise HeightRefused('feedback changed across exposure; image discarded',
                             _drift_diagnostics(hold_fields, values))
     fields = np.median(np.array(values), axis=0).tolist()

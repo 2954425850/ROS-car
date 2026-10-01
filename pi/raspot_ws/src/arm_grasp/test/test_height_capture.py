@@ -76,12 +76,17 @@ class FakeIO:
         self.fb = observer()[1]
         self.fb_n = 0
         self.drift = False
+        self.jitter = False
+        self.base_pitch = self.fb[2]
 
     def spin(self, seconds):
         time.sleep(.01)
         self.fb_n += 1
         if self.drift:
             self.fb[3] += 1.0
+        if self.jitter:
+            # Real stationary wrist pitch: 154-157 counts while holding 156.
+            self.fb[2] = self.base_pitch + (-1, 1, -2, 0, 1, -1)[self.fb_n % 6]
 
 
 def test_snapshot_records_fresh_measured_pose(tmp_path):
@@ -94,6 +99,19 @@ def test_snapshot_records_fresh_measured_pose(tmp_path):
                     publish=lambda *_: None)
     assert view['feedback_samples'] >= 3
     assert view['fields'] == pytest.approx(io.fb)
+
+
+def test_snapshot_accepts_stationary_count_jitter(tmp_path):
+    io = FakeIO()
+    io.jitter = True
+    def capture(path, host, timeout):
+        time.sleep(.08)
+        return True
+    view = snapshot(io, 'fake', tmp_path / 'raw.jpg', list(io.fb),
+                    ScanConfig(stationary_seconds=.03), capture,
+                    publish=lambda *_: None)
+    assert view['feedback_span_counts'][2] == 3
+    assert view['fields'][2] == pytest.approx(io.base_pitch, abs=.5)
 
 
 def test_snapshot_rejects_motion_during_capture(tmp_path):
