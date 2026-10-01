@@ -152,11 +152,17 @@ class GraspLink(ArmLink):
 
     `obs()` 的契约（`grasp.Link`）：**自上一拍以来最新的一条**，没有就 `None`。
     去重靠板子的 `frame` 号（板子时间戳只有秒级，用不了；design §5.1）。
+
+    2026-10-01 复查改的两处：
+      * 挑框用 `observe.BoxFollower`（参考框跟着目标走）。旧写法每拍拿**人画的框**比 IoU，
+        相机一动目标在画面里挪走 ⇒ IoU<0.2 ⇒ 板子还在发跟踪框，这里整条扔掉。
+      * 观测时刻 = 现在 − 结果文件的年龄（mtime），不是"读到的那一刻"——文件最旧可到 1.5s。
     """
 
     def __init__(self, io, host, want_norm, hz=10.0):
         super().__init__(io, (0.0, 0.0, 0.0), hz=hz)   # ArmLink 的模型相机在这里用不上
         self.host, self.want = host, want_norm
+        self.follow = observe.BoxFollower(want_norm)
         self.last_frame = None
         self.last_box = None
         self.last_src = None
@@ -164,18 +170,21 @@ class GraspLink(ArmLink):
         self.n_none = 0       # 结果流里挑不出框（跟踪丢了 / IoU 不达标）的拍数
 
     def obs(self):
-        r = observe.fresh_result()
-        if r is None or r.get('frame') == self.last_frame:
+        got = observe.fresh_result_aged()
+        if got is None:
+            return None
+        r, age = got
+        if r.get('frame') == self.last_frame:
             return None                      # 没新帧 / 文件还没刷新 ⇒ 这拍没有观测
         self.last_frame = r.get('frame')
-        b = observe.pick_box(r, self.want)
+        b = self.follow.pick(r)
         if b is None:
             self.n_none += 1
             return None
         self.last_box, self.last_src = b['box'], b.get('src', 'det')
         u, v = observe.box_center_ai(b['box'])
         self.n_obs += 1
-        return grasp.Obs(self.now(), u, v, r.get('frame'), self.last_src, b['box'])
+        return grasp.Obs(self.now() - age, u, v, r.get('frame'), self.last_src, b['box'])
 
 
 # --------------------------------------------------------------------------

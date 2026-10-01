@@ -45,7 +45,8 @@ GraspConfig = namedtuple('GraspConfig',
     'min_step_deg close_step close_stall alpha_freeze_span bias_m '
     'base_comp base_comp_max '
     'joint_comp joint_comp_max '
-    'bias_r_m')
+    'bias_r_m '
+    's_lead_m lead_max_counts')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -67,7 +68,9 @@ GraspConfig.__new__.__defaults__ = (
     #   （实测耗了 ~390 拍 = 39s，而旧上限正是 400 拍 ⇒ `[close]` 刚起步就被掐掉、整轮白跑）。
     #   拍数上限必须**明显大于**最慢那一相，否则会出现"前面都对、最后一步没时间做"。
     6.0, 10.0, 150.0, 1500,
-    0.002, 10.0, 4, 0.0005,
+    # patience = 25 拍（10Hz = 2.5s）：和 grasp_once 真机默认一致。它必须**明显长于回读滞后**
+    #   （~0.2~0.4s）——否则每次换相刚起步、回读还没开始动，就被误判"卡住"。
+    0.002, 10.0, 25, 0.0005,
     0.020, 0.040, 0.35, 0.03,
     # deadband_counts = 10：实测**带载**（臂自重）下位置环死区稳态误差 5.6~6.6 count，
     # 取 10 留一档余量（定 6.0 时刚好卡在门外 ⇒ 判据不满足 ⇒ 白嗡嗡 2.5 秒才被"卡住"接管）。
@@ -102,6 +105,12 @@ GraspConfig.__new__.__defaults__ = (
     # bias_r_m：**沿半径**的静态偏置（米，+|向外/远离底座）。实测爪尖**几乎每次都偏后 ~1cm**
     #   = 舵机死区稳态残差 + 臂自重沉向那边；换方位角它还是径向 ⇒ 用径向的、不用固定向量。
     0.0,
+    # s_lead_m：下扎时留量**指令**最多领先回读多少（米）。指令按自己上一拍单调往下走，
+    #   回读落后超过这个量就原地等它（回读滞后 ~0.2~0.4s，不能拿滞后回读当起点，见 run()）。
+    # lead_max_counts：每拍限速的起点用**上一拍指令**；指令领先回读超过这么多 count
+    #   （= 臂跟不上 / 被挡住）就**原地等**（指令保持），免得指令一路跑飞。
+    #   不能"退回从回读起步"：那样指令会往回跳（0.4s 滞后下实测来回顶）。
+    0.015, 40.0,
 )
 
 
@@ -383,7 +392,7 @@ def run(cfg, link, phase='aim', log=print):
     rep = {'phase': phase, 'ticks': 0, 'stopped': None, 'ok': False,
            'O_last': None, 'obs_n': 0, 'obs_bad': 0, 'obs_lost': False,
            'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None, 'comp': None,
-           'target': None, 's_ach_m': None, 'rows': [], 'phases': []}
+           'target': None, 's_ach_m': None, 'rows': [], 'phases': [], 'O_phase_end': []}
     dt = 1.0 / cfg.hz
     j_ref, cmd_sent, f_prev, near = None, None, None, 0
     f_now = None          # 上一拍的 field（底座外环补偿要用；本拍的更晚才算）
@@ -400,6 +409,8 @@ def run(cfg, link, phase='aim', log=print):
     comps = None             # 肩/肘/腕的位置环下垂（p3/p4/p5，count）—— 交接处量一次
     p1_start = 0.0        # 'close' 相：进相时的 p1 回读（判"起振"的基准）
     close_armed = False   # 'close' 相：读回"真的动过"了没有（见 close 相那段注释）
+    grip_hold = None      # 'lift' 相：沿用 close 收尾时的 p1 指令（冻结值，**不是** close_field）
+    j_prev_cmd = None     # 上一拍的**未补偿**关节指令（限速的起点，见 ④）
     phase_ticks = 0       # 本相已走几拍
 
     def advance_or_stop(reason):
@@ -408,10 +419,11 @@ def run(cfg, link, phase='aim', log=print):
         只在这里改 `cur` 和每相计数 ⇒ 五个停止点各两行，不会漏复位某一项。
         """
         nonlocal cur, near, stall, best, phase_ticks, hold_j, j_ref, s_cmd
-        nonlocal close_cmd, close_stuck, p1_prev, p1_start, close_armed, comps
+        nonlocal close_cmd, close_stuck, p1_prev, p1_start, close_armed, comps, grip_hold
         # 第三项 = 本相走了几拍。**量"时间花在哪一相"全靠它**（47s 里到底是接近慢、
         # 下扎慢、还是合爪慢，不量就只能猜）。放最后一位，读 `p[0]/p[1]` 的调用方不受影响。
         rep['phases'].append((cur, reason, phase_ticks))
+        rep['O_phase_end'].append((cur, est.O))      # 每相收尾时在用的 O（查"下扎用的是哪个 O"）
         k = seq.index(cur) + 1
         if k >= len(seq):
             rep['stopped'] = reason
@@ -427,6 +439,10 @@ def run(cfg, link, phase='aim', log=print):
             comps = v
             log('  [下垂补偿] 量到 (目标−回读) = %s count ⇒ 下扎/抬起带着走'
                 % ['%+.1f' % x for x in v])
+        if cur == 'close':
+            # ★ 合爪收尾那一刻的 p1 指令带进抬起相（2026-10-01 复查）。旧写法下面把 close_cmd
+            #   清成 None、抬起相就落到 close_field(578) ⇒ "碰上东西就冻结"之后，**抬起时照样全力夹**。
+            grip_hold = close_cmd
         cur = seq[k]
         near, stall, best, phase_ticks = 0, 0, None, 0
         hold_j, j_ref, s_cmd = None, None, cfg.s_pre_m
@@ -480,6 +496,7 @@ def run(cfg, link, phase='aim', log=print):
         if est.O is None:
             if fbf is not None:                          # 还没见到目标 → 原地不动
                 cmd_sent = j_ref = to_fields(from_fields(fbf), cfg.gripper, cfg.wrist_roll)
+                j_prev_cmd = None
                 link.publish(cmd_sent)
             continue
         # ★ 目标点 + **静态偏置**：实测指尖总落在目标左边 1cm ⇒ 目标往右挪 1cm 抵掉。
@@ -502,7 +519,12 @@ def run(cfg, link, phase='aim', log=print):
             tip = tip_open_m(j_cur_m)
             s_ach_now = standoff_along_axis(tip, O_u, prev_alpha)
             step = max(cfg.s_min_step, cfg.s_frac * max(s_ach_now, 0.0))
-            s_cmd = max(cfg.s_stop_m, s_ach_now - step)
+            # ★★ 留量指令从**自己上一拍**单调往下走，回读只用来"别领先太多"（2026-10-01 复查）。
+            #   旧写法 `s_cmd = s_ach_now − step`：回读滞后 0.2~0.4s ⇒ `s_ach_now` 是臂**过去**
+            #   的位置 ⇒ 指令被算到臂已经走过的地方之上 ⇒ 臂被往回拽（带延迟的反馈环，又慢又顶）。
+            #   `min(s_cmd, s_ach_now)`：臂真比指令还低时以回读为准，不往回拉。
+            if s_ach_now - s_cmd < cfg.s_lead_m:
+                s_cmd = max(cfg.s_stop_m, min(s_cmd, s_ach_now) - step)
         elif cur == 'lift':
             # 抬起 = 沿 −ẑ 把留量从 s_stop 加到 s_stop+lift_m（目标点固定，不追）
             s_cmd = cfg.s_stop_m + cfg.lift_m
@@ -537,10 +559,16 @@ def run(cfg, link, phase='aim', log=print):
         if cur != 'close':
             prev_alpha = tgt.alpha
         # 合爪/抬起期间**夹爪保持闭合**（抬起时张开 = 把东西放回去 ✗）
-        grip_cmd = close_cmd if cur in ('close', 'lift') and close_cmd is not None \
-            else (cfg.close_field if cur == 'lift' else cfg.gripper)
-        if cur == 'lift':
-            grip_cmd = cfg.close_field
+        if cur == 'close':
+            grip_cmd = close_cmd
+        elif cur == 'lift':
+            # ★ 沿用合爪收尾时的指令（碰上东西冻结在哪就是哪），**不再拉到 close_field**。
+            #   单独跑 `--phase lift`（没走过 close）⇒ 保持进相时的真回读，不改夹爪状态。
+            if grip_hold is None:
+                grip_hold = p1_read
+            grip_cmd = grip_hold
+        else:
+            grip_cmd = cfg.gripper
         phase_ticks += 1
 
         # ④ 限速参考 + 发
@@ -551,8 +579,24 @@ def run(cfg, link, phase='aim', log=print):
         T_goal = axis_point(O_u, s_cmd, tgt.alpha)
         err_act = math.dist(tip_act, T_goal)
         s_ach = standoff_along_axis(tip_act, O_u, tgt.alpha)
-        j_cmd, ratio, reached = limit_step_floor(j_cur, tgt.joints,
-                                                 cfg.max_step_deg, cfg.min_step_deg)
+        # ★★ 限速的**起点**用上一拍的指令（未补偿的那份），不用回读（2026-10-01 复查）：
+        #   回读滞后 ~0.2~0.4s，从回读起步 ⇒ 每拍指令都被拽回臂"过去"的位置（和上面 s_cmd
+        #   是同一个病）。指令领先回读超过 `lead_max_counts`（臂跟不上/被挡住）⇒ **原地等**
+        #   （指令保持上一拍），不是退回从回读起步 —— 那样指令会往回跳（实测 0.4s 滞后下来回顶）。
+        #   被挡住时回读不动 ⇒ 照样由"卡住"判据接管。合爪相照旧从回读起步（关节本来就冻住）。
+        #   舵机死区也由此自然跨过：小步在指令上累积，攒够死区宽度舵机就动。
+        if j_prev_cmd is None or cur == 'close':
+            j_cmd, ratio, reached = limit_step_floor(j_cur, tgt.joints,
+                                                     cfg.max_step_deg, cfg.min_step_deg)
+        else:
+            f_prev_cmd = to_fields(j_prev_cmd, 0.0, 0.0)
+            f_rb = to_fields(j_cur, 0.0, 0.0)
+            if max(abs(f_prev_cmd[k] - f_rb[k]) for k in (2, 3, 4, 5)) <= cfg.lead_max_counts:
+                j_cmd, ratio, reached = limit_step_floor(j_prev_cmd, tgt.joints,
+                                                         cfg.max_step_deg, cfg.min_step_deg)
+            else:
+                j_cmd, ratio, reached = dict(j_prev_cmd), 0.0, False
+        j_prev_cmd = dict(j_cmd)
         # ★★ 判据查的是**目标**的 field，不是这一拍的**指令**：
         #   实机开场姿态可能是"歇在机械限位上"的 —— 2026-09-30 实测开机 p4=121，**在固件下限 125 之下**，
         #   于是第一拍的限速指令必然也在界外。拿指令当判据 ⇒ 整条链在第一拍就 refuse（永远动不了）。
@@ -621,7 +665,13 @@ def run(cfg, link, phase='aim', log=print):
         #   下的位置环死区稳态误差，是硬件极限。拿"tip 误差 ≤ 2mm"当判据 ⇒ 永远不满足、
         #   白跑到超时（实测 40s）。正确判据：**回读落在目标的死区量级内连续 3 拍**。
         lag = max(abs(f_now[k] - f_tgt[k]) for k in range(2, 6))     # p3..p6 实际 vs 目标
-        near = near + 1 if lag <= cfg.deadband_counts else 0
+        # ★★ 下扎相：只有**指令已经到了 s_stop** 之后 `near` 才开始数（2026-10-01 复查）。
+        #   下扎的 `tgt` 是**每拍的中间点**（只比当前位置往前 2~5mm），不是终点 ⇒ 离目标
+        #   1~2cm 时每拍步长本身就 < deadband_counts，臂只要平稳地跟，`near` 就成立 ⇒
+        #   **半路宣布扎到位**。假臂加回读滞后实测：真实停在 ~8mm（自报 10~11mm）；
+        #   真机下扎收尾残差 9.5~16.6mm 随机，大概率就是它（不是舵机死区）。
+        floor_ok = cur != 'descend' or s_cmd <= cfg.s_stop_m + 1e-9
+        near = near + 1 if (lag <= cfg.deadband_counts and floor_ok) else 0
         if cur in ('aim', 'descend'):     # 合爪/抬起时臂本来就该几乎不动 ⇒ 那两相不判"卡住"
             if moved >= 1.0:              # 1 count = 回读的量化单位 ⇒ 任何真实运动都能清掉它
                 stall = 0

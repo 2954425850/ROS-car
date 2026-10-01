@@ -160,7 +160,7 @@ class FakeLink:
 
     def __init__(self, plant, O_true, hz=10.0, noise_px=0.0, cut_after=None,
                  seed=1, grip_block=None, grip_rate=300.0, grip_lag_s=0.0,
-                 fb_none=0, grip_noise=0.0):
+                 fb_none=0, grip_noise=0.0, fb_lag_s=0.0, follow=False, cam_lag_s=0.0):
         self.p = plant
         self.O = O_true
         self.hz = hz
@@ -184,6 +184,18 @@ class FakeLink:
         self.grip_noise = grip_noise
         self.fb_none = fb_none
         self._ghist = [(0.0, 240.0)]
+        # ★ 2026-10-01 补的两条"像真机"开关（默认关，老用例行为不变）：
+        #   `fb_lag_s`：关节回读**整体滞后**（真机：固件 40ms + 总线轮询 60ms + 发布 40ms，
+        #     曾实测到 ~0.4s）。没有它，"拿滞后回读当现在"的一整类 bug 在假臂上测不出来
+        #     （下扎提前收工、下扎指令往回拉都是这么漏过去的）。
+        #   `follow`：臂按 `Plant.v` 的速度**真的走过去**，而不是 publish 一下就瞬移到指令处。
+        self.fb_lag_s = fb_lag_s
+        self.follow = follow
+        self._fhist = []
+        #   `cam_lag_s`：相机这一路的延迟（拍照 → 框到 Pi），**run() 不知道它是多少**
+        #     （obs 照样按"现在"打时间戳）⇒ 臂在动时拍的框配错关节姿态。
+        self.cam_lag_s = cam_lag_s
+        self._jhist = []
 
     def _fb_grip(self):
         return self._fb_grip_raw() + (self.rng.gauss(0, self.grip_noise)
@@ -211,13 +223,31 @@ class FakeLink:
         # `fb_none` 拍之内假装还没读到回读（真机：跟踪器给框比串口反馈快）
         if self.t < self.fb_none / self.hz:      # 按**时间**算，不依赖发没发过指令
             return None
-        return to_fields(self.p.j, self._fb_grip(), 496.0)
+        f = to_fields(self.p.j, self._fb_grip(), 496.0)
+        if self.fb_lag_s <= 0.0:
+            return f
+        self._fhist.append((self.t, f))
+        tt = self.t - self.fb_lag_s
+        out = self._fhist[0][1]
+        for t, v in self._fhist:
+            if t <= tt + 1e-9:
+                out = v
+            else:
+                break
+        return list(out)
 
     def obs(self):
         if self.cut_after is not None and self.pub_n > self.cut_after:
             return None
         try:
-            u, v = geom.project(self.p.j, self.O)
+            self._jhist.append((self.t, dict(self.p.j)))
+            j_cam = self._jhist[0][1]
+            for t, jj in self._jhist:
+                if t <= self.t - self.cam_lag_s + 1e-9:
+                    j_cam = jj
+                else:
+                    break
+            u, v = geom.project(j_cam, self.O)
         except ValueError:
             # ★ 相对计划原文补的一层：目标在**相机平面之后**时 `geom.project` 抛
             #   ValueError，计划原文会让它从 `run()` 里直接冒出来（而不是"这一拍没观测"）。
@@ -239,6 +269,9 @@ class FakeLink:
         if self.grip_block is not None:
             self.grip = min(self.grip, float(self.grip_block))
         self._ghist.append((self.t, self.grip))
+        if self.follow:
+            self.p.step(from_fields(fields), 1.0 / self.hz)   # 按限速真的走过去
+            return
         self.p.j = from_fields(fields)                # 用 arm_kin 的，不要绕 grasp
         self.p.step(self.p.j, 1.0 / self.hz)
 
@@ -610,3 +643,92 @@ def test_close_arming_gate_survives_a_noisy_gripper_readback():
     rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
     why = _close_reason(rep)
     assert '碰上东西' not in why, why
+
+
+# --------------------------------------------------------------------------
+# 回读滞后下的下扎（2026-10-01 复查补的；假臂开 `fb_lag_s` + `follow`）
+# --------------------------------------------------------------------------
+
+def _laggy_descend(lag, **kw):
+    """回读滞后 `lag` 秒、臂按限速真走的下扎。`z_plane_m` 钉成 CAP 的 z ⇒ 估计无系统偏差，
+    测出来的残差只来自控制律本身。"""
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900, patience=25,
+                          z_plane_m=CAP[2], **kw)
+    plant = Plant(_start_joints(s_m=0.08))
+    link = FakeLink(plant, CAP, fb_lag_s=lag, follow=True)
+    rep = grasp.run(cfg, link, phase='descend', log=lambda *a: None)
+    s_true = grasp.standoff_along_axis(grasp.tip_open_m(plant.j), CAP, rep['alpha'])
+    return rep, link, s_true
+
+
+@pytest.mark.parametrize('lag,s_lead', [(0.2, None), (0.4, None), (0.2, 0.002), (0.4, 0.002)])
+def test_descend_reaches_s_stop_despite_feedback_lag(lag, s_lead):
+    """★ 回读滞后时，下扎**不许在半路就宣布到位**。
+
+    根因：`near`（回读离目标 ≤ 死区、连 3 拍）在下扎相比的是**每拍那个中间目标**
+    （只比当前位置往前挪 2~5mm），不是终点 ⇒ 离目标 1~2cm 时每拍步长本身就 < 10 count，
+    臂只要平稳地跟，`near` 就成立 ⇒ 提前收工。真机下扎收尾残差 9.5~16.6mm 随机，就是它。
+    修法：下扎相只有**指令已经到了 s_stop** 之后，`near` 才开始数。
+    变异（已实测）：
+      * 旧代码（s_cmd 跟滞后回读走）：默认参数这两条就红（真实停在 7.7/8.3mm）。
+      * 现代码去掉 `floor_ok`：默认参数**照绿**（指令领先回读、中间目标总比回读远 ⇒ `near`
+        碰巧不成立），所以另加 `s_lead_m=2mm` 两条（指令几乎贴着回读走 = 旧行为）⇒
+        红（停在 6.2/9.2mm）。`floor_ok` 不能靠"碰巧"，任何 s_lead_m 下都得对。
+    """
+    rep, _link, s_true = _laggy_descend(lag, **({} if s_lead is None else {'s_lead_m': s_lead}))
+    assert rep['ok'], rep['stopped']
+    assert s_true <= 0.003 + 0.0015, (lag, s_true, rep['stopped'])
+
+
+def test_descend_command_does_not_back_up_under_feedback_lag():
+    """★ 下扎**指令**不许被滞后回读往回拽：沿轴留量的**累计上行量** ≤ 3mm。
+
+    根因：旧写法 `s_cmd = s_ach(滞后回读) − step`、限速也从滞后回读起步 ⇒ 回读落后时
+    指令被算到臂**已经过去**的位置之上 ⇒ 臂被拽回去 ⇒ 带延迟的反馈环，来回顶、又慢。
+    实测 0.4s 滞后：旧 6.7mm / 现 2.0mm（剩下的是 α 在 ±alpha_freeze_span 内微漂、
+    量度用的是终态 α 造成的，不是往回拉）。单拍最大回退量两边都 ~1.3mm、区分不开，所以判累计量。
+    """
+    rep, link, _s = _laggy_descend(0.4)
+    assert rep['ok'], rep['stopped']
+    s_cmds = [grasp.standoff_along_axis(grasp.tip_open_m(from_fields(f)), CAP, rep['alpha'])
+              for f in link.pubs]
+    up = sum(max(0.0, b - a) for a, b in zip(s_cmds, s_cmds[1:]))
+    assert up <= 0.003, up
+
+
+def test_lift_keeps_the_frozen_grip_not_full_force():
+    """★ 合爪"碰上东西就冻结"之后，**抬起时不许把夹爪拉到 close_field（全力夹）**。
+
+    根因：`advance_or_stop` 把 `close_cmd` 清成 None，抬起相 `grip_cmd` 就落到 close_field=578
+    ⇒ 用户明确否决过的全力合爪，在抬起那一刻照样发生。
+    变异（已实测）：抬起相改回 `grip_cmd = cfg.close_field` ⇒ 这条红。
+    """
+    import re
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900)
+    plant = Plant(_start_joints(s_m=0.10))
+    link = FakeLink(plant, CAP, grip_block=400.0)
+    rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
+    assert [p[0] for p in rep['phases']] == ['aim', 'descend', 'close', 'lift'], rep['phases']
+    why = _close_reason(rep)
+    cmd_at_freeze = float(re.search(r'p1 令 (-?[\d.]+)', why).group(1))
+    n_lift = rep['phases'][3][2]
+    lift_p1 = [f[0] for f in link.pubs[-n_lift:]]
+    assert lift_p1 and all(abs(v - cmd_at_freeze) < 1e-6 for v in lift_p1), (cmd_at_freeze, lift_p1)
+
+
+def test_estimate_survives_unmodelled_camera_latency():
+    """相机延迟 0.5s（run() 不知道）+ 回读滞后 0.2s：**下扎收尾时在用的 O** 离真值 ≤ 3mm。
+
+    2026-10-01 复查时想过"只用臂静止时的观测 + aim 到位后原地等观测再下扎"，先拿这个
+    场景量了一下：现状就只差 ≤2mm（下扎是沿着视线往目标走，目标像素几乎不动；
+    接近相的偏差在臂停下后被 EWMA 洗掉）⇒ 不值得为它加一套门控和每次 ~1s 的等待。
+    这条把"现状够用"钉住：将来谁改估计器/时间对齐把它弄坏了，这里会红。
+    """
+    import math as _m
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900, z_plane_m=CAP[2])
+    plant = Plant(_start_joints(s_m=0.12))
+    link = FakeLink(plant, CAP, fb_lag_s=0.2, follow=True, cam_lag_s=0.5)
+    rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
+    assert rep['ok'], rep['stopped']
+    O = dict(rep['O_phase_end'])['descend']
+    assert _m.dist(O, CAP) <= 0.003, O

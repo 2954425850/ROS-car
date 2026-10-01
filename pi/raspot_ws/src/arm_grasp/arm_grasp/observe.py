@@ -73,6 +73,36 @@ def pick_box(result, want_norm=None, iou_min=0.2):
     return max(pool, key=lambda o: (_box(o)[2] - _box(o)[0]) * (_box(o)[3] - _box(o)[1]))
 
 
+class BoxFollower:
+    """抓取全程"哪个框是我们的目标"——参考框**跟着目标走**（2026-10-01 复查补的）。
+
+    旧写法（`grasp_once.GraspLink`）每拍都拿**人画的那个框**去 `pick_box` 比 IoU。可臂一动，
+    相机跟着动，目标在画面里就挪走了 ⇒ 与人画的框 IoU 掉到 0.2 以下 ⇒ 板子明明还在发
+    `src=track` 的框，Pi 这边整条扔掉。"相机一动就丢"至少有一部分是**这里自己丢的**。
+
+    规则：
+      1) 有跟踪框 ⇒ 认跟踪框（板子 8557 锁的就是这个目标，跟踪器一次只跟一个、`track_id` 恒 1；
+         漂了/退化的那拍板子根本不发，见模块文档）。多个时取与 `ref` IoU 最大的。
+      2) 没有跟踪框 ⇒ 退回 `pick_box(result, ref)`：按**上一次接受的框**比 IoU。
+      接受了就把 `ref` 换成它；没找到 `ref` 不动。
+    """
+
+    def __init__(self, want_norm, iou_min=0.2):
+        self.ref = list(want_norm)
+        self.iou_min = iou_min
+
+    def pick(self, result):
+        objs = [o for o in (result.get('objs') or []) if _box(o)]
+        tracks = [o for o in objs if o.get('src') == 'track']
+        if tracks:
+            b = max(tracks, key=lambda o: iou(_box(o), self.ref))
+        else:
+            b = pick_box(result, self.ref, self.iou_min)
+        if b is not None:
+            self.ref = list(_box(b))
+        return b
+
+
 def box_center_ai(box_norm):
     """归一化框中心 → **AI 帧（320x180）像素**。
 
@@ -90,6 +120,16 @@ def fresh_result(path=RESULT_PATH, max_age_s=1.5):
 
     文件不在 / 太旧 / 内容坏了，一律返回 None —— 调用方只判 `is None`。
     """
+    got = fresh_result_aged(path, max_age_s)
+    return None if got is None else got[0]
+
+
+def fresh_result_aged(path=RESULT_PATH, max_age_s=1.5):
+    """同 `fresh_result`，但返回 `(result, age_s)`：age = 现在 − 文件 mtime。
+
+    观测的时刻要用它往回推（`t_arrive = now − age`）：文件最旧可以是 1.5s 前写的，
+    拿"读到的那一刻"当观测时刻，臂在动时就会配错关节姿态。
+    """
     try:
         age = time.time() - os.path.getmtime(path)
     except OSError:
@@ -98,7 +138,7 @@ def fresh_result(path=RESULT_PATH, max_age_s=1.5):
         return None
     try:
         with open(path, 'r') as f:
-            return json.load(f)
+            return json.load(f), max(0.0, age)
     except (OSError, ValueError):
         return None
 
