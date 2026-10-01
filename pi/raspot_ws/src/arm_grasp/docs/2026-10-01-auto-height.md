@@ -1,0 +1,89 @@
+# 腕部单目自动测高：第一版
+
+现有 K230 RGB 相机由机械臂带到 3–4 个观察位置，停稳后拍摄原始照片，同时记录真实关节回读。系统匹配同一批图像特征，通过现有内参、手眼和机械臂运动学提供的米制尺度恢复三维点，分别拟合局部支撑平面和物体顶面。无需新增硬件、纸质标记或输入桌面/物体高度。
+
+本版适用于静止场景、周围可见的有纹理支撑面、具有足够纹理且近似平整的可见顶面。物体顶面相对支撑面的倾斜最多 15°，支撑面相对车体安装面最多 30°。测高失败会退出，不会退回 1.6 cm 等默认高度。物体选择仍沿用现有的 `--box` 入口；这次自动化的是支撑面与物体高度测量。
+
+## 使用
+
+在树莓派的 `arm_grasp` 包目录运行，例如 `/home/cy/raspot_ws/src/arm_grasp`。机械臂、K230 结果流与 RTSP 按现有方式启动。当前观察姿态须能完整看见目标及其周围桌面，腕自转保持标定位置（field 496 附近），观察范围没有障碍。路径检查只检查运动学包络和固件限位，不提供场景碰撞检测。
+
+检查测高依赖；尚未安装时使用项目的 `requirements-height.txt` 配置 Python 环境。ROS 系统环境也可使用已有的 `python3-numpy`、`python3-opencv`，无需重复安装另一份 OpenCV。
+
+```bash
+python3 -c "import numpy, cv2; print(numpy.__version__, cv2.__version__); print(hasattr(cv2, 'SIFT_create'))"
+```
+
+先只读检查实际回读下能否生成观察路径，以下框仅为格式示例，需使用实际目标框（原始推流坐标）：
+
+```bash
+python3 tools/grasp_once.py --auto-height --scan-preview --box 0.40,0.35,0.60,0.60
+```
+
+采集并测高，成功后结束，不进入抓取。该步骤会动臂；沿用已有的 sudo 配置或 `GRASP_SUDO_PASS` 环境变量。`--yes` 可跳过已有交互提示，不能绕过测量或路径拒绝。
+
+```bash
+python3 tools/grasp_once.py --auto-height --measure-only --box 0.40,0.35,0.60,0.60
+```
+
+每次创建 `/tmp/arm-height/时间-会话编号/`，保存 `session.json`、`view-00.jpg` 等原始照片、`height-report.json` 和证据标注图。`--height-out /home/cy/arm-height` 可以把数据根目录移到不会随重启清除的位置。原始照片的 `-up.jpg` 副本仅供查看，不能用于测量。
+
+离线重算已采集的数据，不连接 ROS/相机、不发指令：
+
+```bash
+python3 tools/measure_height.py /tmp/arm-height/实际会话/session.json
+python3 tools/grasp_once.py --height-session /tmp/arm-height/实际会话/session.json --dry-run
+```
+
+确认真实场景测量结果后，自动采集新的场景并走抓取全流程：
+
+```bash
+python3 tools/grasp_once.py --auto-height --box 0.40,0.35,0.60,0.60 --phase all
+```
+
+自动模式不需要 `--h`，抓取相位支持 `aim`（默认，只接近对准）和 `all`（完整抓取）。旧的手填高度模式保持兼容。`--auto-height --dry-run` 会被拒绝，因为采集视差需要运动；只读路径检查使用 `--scan-preview`。历史 `--height-session` 只允许离线预演，不能直接启动真机抓取。
+
+## 测量过程与输出
+
+1. 检查观察路径及固件限位，默认每次侧移 25 mm，升高最多 18 mm；关节插值路径中爪尖不低于起始观察高度减 2 mm。扫描保持夹爪位置，每次返回参考姿态后再做下一次小范围移动。合法但靠近限位的参考姿态允许作为起点；新观察姿态需要至少 8 count 的限位余量。无法生成足够姿态则退出。
+2. 使用稳定的实际回读而非指令值作为相机位姿。取流期间持续保持姿态并读取反馈，超过 2 count 的漂移或反馈陈旧会废弃照片。默认单次取流 2.5 秒，实际取帧可靠性须在 Pi 上验证。
+3. GrabCut 区分参考照片的目标内部与其周围支撑区域，SIFT 双向匹配真实特征。每个特征至少在三个视角可匹配；重复方向的同一角点不重复计数。
+4. 三角测量至少需要 12 mm 光心基线、2° 视线夹角，检查前向深度、射线残差、重投影和分视角结果一致性。随后通过 RANSAC 拟合支撑面与顶面。支撑点需要包围目标，顶面需要足够的物理/图像覆盖；多个明确的高层平面会被判为歧义。
+5. 抓取使用已测得的三维顶面特征中心，检测框用于核验它仍在目标区域内，不把框中心重新转换成另一个三维点。有观测时发现不一致立即停止；缺失观测沿用现有的有限盲段超时。测量至合爪前物体必须保持静止，小车全程不移动。夹住后的抬升沿已测接触点规划，物体随夹爪移动，不再要求它留在原来的位置。
+
+核心输出（长度单位均为米）：
+
+| 字段 | 含义 |
+|---|---|
+| `support_plane` | 向上的单位法向量与平面方程偏置，基于车体安装面坐标系 |
+| `support_z_m` | 目标位置处的支撑面 z，可为负数 |
+| `top_z_m` | 所测顶面特征中心的 z |
+| `object_height_m` | 顶面特征中心到支撑面的法向距离 |
+| `vertical_height_m` | 顶面 z 与局部支撑面 z 的差，倾斜时不同于法向高度 |
+| `target_point_m` | 可见顶面特征分布的中心，不保证是物体几何中心或最佳夹持点 |
+| `quality` | 内点数量、覆盖、残差及分视角差异，表示几何一致性 |
+| `compute_seconds` / `acquisition_seconds` | 当前会话实际计算/采集耗时 |
+| `calibration_id` / `calibration` | 本次使用的内参、手眼、坐标约定和运动学版本 |
+| `ok` / `reason` | 成功状态；失败报告没有备用高度 |
+
+`quality.accuracy_verified` 当前始终为 `false`。低残差不能发现所有共同的位姿/手眼偏差，也不等于物理精度已达标。第一版报告高度至少需要 24 个支撑点和 10 个顶面点；物体法向高度工作区间为 4–180 mm。这些阈值是拒绝条件，不是精度指标。
+
+常见失败原因：桌面/顶面没有纹理；物体出画或进入画面底部夹爪区域；观察基线或视差不足；真实回读在拍照期间漂移；支撑点集中在一侧；匹配结果不符合几何；存在多个可见高层表面。每次扫描有固定数量的有界尝试，失败后退出。本版尚未实现依据失败原因再次规划一轮新视角。
+
+## 真机验证
+
+先只运行 `--measure-only`。选取数个独立尺量高度的物块，覆盖车身平台和外部桌面、近/远和左/右位置，每个场景重复采集至少五次。尺量支撑面 z 的零点应是车体安装面；同时记录物块顶面高度/物块自身高度。每次保存完整会话，不只保留成功报告。
+
+统计支撑面/顶面/物体高度各自的绝对误差、中位数、95 分位误差、重复测量散布、拒绝率和采集加计算的实际耗时。薄瓶盖应单列，避免大物体的结果掩盖薄物体上同量级误差。最后才运行抓取，并另行记录夹爪落点误差与抓取成功率。
+
+本次开发未连接或移动真实机械臂，没有实测精度或实测整轮耗时。图像测试使用已知尺寸的渲染场景，仅验证图像到报告的实现链路。
+
+本地验证（Windows PowerShell）：
+
+```powershell
+$env:PYTHONPATH = (Resolve-Path raspot_ws/src/arm_grasp).Path
+python -X utf8 -m pytest raspot_ws/src/arm_grasp/test/test_height.py raspot_ws/src/arm_grasp/test/test_height_vision.py raspot_ws/src/arm_grasp/test/test_height_capture.py raspot_ws/src/arm_grasp/test/test_height_cli.py raspot_ws/src/arm_grasp/test/test_grasp.py -q
+python -X utf8 raspot_ws/src/arm_grasp/tools/grasp_once.py --selftest
+```
+
+全量旧测试在修改前存在 9 项失败：`test_arm_kin` 两项、`test_calib_report` 一项、`test_calib_solve` 五项、`test_collect` 一项。已用 Git HEAD 导出的独立源码复现相同失败；本次未改动这些标定模型或旧测试。

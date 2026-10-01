@@ -330,6 +330,42 @@ def test_loop_descends_and_stops_shallow():
     assert rep['ticks'] >= 5                            # 是"压下去"的，不是一拍就宣布到位
 
 
+@pytest.mark.parametrize('phase', ['descend', 'all'])
+def test_measured_point_is_not_replaced_by_box_centre(phase):
+    cfg = _cfg()._replace(max_seconds=60.0, max_ticks=900)
+    plant = Plant(_start_joints(s_m=.05))
+    class MeasuredLink(FakeLink):
+        def obs(self):
+            obs = super().obs()
+            if obs is None:
+                return None
+            u, v = geom.project(self.p.j, CAP)
+            x, y = u / 320, v / 180
+            box = [max(0., x - .03), max(0., y - .03),
+                   min(1., x + .08), min(1., y + .04)]
+            return obs._replace(u_ai=u + 12, box_norm=box)
+    link = MeasuredLink(plant, CAP, grip_block=400.0)
+    rep = grasp.run(cfg, link, phase=phase, initial_point=CAP, log=lambda *_: None)
+    assert rep['ok'], rep['stopped']
+    assert rep['O_last'] == pytest.approx(CAP, abs=1e-12)
+    if phase == 'all':
+        assert [p[0] for p in rep['phases']] == ['aim', 'descend', 'close', 'lift']
+        assert rep['s_ach_m'] > cfg.lift_m * .8
+
+
+def test_wrong_box_stops_measured_grasp_before_publishing():
+    cfg = _cfg()._replace(max_ticks=30)
+    plant = Plant(_start_joints(s_m=.05))
+    class WrongBoxLink(FakeLink):
+        def obs(self):
+            return super().obs()._replace(box_norm=[.01, .01, .04, .04])
+    link = WrongBoxLink(plant, CAP)
+    rep = grasp.run(cfg, link, initial_point=CAP, log=lambda *_: None)
+    assert not rep['ok']
+    assert '核验失败' in rep['stopped']
+    assert not link.pubs
+
+
 def test_loop_holds_when_observation_dies():
     """观测断了：必须**明确报出来**并保持住估计，而不是崩/继续乱走。
 

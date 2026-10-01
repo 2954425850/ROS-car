@@ -1,0 +1,3 @@
+# Optional automatic-height/replay dependencies; existing manual grasp stays dependency-free.
+numpy>=1.24,<3
+opencv-python-headless>=4.5,<6

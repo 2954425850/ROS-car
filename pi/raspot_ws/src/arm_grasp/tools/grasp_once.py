@@ -23,7 +23,14 @@
 归一化 `l,t,r,b`，与板子 8557 的约定**逐字相同**（左上原点、基准 1280x720 推流画面）
 ⇒ Pi 不需要任何坐标换算，直接转发（避开"通道/分辨率不同"那个静默坑）。
 
-## `--h` 是尺度来源
+## 高度来源
+
+`--auto-height`：先通过腕部单目多视角照片与真实关节回读自动测量支撑平面/目标顶面。
+测量失败不抓取，不使用默认高度。`--measure-only` 只测高，`--scan-preview` 只读查路径。
+`--height-session ... --dry-run` 离线重算与预演，不接触 ROS/相机。
+详见 `docs/2026-10-01-auto-height.md`。
+
+手动模式的 `--h` 是尺度来源：
 单目没有距离：用"射线 ∩ z = h 平面"当尺度（design §2.3）。目标面高度默认 0.016 m
 （车身安装面上 1.6cm）。**它进 `cfg.z_plane_m`**，不是随手一个常数 —— 填错 =
 整条链的落点整体偏（`--dry-run` 打印的就是它算出来的 O）。
@@ -323,9 +330,20 @@ def main(argv=None):
     ap.add_argument('--box', default=None,
                     help='归一化 l,t,r,b（与板子 8557 同约定，1280x720 推流系）—— '
                          '**人画的那个框**')
-    ap.add_argument('--h', type=float, default=DEFAULT_H_M,
+    ap.add_argument('--h', type=float, default=None,
                     help='目标面高度（米），默认 %.3f（安装面上 1.6cm）**进 cfg.z_plane_m**'
                          % DEFAULT_H_M)
+    height_mode = ap.add_mutually_exclusive_group()
+    height_mode.add_argument('--auto-height', action='store_true',
+                             help='先动臂采集多视角照片并自动测高；失败不抓取')
+    height_mode.add_argument('--height-session',
+                             help='离线重算 session.json 并预演抓取；必须带 --dry-run')
+    ap.add_argument('--measure-only', action='store_true',
+                    help='配合 --auto-height：采集并测高后结束，不下扎/合爪')
+    ap.add_argument('--scan-preview', action='store_true',
+                    help='配合 --auto-height：只读当前回读并打印扫描路径，不动臂')
+    ap.add_argument('--height-out', default=None,
+                    help='自动测高数据根目录；每次创建独立会话，默认 /tmp/arm-height')
     ap.add_argument('--dry-run', action='store_true',
                     help='只读：锁框 → 读关节 → 算 O/S0 → 打印；不发 /arm/command、不停服务')
     ap.add_argument('--phase', choices=('aim', 'descend', 'close', 'lift', 'all'), default='aim',
@@ -360,6 +378,32 @@ def main(argv=None):
 
     if args.selftest:
         return selftest()
+
+    if args.auto_height or args.height_session:
+        if args.h is not None:
+            print('❌ 自动测高/离线测高不能同时指定 --h；不使用默认高度兜底。')
+            return 2
+        if args.auto_height and args.dry_run and not args.scan_preview:
+            print('❌ --auto-height 采集会动臂，不能作为 --dry-run；'
+                  '用 --scan-preview 只读检查路径，或 --height-session 离线预演。')
+            return 2
+        if args.auto_height and not (args.measure_only or args.scan_preview) and args.phase not in ('aim', 'all'):
+            print('❌ 自动测高从观察姿态开始，只支持 --phase aim 或 all。')
+            return 2
+        if args.height_session and (not args.dry_run or args.measure_only or args.scan_preview):
+            print('❌ 历史测高会话仅支持 --height-session ... --dry-run，不能驱动真机。')
+            return 2
+        try:
+            from auto_height_grasp import run_auto_height
+            return run_auto_height(args)
+        except ImportError as e:
+            print('❌ 自动测高依赖不可用：%s；见 requirements-height.txt。' % e)
+            return 2
+    if args.measure_only or args.scan_preview or args.height_out:
+        print('❌ --measure-only / --scan-preview / --height-out 需要 --auto-height。')
+        return 2
+    if args.h is None:
+        args.h = DEFAULT_H_M
 
     if not args.box:
         print('❌ 缺少 --box l,t,r,b（用 --selftest 可以不带硬件自检）')

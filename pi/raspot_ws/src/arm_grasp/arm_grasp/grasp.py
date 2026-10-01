@@ -337,6 +337,28 @@ def estimate_point(trace, obs, z_plane_m, latency_s):
     return P, C, d, j, t_frame
 
 
+def validate_measured_observation(trace, obs, point, latency_s):
+    """A tracked box confirms visibility of a measured point, not its 3D depth.
+
+Requires actual feedback and a finite box. Inconsistent boxes do not refresh
+the blind-motion timer. The scene must remain static after the scan.
+"""
+    box = obs.box_norm
+    if (box is None or len(box) != 4 or not all(math.isfinite(v) for v in box)
+            or not (0 <= box[0] < box[2] <= 1 and 0 <= box[1] < box[3] <= 1)):
+        raise _refuse('多视角目标需要有效跟踪框核验')
+    try:
+        j = from_fields(trace.at(obs.t_arrive - latency_s, 'fb'))
+        u, v = geom.project(j, point)
+    except ValueError as e:
+        raise _refuse('多视角目标投影失败：%s' % e)
+    u, v = u / geom.AI_W, v / geom.AI_H
+    margin = .025
+    if not (box[0] - margin <= u <= box[2] + margin
+            and box[1] - margin <= v <= box[3] + margin):
+        raise _refuse('跟踪框不包含已测目标（目标移动/错框/位姿偏差）')
+
+
 class Est:
     """静止目标的 O 估计：门限 + EWMA + 盲段保持（不上卡尔曼，理由见 design §2.5）。
 
@@ -374,7 +396,7 @@ class Link:
 PHASES = ('aim', 'descend', 'close', 'lift')
 
 
-def run(cfg, link, phase='aim', log=print):
+def run(cfg, link, phase='aim', log=print, initial_point=None):
     """流式主循环：每拍只算一次目标并限速发一帧，**没有任何一处会阻塞在"等到位"**。
 
     phase ∈ {'aim','descend','close','lift','all'}。
@@ -389,6 +411,13 @@ def run(cfg, link, phase='aim', log=print):
     seq = list(PHASES) if phase == 'all' else [phase]
     trace = ltrace.Trace()
     est = Est(cfg.k_ewma, cfg.gate_m)
+    if initial_point is not None:
+        # Multiview target is a real measured surface point. Detector-box centres
+        # are not the same physical point and must not overwrite this estimate.
+        initial_point = tuple(float(v) for v in initial_point)
+        if len(initial_point) != 3 or not all(math.isfinite(v) for v in initial_point):
+            raise _refuse('无效的多视角目标点')
+        est.update(initial_point)
     rep = {'phase': phase, 'ticks': 0, 'stopped': None, 'ok': False,
            'O_last': None, 'obs_n': 0, 'obs_bad': 0, 'obs_lost': False,
            'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None, 'comp': None,
@@ -400,7 +429,7 @@ def run(cfg, link, phase='aim', log=print):
     stall, best = 0, None
     s_cmd = cfg.s_pre_m
     t0 = None
-    obs_age = None
+    obs_age = 0.0 if initial_point is not None else None
     cur = seq[0]          # 当前相
     hold_j = None         # 'close' 相：进相时冻住的四个关节
     close_cmd = None      # 'close' 相：正在往 close_field 爬的 p1 指令
@@ -473,21 +502,36 @@ def run(cfg, link, phase='aim', log=print):
         if not trace.buf:
             continue
         # ② 观测 → 估计
-        obs = link.obs()
+        # Once the object is grasped it moves with the gripper. The measured
+        # contact point remains the lift-path anchor, not a visibility target.
+        obs = None if initial_point is not None and cur == 'lift' else link.obs()
+        if initial_point is not None and cur == 'lift':
+            obs_age = None
+        elif initial_point is not None and obs_age is not None:
+            obs_age += dt
         if obs is not None:
-            obs_age = 0.0
+            if initial_point is None:
+                obs_age = 0.0
             try:
-                O_new, C_obs, d_obs, j_obs, t_fr = estimate_point(
-                    trace, obs, cfg.z_plane_m, cfg.latency_s)
-                if est.update(O_new):
+                if initial_point is not None:
+                    validate_measured_observation(trace, obs, initial_point, cfg.latency_s)
+                    obs_age = 0.0
                     rep['obs_n'] += 1
                 else:
-                    rep['obs_bad'] += 1
+                    O_new, C_obs, d_obs, j_obs, t_fr = estimate_point(
+                        trace, obs, cfg.z_plane_m, cfg.latency_s)
+                    if est.update(O_new):
+                        rep['obs_n'] += 1
+                    else:
+                        rep['obs_bad'] += 1
             except Refused as e:
                 rep['obs_bad'] += 1
                 log('  [obs] 丢：%s' % e)
+                if initial_point is not None:
+                    rep['stopped'] = '已测目标核验失败：%s' % e
+                    break
         else:
-            if obs_age is not None:
+            if obs_age is not None and initial_point is None:
                 obs_age += dt
         # 阶段推进前的守卫
         if now - t0 > cfg.max_seconds:
