@@ -39,7 +39,9 @@ class ScanConfig:
 def valid_feedback(fields):
     return (fields is not None and len(fields) == 6
             and all(math.isfinite(float(x)) for x in fields)
-            and all(fields[i] != 0 for i in (2, 3, 4)))
+            # Firmware polls servos 1-5; 0 means that servo was not read this
+            # cycle (seen live: one wrist-roll 0 among steady 497 readings).
+            and all(fields[i] != 0 for i in range(1, 6)))
 
 
 def validate_path(start, finish, fields, config=None, floor_z=None, require_margin=True):

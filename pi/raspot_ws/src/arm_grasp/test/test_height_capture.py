@@ -77,6 +77,7 @@ class FakeIO:
         self.fb_n = 0
         self.drift = False
         self.jitter = False
+        self.glitch_at = None
         self.base_pitch = self.fb[2]
 
     def spin(self, seconds):
@@ -84,6 +85,10 @@ class FakeIO:
         self.fb_n += 1
         if self.drift:
             self.fb[3] += 1.0
+        if self.glitch_at == self.fb_n:
+            self.fb[1], self._roll = 0.0, self.fb[1]
+        elif self.glitch_at is not None and self.fb[1] == 0.0:
+            self.fb[1] = self._roll
         if self.jitter:
             # Real stationary wrist pitch: 154-157 counts while holding 156.
             self.fb[2] = self.base_pitch + (-1, 1, -2, 0, 1, -1)[self.fb_n % 6]
@@ -112,6 +117,19 @@ def test_snapshot_accepts_stationary_count_jitter(tmp_path):
                     publish=lambda *_: None)
     assert view['feedback_span_counts'][2] == 3
     assert view['fields'][2] == pytest.approx(io.base_pitch, abs=.5)
+
+
+def test_snapshot_skips_unread_servo_sample(tmp_path):
+    io = FakeIO()
+    io.glitch_at = 12  # within exposure, after settling
+    def capture(path, host, timeout):
+        time.sleep(.08)
+        return True
+    view = snapshot(io, 'fake', tmp_path / 'raw.jpg', list(io.fb),
+                    ScanConfig(stationary_seconds=.03), capture,
+                    publish=lambda *_: None)
+    assert io.fb_n > io.glitch_at
+    assert max(view['feedback_span_counts'][1:]) == 0
 
 
 def test_snapshot_rejects_motion_during_capture(tmp_path):
