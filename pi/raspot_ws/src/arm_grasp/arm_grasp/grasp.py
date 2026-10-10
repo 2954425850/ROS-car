@@ -214,8 +214,20 @@ def pick_target(O_m, cfg, s_m, prefer_alpha, vis=None, span=None, balance=False)
                                 math.dist(tip_open_m(j), O_m), vis_ok, px[0], px[1]))
         k += cfg.alpha_step
     if not cands:
-        raise _refuse('α∈[%.0f°,%.0f°]、留量 %.1fcm 下无可行姿态（不可解或越界）'
-                      % (cfg.alpha_lo, cfg.alpha_hi, s_m * 100))
+        # ⚠️ 印**搜过的窗口**（alpha0 ± span 再夹到配置包络），别印 cfg.alpha_lo/alpha_hi ——
+        #   印包络会把操作者引向"整个合法范围都搜遍了 ⇒ 这个点不可达"，而真相常常是
+        #   "种子太缓、窗口没够到，换 --alpha0 就行"。2026-10-02 真机实测：默认 α0=−58°
+        #   窗口只有 [−72°,−45°]，桌面高度的真解在 −73°…−88°，**恰好落在印出来的那个
+        #   −88°…−45° 里面** ⇒ 照着这句话判断会直接放弃一个本来抓得到的点。
+        lo, hi = sorted((max(cfg.alpha_lo, prefer_alpha - span),
+                         min(cfg.alpha_hi, prefer_alpha + span)))
+        # 只有窗口没铺满包络时才提换种子 —— 铺满了就没什么可搜的了，再提就是误导。
+        hint = ('；窗口没铺满配置包络 [%.0f°,%.0f°]，可换 --alpha0 再试'
+                % (cfg.alpha_lo, cfg.alpha_hi)
+                if lo > cfg.alpha_lo + 1e-9 or hi < cfg.alpha_hi - 1e-9 else '')
+        raise _refuse('搜过的 α∈[%.0f°,%.0f°]（种子 α0=%.0f°、半径 %.0f°）、'
+                      '留量 %.1fcm 下无可行姿态（不可解或越界）%s'
+                      % (lo, hi, prefer_alpha, span, s_m * 100, hint))
     good = cands          # ← 别加 visible 过滤：那是恒等变换（证明见 docstring）
     top = max(c.slack for c in good)
     near = [c for c in good if c.slack >= top - cfg.slack_tie]
