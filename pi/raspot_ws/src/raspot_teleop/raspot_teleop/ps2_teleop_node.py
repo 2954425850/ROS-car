@@ -10,9 +10,13 @@
 服务客户端:
   /arm/rehome   std_srvs/Trigger        START 键触发机械臂回中（锚定+回中）
 
-运动模型与云平台 114.215.188.147 一致:
+运动模型 = **云平台前端 `Gv`/轮盘的逐行移植**（实现在 `chassis.py`，别在这儿重写）:
   vx∈±0.5 m/s, wz∈±1.5 rad/s, 最小转弯半径 0.6m（不能原地转）,
-  有转向输入时最低 0.12 m/s, 摇杆死区 0.12, 平滑 0.35, 档位 0.15~0.50 步进 0.05。
+  有转向输入时最低 0.12 m/s, 轮盘**径向**死区 0.12, **没有低通**, 档位 0.15~0.50 步进 0.05。
+  ⚠️ 照抄的两个后果，都是**故意的**，别当 bug 顺手改：
+    · 只推左右（前后居中）⇒ 会以 0.12 m/s 前蠕画弧 —— 云端就是这样。
+    · 云端缺原厂 `balance.c` 的 `if(Move_X<0) Move_Z=-Move_Z`，所以**后退时左右是反的**
+      （见记忆 `l150pro-turn-decisions` ②）。本次要求是"完全照抄"，故没有补这一条。
 键位在下方 CFG，--probe 实测编号后按需修改。
 """
 import argparse
@@ -26,14 +30,17 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 
+from .chassis import clamp, stick_to_drive
 from .js_input import JsReader, JsState, run_probe
 from .protocol import ARM_JOINT_NAMES
 
 CFG = {
     # —— 轴（2026-09-27 22:07 实测确认：0=左X 1=左Y 2=右X 3=右Y 4=十字X 5=十字Y；
     #    每个轴的负方向 = 该摇杆/十字键的 左 或 上；DIR=±1 纠方向）——
-    'AX_THROTTLE': 1, 'THROTTLE_FLIP': -1,        # 左摇杆Y 上推=前进（车）
-    'AX_STEER': 0, 'STEER_FLIP': 1,               # 左摇杆X 右推=右转（车）
+    # 底盘走的是云平台的"轮盘"模型（二维矢量 + 径向死区，见 chassis.py），
+    # 所以左摇杆是当**一根轮盘**读的：X→轮盘 x（右为正）、Y→轮盘 y（下为正）。
+    'AX_PAD_X': 0, 'PAD_X_DIR': 1,                # 左摇杆X：轴正方向=右推 → 轮盘 x 同号
+    'AX_PAD_Y': 1, 'PAD_Y_DIR': 1,                # 左摇杆Y：轴负方向=上推、轮盘 y 下为正 → 同号
     'AX_SHOULDER': 3, 'DIR_SHOULDER': 1,          # 右摇杆Y 上下=大臂（5 号舵机，方向已翻）
     'AX_BASE': 2, 'DIR_BASE': -1,                 # 右摇杆X 左右=底座（用户此前实测该轴方向反了）
     'AX_HAT_Y': 5,                                # 十字键 上下=速度档升/降
@@ -71,7 +78,7 @@ CFG = {
     'BTN_REHOME': 9,              # START 回中（用户实测编号）
     'BTN_ESTOP': 8,               # SELECT 急停（实测编号 8；按一下锁存，再按一下解除）
 
-    # —— 底盘（云平台同款参数）——
+    # —— 底盘（云平台前端同款参数，见 chassis.py）——
     'JS_DEVICE': '/dev/input/js0',
     'LOOP_HZ': 25,
     'GEAR_DEFAULT': 0.15, 'GEAR_MIN': 0.15, 'GEAR_MAX': 0.50, 'GEAR_STEP': 0.05,
@@ -80,8 +87,9 @@ CFG = {
     'R_MIN': 0.6,
     'V_MIN': 0.12,
     'LAT_EPS': 0.02,
-    'DEADZONE': 0.15,             # 摇杆死区
-    'SMOOTHING': 0.35,            # 低通系数（越大越跟手）
+    'STICK_DEADZONE': 0.12,       # 底盘轮盘的**径向**死区（云端 joystickDeadzone）
+    'DEADZONE': 0.15,             # 臂摇杆的**逐轴**死区（和上面那条不是一回事）
+    'SMOOTHING': 0.35,            # 臂摇杆低通系数（底盘已照抄云端：没有低通）
     'IDLE_ZERO_S': 3.0,           # 手柄无事件 N 秒 → 底盘清零
     'HAT_EDGE_CNT': 16000,        # 十字键判沿阈值（|值|超过视为按下）
 
@@ -94,10 +102,6 @@ CFG = {
     'ARM_SYNC_TOL': 30.0,        # 空闲时回读与目标偏差超过它才同步（count / 底座 field）
     'ARM_DEBOUNCE_TICKS': 2,      # 臂通道去抖：连续 N 拍有效才生效（滤鬼影事件）
 }
-
-
-def clamp(v, lo, hi):
-    return lo if v < lo else hi if v > hi else v
 
 
 def norm(raw):
@@ -138,7 +142,7 @@ class Ps2TeleopNode(Node):
         self.last_estop_pub = None
         self.prev_sel = 0
         self.prev_buttons = {}
-        self.sm_th = self.sm_st = self.sm_sh = self.sm_bs = 0.0
+        self.sm_sh = self.sm_bs = 0.0
         self.prev_hat_up = 0
         self.prev_hat_dn = 0
         self.targets = None           # 首条 /arm/feedback 到达后按实际位姿初始化
@@ -220,22 +224,13 @@ class Ps2TeleopNode(Node):
         self.prev_hat_up = hat_up
         self.prev_hat_dn = hat_dn
 
-        # 底盘：弧线模型（云平台 Gv）
+        # 底盘：云平台"轮盘 + Gv"的逐行移植（实现在 chassis.py，这里只做轴→轮盘坐标）
         vx = wz = 0.0
         if not self.estop and not stale:
-            a = c['SMOOTHING']
-            raw_th = c['THROTTLE_FLIP'] * norm(axes.get(c['AX_THROTTLE'], 0))
-            raw_st = c['STEER_FLIP'] * norm(axes.get(c['AX_STEER'], 0))
-            self.sm_th += a * (dead(raw_th, c['DEADZONE']) - self.sm_th)
-            self.sm_st += a * (dead(raw_st, c['DEADZONE']) - self.sm_st)
-            if abs(self.sm_th) >= c['DEADZONE'] * 0.5:   # 无油门不蠕行
-                r = self.gear * abs(self.sm_th)
-                if abs(self.sm_st) > c['LAT_EPS']:
-                    r = max(r, c['V_MIN'])
-                vx = -r if self.sm_th < 0 else r
-                wz = clamp(vx * self.sm_st / c['R_MIN'], -c['WZ_MAX'], c['WZ_MAX'])
-        else:
-            self.sm_th = self.sm_st = 0.0
+            x = c['PAD_X_DIR'] * norm(axes.get(c['AX_PAD_X'], 0))
+            y = c['PAD_Y_DIR'] * norm(axes.get(c['AX_PAD_Y'], 0))
+            vx, wz = stick_to_drive(x, y, self.gear, c)
+
         msg = Twist()
         msg.linear.x = clamp(vx, -c['VX_MAX'], c['VX_MAX'])
         msg.angular.z = clamp(wz, -c['WZ_MAX'], c['WZ_MAX'])
