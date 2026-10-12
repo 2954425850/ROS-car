@@ -99,6 +99,7 @@ class A010(object):
                          stop=UART.STOPBITS_ONE)
         self._buf = b""
         self.frames = 0
+        self.baud = baud
 
     # ---- 底层收发 ----
     def close(self):
@@ -182,6 +183,40 @@ class A010(object):
                 self._buf += tail
         return True
 
+    def ping(self, timeout_ms=600):
+        """发一条 AT，回 OK 才算通。用来探测模块当前挂在哪个波特率上。"""
+        self._drain(quiet_ms=30, max_ms=120)
+        self.uart.read(4096)
+        self.uart.write("AT\r")
+        got = b""
+        t0 = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), t0) < timeout_ms:
+            d = self.uart.read(READ_CHUNK)
+            if d:
+                got += d
+                if b"OK" in got:
+                    return True
+                if b"ERR" in got:
+                    return False
+            else:
+                time.sleep_ms(2)
+        return False
+
+    def stop_stream(self):
+        """停出图。—— 提速/改配置**必须先停流**：不停的话命令回显会被深度帧淹没，
+        判定不了 OK（2026-10-10 实测：AT+BAUD? 读到过 2048 字节深度流）。"""
+        self.cmd("AT+DISP=0")
+
+    def start_stream(self):
+        self.cmd("AT+DISP=%d" % (1 | 4))     # LCD | UART
+
+    def set_baud_index(self, index):
+        """AT+BAUD 收的是**索引**不是波特率数值。返回切换后的波特率。"""
+        if index not in BAUD_INDEX_TO_RATE:
+            raise ValueError("非法波特率索引 %r" % (index,))
+        self.cmd("AT+BAUD=%d" % index)
+        return BAUD_INDEX_TO_RATE[index]
+
     # ---- 取一帧 ----
     def read_frame(self, timeout_ms=2000):
         """等到一帧完整、校验通过的深度帧；超时返回 None。"""
@@ -213,6 +248,73 @@ def _show(b, limit=48):
     if len(b) > limit:
         s += "...(%d)" % len(b)
     return s
+
+
+_PROBE_ORDER = (115200, 230400, 921600, 460800, 3000000)
+
+
+def open_tof(fast=True, unit=TOF_UNIT):
+    """开一个 A010 会话，可选提速到 921600。返回 (dev | None, baud | None)。
+
+    * **先探测**模块挂在哪个波特率上 —— 掉电默认是 115200，但别假设
+      （改过波特率又没断电时它还在别处；模块的设置掉电不保存，见文件头）。
+    * 提速顺序：停流 → AT+BAUD=5 → **关掉再用新波特率重开** → 开流。
+    """
+    dev = None
+    for b in _PROBE_ORDER:
+        d = A010(baud=b)
+        if d.ping():
+            dev = d
+            break
+        d.close()
+    if dev is None:
+        return None, None
+    dev.init(unit=unit)
+    if not fast:
+        return dev, dev.baud
+    dev.stop_stream()
+    dev.set_baud_index(FAST_BAUD_INDEX)
+    dev.close()
+    time.sleep_ms(600)
+    dev = A010(baud=BAUD_INDEX_TO_RATE[FAST_BAUD_INDEX])
+    if not dev.ping():
+        dev.close()
+        return None, None
+    dev.stop_stream()
+    dev.cmd("AT+UNIT=%d" % unit)
+    dev.cmd("AT+BINN=1")
+    dev.cmd("AT+FPS=19")
+    dev.start_stream()
+    return dev, dev.baud
+
+
+class TofReader:
+    """非阻塞取帧：每拍最多读 max_reads 块，没数据就立刻返回。
+
+    **绝不在主循环里长等** —— app.py 的主循环同时喂着推流/RTSP/推理，
+    板子上已经有"主循环里一个 sleep 把整条链路拖到 1Hz"的前科。
+    """
+
+    def __init__(self, dev, chunk=READ_CHUNK):
+        self.dev = dev
+        self.chunk = chunk
+        self.buf = b""
+        self.latest_frame = None
+        self.frames = 0
+
+    def pump(self, max_reads=4):
+        got = 0
+        for _ in range(max_reads):
+            d = self.dev.uart.read(self.chunk)
+            if not d:
+                break
+            self.buf += d
+            fr, self.buf = a010_frame.feed(self.buf)
+            if fr is not None:
+                self.latest_frame = fr
+                self.frames += 1
+                got += 1
+        return got
 
 
 def demo(unit=TOF_UNIT, seconds=0):
