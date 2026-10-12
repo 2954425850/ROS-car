@@ -221,6 +221,27 @@ def target_from_pixel(joints, u, v, z_target_m, k=K_AI320x180_CHN2, min_down=0.3
     return P, Z_axial, t
 
 
+def target_from_pixel_depth(joints, u, v, z_axial_m, k=K_AI320x180_CHN2):
+    """像素 + **实测的光轴方向深度** → (目标基座系坐标, 沿射线的欧氏距离)，米。
+
+    这是 `target_from_pixel` 的对偶：那边靠"假设目标落在某个水平面"求 t，
+    这边直接用 ToF 实测的轴向深度 Z 反解 `t = Z / (d·轴)`。
+
+    ★ 与平面法的一个实际好处：**不再要求视线别太贴平面**（那边 `d_z > -0.3` 就拒），
+    所以浅角度看目标也能测 —— 而浅角度正是平面法最容易"自洽但错"的地方。
+    """
+    C, d = pixel_ray(joints, u, v, k)
+    _, axis = fk(joints)                 # geom.py 顶部已有 `from .arm_kin import fk`
+    cos_ax = sum(d[i] * axis[i] for i in range(3))
+    if cos_ax <= 1e-6:
+        raise ValueError('视线与光轴近垂直（cos=%.6f），深度不可用' % cos_ax)
+    t = z_axial_m / cos_ax
+    if t <= 0.0:
+        raise ValueError('实测深度非正（t=%.4f）' % t)
+    P = tuple(C[i] + t * d[i] for i in range(3))
+    return P, t
+
+
 def project(joints, P_base, k=K_AI320x180_CHN2):
     """基座系点 → 像素（含畸变）。正解，给检验 P3/P4 与自检用。"""
     C = camera_center(joints)

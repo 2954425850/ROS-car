@@ -171,3 +171,43 @@ def test_stream_and_ai_frames_are_a_uniform_div4():
         assert abs(sv / geom.STREAM_H - v / k.h) < 1e-12
         bu, bv = geom.to_ai(su, sv)
         assert abs(bu - u) < 1e-9 and abs(bv - v) < 1e-9
+
+
+# ---------------- 实测深度分支（ToF：ray × 光轴深度）----------------
+
+def _axial_depth_m(joints, P):
+    """基座系点 P 相对相机光轴的「光轴方向深度」。（这就是 ToF 报的那个量。）"""
+    C = geom.camera_center(joints)
+    _, axis = fk(joints)
+    d = [P[i] - C[i] for i in range(3)]
+    n = math.sqrt(sum(x * x for x in d))
+    return n * sum((d[i] / n) * axis[i] for i in range(3))
+
+
+def test_depth_round_trips_through_project():
+    """拿一个已知基座系点 P：投影成像素、算它的光轴深度，再用
+    target_from_pixel_depth 还原 —— 必须回到 P。"""
+    P = geom.gripper_tip(POSE)            # 爪尖：在相机前方，且明显偏离光轴
+    u, v = geom.project(POSE, P)
+    z = _axial_depth_m(POSE, P)
+    P2, t = geom.target_from_pixel_depth(POSE, u, v, z)
+    assert abs(t - math.dist(P, geom.camera_center(POSE))) < 1e-3
+    for a, b in zip(P, P2):
+        assert abs(a - b) < 1e-3          # 1mm：畸变是迭代反解的，留一点余量
+
+
+def test_depth_is_independent_of_the_plane():
+    """给的深度变一倍，解出的点必须跟着变一倍（不是被某个平面钉住）。"""
+    P = geom.gripper_tip(POSE)
+    u, v = geom.project(POSE, P)
+    z = _axial_depth_m(POSE, P)
+    _, t1 = geom.target_from_pixel_depth(POSE, u, v, z)
+    _, t2 = geom.target_from_pixel_depth(POSE, u, v, 2.0 * z)
+    assert abs(t2 - 2.0 * t1) < 1e-6
+
+
+def test_depth_rejects_nonpositive():
+    with pytest.raises(ValueError):
+        geom.target_from_pixel_depth(POSE, 160.0, 90.0, 0.0)
+    with pytest.raises(ValueError):
+        geom.target_from_pixel_depth(POSE, 160.0, 90.0, -0.2)
