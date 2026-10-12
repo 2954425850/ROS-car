@@ -768,3 +768,15 @@ def test_estimate_survives_unmodelled_camera_latency():
     assert rep['ok'], rep['stopped']
     O = dict(rep['O_phase_end'])['descend']
     assert _m.dist(O, CAP) <= 0.003, O
+
+
+# ---- Task 6: Obs.depth_mm 打通 --------------------------------------------------
+
+def test_obs_depth_defaults_to_none():
+    o = grasp.Obs(1.0, 10.0, 20.0, 7, 'track', [0.1, 0.1, 0.2, 0.2])
+    assert o.depth_mm is None
+
+
+def test_obs_carries_depth():
+    o = grasp.Obs(1.0, 10.0, 20.0, 7, 'track', None, 420)
+    assert o.depth_mm == 420

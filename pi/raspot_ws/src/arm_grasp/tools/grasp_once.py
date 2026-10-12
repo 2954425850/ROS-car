@@ -145,7 +145,8 @@ def one_obs(want_norm, timeout=OBS_WAIT_S):
             if b is not None:
                 u, v = observe.box_center_ai(b['box'])
                 return grasp.Obs(time.monotonic(), u, v, r.get('frame'),
-                                 b.get('src', 'det'), b['box'])
+                                 b.get('src', 'det'), b['box'],
+                                 b.get('depth_mm'))
         time.sleep(0.05)
     return None
 
@@ -191,7 +192,8 @@ class GraspLink(ArmLink):
         self.last_box, self.last_src = b['box'], b.get('src', 'det')
         u, v = observe.box_center_ai(b['box'])
         self.n_obs += 1
-        return grasp.Obs(self.now() - age, u, v, r.get('frame'), self.last_src, b['box'])
+        return grasp.Obs(self.now() - age, u, v, r.get('frame'), self.last_src, b['box'],
+                         b.get('depth_mm'))
 
 
 # --------------------------------------------------------------------------

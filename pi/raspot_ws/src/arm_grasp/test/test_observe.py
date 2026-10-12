@@ -129,3 +129,22 @@ def test_fresh_result_aged_reports_file_age(tmp_path):
     assert 0.75 <= age <= 1.2, age
     assert observe.fresh_result_aged(str(p), max_age_s=0.5) is None     # 太旧
     assert observe.fresh_result(str(p), max_age_s=1.5)['frame'] == 3     # 老接口不变
+
+
+# ---- Task 6: pick_box 透传 depth_mm --------------------------------------------
+
+def test_pick_box_keeps_depth_field():
+    result = {"frame": 3, "objs": [
+        {"cls": "chair", "score": .9, "box": [.4, .4, .6, .6],
+         "depth_mm": 420, "src": "track"},
+    ]}
+    b = observe.pick_box(result)
+    assert b["depth_mm"] == 420
+
+
+def test_pick_box_tolerates_missing_depth():
+    result = {"frame": 4, "objs": [
+        {"cls": "chair", "score": .9, "box": [.4, .4, .6, .6], "src": "track"},
+    ]}
+    b = observe.pick_box(result)
+    assert b.get("depth_mm") is None

@@ -28,7 +28,8 @@ def _refuse(msg):
     return Refused(msg)
 
 
-Obs = namedtuple('Obs', 't_arrive u_ai v_ai frame src box_norm')
+Obs = namedtuple('Obs', 't_arrive u_ai v_ai frame src box_norm depth_mm',
+                 defaults=(None,))
 Vis = namedtuple('Vis', 'u_lo u_hi v_lo v_hi')
 Target = namedtuple('Target', 'alpha s_m joints fields slack err_m visible upx vpx')
 
