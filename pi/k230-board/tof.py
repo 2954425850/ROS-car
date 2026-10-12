@@ -78,6 +78,17 @@ FAST_BAUD_INDEX = 5     # 921600；实测 100x100 → 6.8 fps（115200 只有 1.
 TOF_UNIT = 4
 
 READ_CHUNK = 512
+
+# ★★ 每条命令前先送几个裸 CR —— **不是装饰，是必须的**。
+#
+# 2026-10-12 实测（隔离出来的）：在**错的波特率**上发过一次 `AT\r` 之后，模块在它**真实**
+# 波特率上就**一个字节都不回了** —— 因为那串被 8 倍过采样解成垃圾、**不含 `\r`** 的字节
+# 堆在模块的 AT 行缓冲里；之后正确的 `AT\r` 被拼在垃圾后面，成了个不认识的命令。
+# 证据链：污染后 `AT\r` → 0 字节；`\r\r\rAT\r` → 立刻 `OK`；再污染几次又自己好了
+# （攒够 CR 把脏行结掉）。
+# ⇒ 探测循环里"第一次在错波特率试一下就再也连不上"就是这个原因（不是时序、不是线）。
+# 对正常通信无害：空行被模块忽略。
+CMD_CR_FLUSH = "\r\r\r"
 INIT_WAIT_MS = 1500     # 上电后等模块稳定再搭话
 
 
@@ -136,7 +147,7 @@ class A010(object):
         # 当成这一条的响应，整条 init 时序错位一拍（2026-10-10 实测：
         # AT+UNIT=4 读到的是 AT+COEFF? 的回答，后面全乱）。
         self._drain(quiet_ms=30, max_ms=150)
-        self.uart.write(text + "\r")
+        self.uart.write(CMD_CR_FLUSH + text + "\r")
         got = b""
         t0 = time.ticks_ms()
         while time.ticks_diff(time.ticks_ms(), t0) < timeout_ms:
@@ -155,7 +166,7 @@ class A010(object):
         time.sleep_ms(INIT_WAIT_MS)
         # 板子可能正卡在"上一次会话没关、还在猛吐数据"的状态。这时光靠 drain
         # 清不完（数据是**持续**的，永远等不到静默）。所以先叫停出图，再清。
-        self.uart.write("AT+ISP=0\r")
+        self.uart.write(CMD_CR_FLUSH + "AT+ISP=0\r")
         time.sleep_ms(120)
         self._drain(quiet_ms=60, max_ms=600)   # 把在途的帧数据一并清掉
 
@@ -184,22 +195,33 @@ class A010(object):
         return True
 
     def ping(self, timeout_ms=600):
-        """发一条 AT，回 OK 才算通。用来探测模块当前挂在哪个波特率上。"""
-        self._drain(quiet_ms=30, max_ms=120)
-        self.uart.read(4096)
-        self.uart.write("AT\r")
-        got = b""
-        t0 = time.ticks_ms()
-        while time.ticks_diff(time.ticks_ms(), t0) < timeout_ms:
-            d = self.uart.read(READ_CHUNK)
-            if d:
-                got += d
-                if b"OK" in got:
-                    return True
-                if b"ERR" in got:
-                    return False
-            else:
-                time.sleep_ms(2)
+        """发 `AT`，回 `OK` 才算通。用来探测模块当前挂在哪个波特率上。
+
+        ★ **要发两次**（2026-10-12 实测隔离出来的）：
+        在**错的波特率**上试过一次之后，模块的行缓冲里会堆一截不含 `\r` 的垃圾；
+        此时在它**真实**波特率上发第一条 `AT`（即使前面带了 `CMD_CR_FLUSH` 的裸 CR）
+        **只够把那截脏行洗掉，拿不到 OK** —— 实测同一位置 `ping()` 返回 False，
+        紧接着再发一次同样的字节就回 `OK`。
+        ⇒ 第一次短等（够"错的波特率"快速跳过），第二次给足时间。
+        不这么做的话，`app.py` 开机探测会**系统性失败**（先把 115200 试错一次，
+        后面那个真的波特率就再也 ping 不到了）。
+        """
+        for attempt in range(2):
+            self.uart.read(65536)
+            self.uart.write(CMD_CR_FLUSH + "AT\r")
+            got = b""
+            t0 = time.ticks_ms()
+            limit = timeout_ms if attempt else 200      # 第一发短等，别拖累探测
+            while time.ticks_diff(time.ticks_ms(), t0) < limit:
+                d = self.uart.read(READ_CHUNK)
+                if d:
+                    got += d
+                    if b"OK" in got:
+                        return True
+                    if b"ERR" in got:
+                        break
+                else:
+                    time.sleep_ms(2)
         return False
 
     def stop_stream(self):
@@ -251,6 +273,26 @@ def _show(b, limit=48):
 
 
 _PROBE_ORDER = (115200, 230400, 921600, 460800, 3000000)
+PROBE_ATTEMPTS = 2          # 探测轮数：开板后**第一次握手可能整个失败**（2026-10-12 实测）
+
+
+def _probe(attempts=PROBE_ATTEMPTS):
+    """按 `_PROBE_ORDER` 找模块挂在哪个波特率上；找到返回一个已开好的 A010，否则 None。
+
+    ★ **必须重试**：2026-10-12 实测，板子刚上电/刚软复位后的**第一次握手会整个失败**
+    （所有波特率都 ping 不到），隔一拍重来就正常。不重试的话：`app.py` 开机探测失败
+    ⇒ `depth_mm` 整场为 null ⇒ Pi 的盲区硬闸直接拒绝下扎 —— **抓取静默失效**，
+    而且现象看起来像"ToF 坏了"，极难查。
+    """
+    for k in range(attempts):
+        for b in _PROBE_ORDER:
+            d = A010(baud=b)
+            if d.ping():
+                return d
+            d.close()
+        if k + 1 < attempts:
+            time.sleep_ms(300)
+    return None
 
 
 def open_tof(fast=True, unit=TOF_UNIT):
@@ -260,13 +302,7 @@ def open_tof(fast=True, unit=TOF_UNIT):
       （改过波特率又没断电时它还在别处；模块的设置掉电不保存，见文件头）。
     * 提速顺序：停流 → AT+BAUD=5 → **关掉再用新波特率重开** → 开流。
     """
-    dev = None
-    for b in _PROBE_ORDER:
-        d = A010(baud=b)
-        if d.ping():
-            dev = d
-            break
-        d.close()
+    dev = _probe()
     if dev is None:
         return None, None
     dev.init(unit=unit)
@@ -275,10 +311,16 @@ def open_tof(fast=True, unit=TOF_UNIT):
     dev.stop_stream()
     dev.set_baud_index(FAST_BAUD_INDEX)
     dev.close()
-    time.sleep_ms(600)
-    dev = A010(baud=BAUD_INDEX_TO_RATE[FAST_BAUD_INDEX])
-    if not dev.ping():
-        dev.close()
+    # 切完波特率后也要重试：模块切换需要一点时间，一次 ping 不到不能就判死。
+    dev = None
+    for _ in range(4):
+        time.sleep_ms(300)
+        d = A010(baud=BAUD_INDEX_TO_RATE[FAST_BAUD_INDEX])
+        if d.ping():
+            dev = d
+            break
+        d.close()
+    if dev is None:
         return None, None
     dev.stop_stream()
     dev.cmd("AT+UNIT=%d" % unit)
