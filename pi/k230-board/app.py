@@ -7,6 +7,29 @@ MicroPython 的 _thread 在这块板子上与 MPP 的配合没验证过，**不�
 所有"取一帧"的动作都是非阻塞或短超时的（pusher 100 ms / rtsp 0），
 在一个循环里轮流推进 —— Task 4 已证单线程 `pump()` 与官方 _thread 版等效。
 
+## 主循环节拍：**一轮里绝不能有阻塞等待**（2026-10-01 的教训）
+
+设计节拍是 10 Hz（`INFER_HZ`），但 2026-10-01 在车上实测只有 **0.6 Hz** ——
+推理、人脸、跟踪、上报**全都被拖慢 16 倍**。原因不是推理慢，是主循环里有阻塞等待：
+
+    推流目标 192.168.5.1:8555 不可达（本车常态）
+      -> pusher.pump() 返回 -2
+      -> time.sleep_ms(1000)          # 1.0 s —— **整条循环陪着睡**
+      -> pusher.connect() 跑满超时     # 0.5 s（实测 0.501 s）
+      = 每轮白付 1.5 s，再加结果上报那 0.2 s ≈ 1.7 s/轮
+
+**修法：一律按时间戳节流，不在循环里 sleep。**
+
+  - 推流重连：`t_push_retry` + `config.PUSH_RETRY_MS`（10 s 一次 ——
+    因为**单次尝试本身就要 0.5 s**，间隔太短等于没改）
+  - 结果上报重连：`Reporter.connect()` 内部节流（`retry_ms`，默认 2 s）——
+    这样 `if not r.ok: r.connect()` 这个惯用法才是真免费
+  - 两个 `pump()` 本来就是短超时/非阻塞的（pusher 100 ms、rtsp 0）
+
+⚠️ **以后加任何 IO 都照这个办**：调用要么本身非阻塞、要么自带节流。
+**不许拿循环去等一个 socket。** "反正是后台任务"不是理由 —— 这里没有后台任务，
+只有一个循环，谁阻塞它谁就拖慢全部。
+
 ## 四处按实测修正的地方（照抄计划原版会踩）
 
 1. **不用 `from libs.PipeLine import PipeLine`**，计划里那句是多余的。
@@ -80,7 +103,32 @@ MicroPython 的 _thread 在这块板子上与 MPP 的配合没验证过，**不�
 那是 K230 自己的事。
 
 **任一条外部命令都会关掉"检测器自动锁定"**（`det_auto = False`）：人来指定就是命令，
-不能被下一帧的检测器覆盖掉。目前**没有"切回检测器驱动"的命令**，要回去只能重启。
+不能被下一帧的检测器覆盖掉。`{"cmd": "auto"}` 可以切回检测器驱动
+（2026-09-19 加的；在那之前只能重启，这句注释当时写的就是"没有切回来的命令"，已过期）。
+
+## 避障数据：给雷达补盲区（8559）
+
+`obstacles.py` 每 10 Hz 把**这一帧的检测结果**编成「障碍物语义」推给 Pi：
+
+    {"ts": <epoch_ms>, "frame": <n>,
+     "obstacles": [{"type":"chair", "score":0.71, "box":[l,t,r,b],
+                    "h_ratio":0.32, "depth_zone":"mid", "priority":"low"}, ...],
+     "free_zones": [[0.0, 0.2], [0.6, 1.0]]}
+
+**只发雷达给不了的三样**：是什么（`type`）、挡在哪（`box`）、有多挡路
+（`depth_zone` / `priority` / `free_zones`）。**刻意不发距离** —— 单目没有距离，
+而且相机是**眼在手上**（机械臂末端），换算成米在本架构下没有意义。
+真距离由 Pi 侧的雷达给，两边在 Pi 上融合。
+
+三个必须记住的边界（理由详见 `obstacles.py` 文件头）：
+  1. `depth_zone` 是"框占画面多大"的粗分档，**不是测距**；
+  2. `free_zones` 是**粗糙代理量**不是可通行区域真值 —— 远处地面障碍会被当成不挡路，
+     Pi 侧不要拿它当结论；
+  3. **喂进去的是 `objs`，不含跟踪目标 `t_objs`** —— 跟踪目标是要抓/要跟的**目的物**，
+     不是要避开的障碍物，混进去会把规划器带偏。
+
+**云端结果上报那条路已整条删除**（2026-10-01）—— 理由见 `config.py` 里那段注释。
+8556（本地 Pi）是唯一的结果上报路径。
 
 ## 人脸：谁在场
 
@@ -146,6 +194,7 @@ from pusher import Pusher
 from rtsp_srv import RtspOut
 from results import encode, normalize
 from reporter import Reporter
+import obstacles
 from vision import Detector
 from tracker import Tracker
 from targets import (TargetRx, template_crop_side as tside,
@@ -157,9 +206,33 @@ INFER_HZ = 10.0                 # 推理 + 上报节拍（计划两块都是 0.1
 STATS_MS = 30000                # 30 s 一行 STATS，给长稳测试留证据
 
 
+def _obstacles_payload(objs, frame_no, ts_ms):
+    """检测结果 -> 8559 那一行 JSON。
+
+    组装放在这里（不放进 obstacles.py）是为了让那边**保持纯函数、不依赖 config** ——
+    纯函数才能脱离网络和硬件单独测（同 targets.py 的分法）。阈值全部从 config 传进去。
+    """
+    near_hi = config.OBSTACLE_NEAR_HI
+    mid_hi = config.OBSTACLE_MID_HI
+    zones = config.OBSTACLE_ZONES
+    bottom_min = config.OBSTACLE_ZONE_BOTTOM_MIN
+    h_min = config.OBSTACLE_ZONE_H_MIN
+    obs = obstacles.build(objs, near_hi, mid_hi,
+                          config.OBSTACLE_PRIO_HIGH, config.OBSTACLE_PRIO_LOW,
+                          zones, bottom_min, h_min)
+    free = obstacles.free_zones(objs, zones, bottom_min, h_min)
+    return obstacles.encode(obs, free, frame_no, ts_ms)
+
+
 def main():
     netup.init(config.WIFI_SSID, config.WIFI_PASS)
     while not netup.connect():
+        # ★ 这里以前**没有 os.exitpoint()** —— 于是 WiFi 起不来时，板子会卡在一条
+        #   **不可打断**的循环里：Ctrl-C 无效、raw REPL 进不去，**只能断电**
+        #   （README §7.6 记的就是这个坑）。而"WiFi 起不来"最常见的成因恰恰是
+        #   `config_local.py` 没放到卡上 —— 一个配置问题被放大成"板子像是坏了"。
+        #   补上这一行之后，Ctrl-C 随时能把控制权拿回来。
+        os.exitpoint()
         print("WIFI FAILED, retry")
         time.sleep(2)
     print("WIFI OK %s" % netup.ip())
@@ -252,15 +325,17 @@ def main():
     print("REPORTER connect=%s %s:%s" % (r_pi.connect(),
                                          config.RESULT_HOST, config.RESULT_PORT))
 
-    # 云端未就绪（CLOUD_RESULT_HOST 为空串）=> 不启用，**本地路径不因此失败**
-    r_cloud = None
-    if config.CLOUD_RESULT_HOST:
-        r_cloud = Reporter(config.CLOUD_RESULT_HOST, config.CLOUD_RESULT_PORT)
-        print("CLOUD connect=%s %s:%s" % (r_cloud.connect(),
-                                          config.CLOUD_RESULT_HOST,
-                                          config.CLOUD_RESULT_PORT))
+    # 避障数据（8559）：给 Pi 侧的"视觉补雷达盲区"。默认与 RESULT_HOST 同一台。
+    # ⚠️ 连不上**不能拖主循环** —— Reporter 本身是非阻塞的（发不出去就丢掉这一条，
+    #    绝不排队），所以和 8556 一样：对面不在，只是丢数据，推理节拍不受影响。
+    r_obs = None
+    if config.OBSTACLE_ENABLE:
+        obs_host = config.OBSTACLE_HOST or config.RESULT_HOST
+        r_obs = Reporter(obs_host, config.OBSTACLE_PORT)
+        print("OBSTACLE connect=%s %s:%s" % (r_obs.connect(),
+                                             obs_host, config.OBSTACLE_PORT))
     else:
-        print("CLOUD disabled (CLOUD_RESULT_HOST empty) - local path unaffected")
+        print("OBSTACLE disabled (config.OBSTACLE_ENABLE=False)")
 
     wd = Watchdog(config.PUSH_STALL_WARN_MS)
     # 用回调而不是每轮 print：停滞期每轮打一行会把 30 min 的日志刷爆
@@ -270,6 +345,7 @@ def main():
     t_start = time.ticks_ms()
     nxt = t_start
     t_stats = t_start
+    t_push_retry = t_start      # 下次允许尝试推流重连的时刻（见循环里 1) 那段注释）
     period = int(1000.0 / INFER_HZ)
     frame_no = 0
     obj_frames = 0
@@ -290,22 +366,6 @@ def main():
     face_err = 0            # 人脸环节报错的次数（只打第一条，免得刷屏）
     t_face_save = time.ticks_ms()   # 上次把库落盘的时刻
 
-    # ---- A010 ToF（可选：模块不在/线没接好都不能拖垮 app）----
-    tof_dev, tof_reader = None, None
-    if config.TOF_ENABLE:
-        try:
-            from tof import open_tof, TofReader
-            tof_dev, tof_baud = open_tof(fast=config.TOF_FAST, unit=config.TOF_UNIT)
-            if tof_dev is not None:
-                tof_reader = TofReader(tof_dev)
-                print("TOF OK baud=%s unit=%d fast=%s"
-                      % (tof_baud, config.TOF_UNIT, config.TOF_FAST))
-            else:
-                print("TOF WARN 探测不到模块 —— depth_mm 一律 null")
-        except Exception as e:
-            print("TOF EXC", e)
-            tof_dev, tof_reader = None, None
-
     try:
         while True:
             # ★ os.exitpoint()：**让它能被 Ctrl-C 打断。**
@@ -323,11 +383,20 @@ def main():
             # 1) 推流：每轮尽量取，不空转
             rc = pusher.pump()
             if rc == -2:
-                # 断线：退避后只重连 socket。**不要在这里重建 MPP 管线**（见文件头）
-                time.sleep_ms(config.RECONNECT_BACKOFF_MS)
-                if pusher.connect():
-                    print("PUSH RECONNECTED connects=%d" % pusher.connects)
-                    cam.request_idr(config.PUSH_CHN)   # 显式 no-op，见文件头第 4 条
+                # 断线：**到点了才试一次**重连。不要在这里重建 MPP 管线（见文件头）。
+                #
+                # ⚠️ 这里原来是 `time.sleep_ms(config.RECONNECT_BACKOFF_MS)`（1000 ms）。
+                #    那是**拿整条主循环去等一个 socket**：PUSH 目标不可达时（本车常态）
+                #    每轮白付 1.0 s sleep + 0.5 s connect 超时，把 10 Hz 的主循环
+                #    **拖成 0.6 Hz**（2026-10-01 在车上实测：8556 与 8559 两条上报
+                #    都是 0.6 条/秒）。推理/人脸/跟踪/上报全跟着一起慢 16 倍。
+                #    改成按时间戳节流后，没到点的那一轮**代价为零**。
+                now_ms = time.ticks_ms()
+                if time.ticks_diff(now_ms, t_push_retry) >= 0:
+                    t_push_retry = time.ticks_add(now_ms, config.PUSH_RETRY_MS)
+                    if pusher.connect():
+                        print("PUSH RECONNECTED connects=%d" % pusher.connects)
+                        cam.request_idr(config.PUSH_CHN)   # 显式 no-op，见文件头第 4 条
             # 看门狗每轮都喂（计划只在 rc==0 时喂，那样完全断流时它永不触发）
             wd.tick(pusher.frames_sent)
 
@@ -337,11 +406,6 @@ def main():
 
             # 2b) 外部目标框入口（非阻塞；只有人来命令时才有活）
             rx.poll()
-
-            # 2c) ToF：非阻塞取帧。**每拍只读几块，绝不长等** —— 本循环同时喂着
-            #     推流/RTSP/推理，板子上有"主循环里一个 sleep 拖到 1Hz"的前科。
-            if tof_reader is not None:
-                tof_reader.pump()
 
             # 3) 10 Hz：推理 + 上报（同一节拍，见文件头"偏离"）
             now = time.ticks_ms()
@@ -539,20 +603,6 @@ def main():
                     if trk.locked:
                         trk_frames += 1
 
-                    # ToF 深度：只给配置里的类挂，最多 TOF_MAX_BOXES 个（MicroPython
-                    # 下逐像素的 Python 循环很慢，不限量会拖掉 10Hz 节拍）。
-                    if tof_reader is not None:
-                        try:
-                            from tof_locate import attach_depths
-                            attach_depths(objs + t_objs, tof_reader.latest_frame,
-                                          config.TOF_UNIT, config.TOF_MAP,
-                                          classes=config.TOF_CLASSES,
-                                          max_boxes=config.TOF_MAX_BOXES,
-                                          pad=config.TOF_PAD,
-                                          min_mm=config.TOF_MIN_MM)
-                        except Exception as e:
-                            print("TOF attach EXC", e)
-
                     # 上报 = **本帧真实的检测结果** + 跟踪器的连续目标。
                     #
                     # ⚠️ 这里**不再沿用上一帧的 last_objs**。原来的写法会把陈旧坐标当新数据
@@ -560,16 +610,22 @@ def main():
                     # **连续性现在交给跟踪器**，不再靠"保持上一帧"——那是两回事，不能混。
                     #
                     # w/h 用**推流**分辨率：前端拿归一化坐标 × 自己的显示尺寸
+                    ts_ms = int(time.time() * 1000)   # 平台限制：只有秒级精度（见文件头第 3 条）
                     payload = encode(objs + t_objs, config.WIDTH, config.HEIGHT,
-                                     frame_no, int(time.time() * 1000),
-                                     faces=fobjs)
+                                     frame_no, ts_ms, faces=fobjs)
                     if not r_pi.ok:
                         r_pi.connect()
                     r_pi.send(payload)
-                    if r_cloud is not None:
-                        if not r_cloud.ok:
-                            r_cloud.connect()
-                        r_cloud.send(payload)
+
+                    # ---- 避障数据（8559）：视觉给雷达补盲区 ----
+                    # ⚠️ 喂进去的是 **objs**，不是 `objs + t_objs`：
+                    #    跟踪器跟的是"人指定的那个目标"（要抓的桃、要跟随的人）——
+                    #    那是**目的物**，不是要避开的障碍物。混进障碍列表会把规划器带偏。
+                    #    理由见 obstacles.py 文件头第 3 条。
+                    if r_obs is not None:
+                        if not r_obs.ok:
+                            r_obs.connect()
+                        r_obs.send(_obstacles_payload(objs, frame_no, ts_ms))
                 else:
                     print("SNAPSHOT None")
                 gc.collect()
@@ -579,6 +635,7 @@ def main():
                 t_stats = now
                 print("STATS t=%ds frame=%d obj=%d sent=%d dropped=%d lost=%d "
                       "conns=%d rtsp=%d rtsp_empty=%d stall=%d report=%d/%d "
+                      "obs=%d/%d "
                       "trk=%d lock=%d rel=%d iou=%.2f tgt=%d/%d auto=%d "
                       "face=%d ok=%d known=%d add=%d err=%d mem=%d"
                       % (time.ticks_diff(now, t_start) // 1000, frame_no, obj_frames,
@@ -586,6 +643,8 @@ def main():
                          pusher.lost_events, pusher.connects,
                          rtsp.frames, rtsp.empty, wd.stalls,
                          r_pi.sent, r_pi.dropped,
+                         r_obs.sent if r_obs is not None else -1,
+                         r_obs.dropped if r_obs is not None else -1,
                          trk_frames, trk_locks, trk_releases, trk_iou,
                          rx.recv_ok, rx.recv_bad, 1 if det_auto else 0,
                          face_seen, face_ok, face_known, face_added, face_err,
@@ -605,6 +664,11 @@ def main():
         except Exception as e:
             print("app: rtsp.stop EXC", e)
         try:
+            if r_obs is not None:
+                r_obs.close()
+        except Exception as e:
+            print("app: r_obs.close EXC", e)
+        try:
             rx.close()
         except Exception as e:
             print("app: rx.close EXC", e)
@@ -622,12 +686,6 @@ def main():
             det.deinit()
         except Exception as e:
             print("app: det.deinit EXC", e)
-        try:
-            if tof_dev is not None:
-                tof_dev.stop_stream()
-                tof_dev.close()
-        except Exception as e:
-            print("app: tof.close EXC", e)
         gc.collect()
         print("APP CLEANUP_DONE MEM %d" % gc.mem_free())
 
