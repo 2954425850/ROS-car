@@ -130,7 +130,7 @@ def test_pick_target_breaks_slack_ties_toward_prefer_alpha():
 # ---------------------------------------------------------------------------
 # Task 5：流式主循环 + 估计器（M2）
 # ---------------------------------------------------------------------------
-from arm_grasp.arm_kin import from_fields, to_fields
+from arm_grasp.arm_kin import from_fields, to_fields, fk
 from arm_grasp.servo import ik_open_m
 
 
@@ -780,3 +780,65 @@ def test_obs_depth_defaults_to_none():
 def test_obs_carries_depth():
     o = grasp.Obs(1.0, 10.0, 20.0, 7, 'track', None, 420)
     assert o.depth_mm == 420
+
+
+# ---- Task 7: estimate_point 用上实测深度 ----------------------------------------
+
+def _axial_depth_m(joints, P):
+    """基座系点 P 相对相机光轴的光轴方向深度（= ToF 报的那个量），米。"""
+    C = geom.camera_center(joints)
+    _, axis = fk(joints)
+    d = [P[i] - C[i] for i in range(3)]
+    n = math.sqrt(sum(x * x for x in d))
+    return n * sum((d[i] / n) * axis[i] for i in range(3))
+
+
+class DepthLink(FakeLink):
+    """FakeLink 的观测里带上 depth_mm。depth='auto' 按**真值**算（好深度）；
+    给具体数字就是故意喂错的深度。"""
+
+    def __init__(self, *a, depth=None, **kw):
+        super().__init__(*a, **kw)
+        self._depth = depth
+
+    def obs(self):
+        o = super().obs()
+        if o is None:
+            return None
+        d = (_axial_depth_m(self.p.j, self.O) * 1000.0
+             if self._depth == 'auto' else self._depth)
+        return o._replace(depth_mm=d)
+
+
+def test_loop_converges_with_measured_depth():
+    """给真值深度、**不用 --h**（z_plane 保持默认 1.6cm）也必须收敛。"""
+    cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300)
+    plant = Plant(_start_joints())
+    rep = grasp.run(cfg, DepthLink(plant, CAP, depth='auto'))
+    assert rep['ok'] is True
+
+
+def test_measured_depth_wins_over_z_plane():
+    """★ 关键一条：把 z_plane 改到离谱（1 m），结果必须**一模一样** —— 证明走的是深度分支。
+    若 estimate_point 无视 depth_mm，这条必红。"""
+    cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300)
+    r1 = grasp.run(cfg._replace(z_plane_m=0.016),
+                   DepthLink(Plant(_start_joints()), CAP, depth='auto'))
+    r2 = grasp.run(cfg._replace(z_plane_m=1.000),
+                   DepthLink(Plant(_start_joints()), CAP, depth='auto'))
+    assert r1['ok'] and r2['ok']
+    assert max(abs(a - b) for a, b in zip(r1['O_last'], r2['O_last'])) < 1e-9
+
+
+def test_absurd_depth_does_not_grab():
+    """深度离谱地大（4 m，目标其实 20 cm）⇒ 目标点跑飞，必须判失败而不是硬抓。"""
+    cfg = _cfg()._replace(hz=10.0, max_seconds=20.0, max_ticks=200)
+    rep = grasp.run(cfg, DepthLink(Plant(_start_joints()), CAP, depth=4000.0))
+    assert rep['ok'] is False
+
+
+def test_plane_path_still_works_without_depth():
+    """观测里没有 depth_mm ⇒ 老的水平面路径原样可用（`--h` 兜底）。"""
+    cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300)
+    rep = grasp.run(cfg, FakeLink(Plant(_start_joints()), CAP))
+    assert rep['ok'] is True

@@ -331,20 +331,28 @@ def standoff_along_axis(tip_m, O_m, alpha_deg):
 def estimate_point(trace, obs, z_plane_m, latency_s):
     """一条观测 → 基座系目标点 O。
 
-    ① 时间对齐：用 `obs.t_arrive − latency_s` 去 Trace 里取"拍那张图那一刻"的关节状态
-       （K230 的框是"过去"的，拿"现在"的关节去算几何会把误差按臂速放大）
-    ② 射线 ∩ 平面(z=z_plane_m) → O
+    ★ 两条路：
+      * `obs.depth_mm` 有值（ToF 实测）⇒ **射线 × 实测光轴深度**。这是首选。
+      * 否则 ⇒ 老的 **射线 ∩ 假设平面 z=z_plane_m**（`--h` 兜底路径）。
 
-    返回 (O, C, d, joints, t_frame)。算不出来一律 `Refused`（**绝不返回垃圾深度**）。
+    返回 (O, C, d, joints, t_frame)。**绝不返回垃圾深度** —— 算不出来一律 Refused。
     """
     t_frame = obs.t_arrive - latency_s
     fbf = trace.at(t_frame, 'auto')
     j = from_fields(fbf)
+    C, d = geom.pixel_ray(j, obs.u_ai, obs.v_ai)
+    depth_mm = getattr(obs, 'depth_mm', None)
+    if depth_mm is not None:
+        try:
+            P, _t = geom.target_from_pixel_depth(
+                j, obs.u_ai, obs.v_ai, float(depth_mm) / 1000.0)
+        except ValueError as e:
+            raise _refuse('算不出目标点（实测深度）：%s' % e)
+        return P, C, d, j, t_frame
     try:
         P, _, _ = geom.target_from_pixel(j, obs.u_ai, obs.v_ai, z_plane_m)
     except ValueError as e:
         raise _refuse('算不出目标点：%s' % e)
-    C, d = geom.pixel_ray(j, obs.u_ai, obs.v_ai)
     if d[2] > -0.3:
         raise _refuse('射线太平（d_z=%.3f），深度不可用' % d[2])
     return P, C, d, j, t_frame
