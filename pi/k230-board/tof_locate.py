@@ -82,3 +82,17 @@ def locate_depth(frame, box_norm, unit_mm, map_cfg=None, pad=0.06,
     if region is None:
         return None
     return region_depth(frame, region, unit_mm, min_mm, val_max)
+
+
+def attach_depths(objs, frame, unit_mm, map_cfg=None, classes=None,
+                  max_boxes=3, pad=0.06, min_mm=MIN_MM):
+    """就地给 objs 里的目标框挂 `depth_mm`（毫米整数，或 None）。
+
+    只处理 `classes` 里的类（None = 全部），且**最多 max_boxes 个**（按框面积从大到小）——
+    MicroPython 下逐像素的 Python 循环很慢，框一多会让 10Hz 的推理节拍掉帧。
+    """
+    picks = [o for o in objs if classes is None or o.get("cls") in classes]
+    picks.sort(key=lambda o: -((o["box"][2] - o["box"][0]) * (o["box"][3] - o["box"][1])))
+    for o in picks[:max_boxes]:
+        o["depth_mm"] = locate_depth(frame, o["box"], unit_mm, map_cfg,
+                                     pad=pad, min_mm=min_mm)

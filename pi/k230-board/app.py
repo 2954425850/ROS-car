@@ -290,6 +290,22 @@ def main():
     face_err = 0            # 人脸环节报错的次数（只打第一条，免得刷屏）
     t_face_save = time.ticks_ms()   # 上次把库落盘的时刻
 
+    # ---- A010 ToF（可选：模块不在/线没接好都不能拖垮 app）----
+    tof_dev, tof_reader = None, None
+    if config.TOF_ENABLE:
+        try:
+            from tof import open_tof, TofReader
+            tof_dev, tof_baud = open_tof(fast=config.TOF_FAST, unit=config.TOF_UNIT)
+            if tof_dev is not None:
+                tof_reader = TofReader(tof_dev)
+                print("TOF OK baud=%s unit=%d fast=%s"
+                      % (tof_baud, config.TOF_UNIT, config.TOF_FAST))
+            else:
+                print("TOF WARN 探测不到模块 —— depth_mm 一律 null")
+        except Exception as e:
+            print("TOF EXC", e)
+            tof_dev, tof_reader = None, None
+
     try:
         while True:
             # ★ os.exitpoint()：**让它能被 Ctrl-C 打断。**
@@ -321,6 +337,11 @@ def main():
 
             # 2b) 外部目标框入口（非阻塞；只有人来命令时才有活）
             rx.poll()
+
+            # 2c) ToF：非阻塞取帧。**每拍只读几块，绝不长等** —— 本循环同时喂着
+            #     推流/RTSP/推理，板子上有"主循环里一个 sleep 拖到 1Hz"的前科。
+            if tof_reader is not None:
+                tof_reader.pump()
 
             # 3) 10 Hz：推理 + 上报（同一节拍，见文件头"偏离"）
             now = time.ticks_ms()
@@ -518,6 +539,20 @@ def main():
                     if trk.locked:
                         trk_frames += 1
 
+                    # ToF 深度：只给配置里的类挂，最多 TOF_MAX_BOXES 个（MicroPython
+                    # 下聚类是逐像素循环，不限量会拖掉 10Hz 节拍）。
+                    if tof_reader is not None:
+                        try:
+                            from tof_locate import attach_depths
+                            attach_depths(objs + t_objs, tof_reader.latest_frame,
+                                          config.TOF_UNIT, config.TOF_MAP,
+                                          classes=config.TOF_CLASSES,
+                                          max_boxes=config.TOF_MAX_BOXES,
+                                          pad=config.TOF_PAD,
+                                          min_mm=config.TOF_MIN_MM)
+                        except Exception as e:
+                            print("TOF attach EXC", e)
+
                     # 上报 = **本帧真实的检测结果** + 跟踪器的连续目标。
                     #
                     # ⚠️ 这里**不再沿用上一帧的 last_objs**。原来的写法会把陈旧坐标当新数据
@@ -587,6 +622,12 @@ def main():
             det.deinit()
         except Exception as e:
             print("app: det.deinit EXC", e)
+        try:
+            if tof_dev is not None:
+                tof_dev.stop_stream()
+                tof_dev.close()
+        except Exception as e:
+            print("app: tof.close EXC", e)
         gc.collect()
         print("APP CLEANUP_DONE MEM %d" % gc.mem_free())
 
