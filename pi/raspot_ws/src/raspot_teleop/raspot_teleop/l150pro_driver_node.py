@@ -178,6 +178,14 @@ class L150ProDriverNode(Node):
         baud = int(self.get_parameter('baud').value)
         self.arm_t_ms = int(self.get_parameter('arm_t_ms').value)
         self.require_online = bool(self.get_parameter('require_online').value)
+        # ★ 2026-10-12（用户点头）：底盘速度限幅做成 ROS 参数。
+        #   原来是写死的 `min(max(x, -0.5), 0.5)` / `±1.5`，那两行在冻结名单里
+        #   （`chassis_tick`）。**默认值一个没动（0.5 / 1.5）⇒ 行为与冻结版逐字一致**，
+        #   做成参数只是为了让台架上量传动速度上限时能
+        #   `ros2 param set /l150pro_driver max_vx 1.8` —— 改完立即生效、不用重启服务、
+        #   也不用再改代码（同 `l150pro_ws` 那份驱动的做法）。测完 set 回 0.5 即可。
+        self.declare_parameter('max_vx', 0.5)
+        self.declare_parameter('max_wz', 1.5)
 
         self.pub_voltage = self.create_publisher(Float32, 'battery_voltage', 10)
         self.pub_faults = self.create_publisher(Int32, 'chassis_faults', 10)
@@ -301,8 +309,11 @@ class L150ProDriverNode(Node):
         if self.estop or (now - self.tw_time) > CMD_STALE_S:
             vx = wz = 0.0
         else:
-            vx = min(max(self.tw.linear.x, -0.5), 0.5)
-            wz = min(max(self.tw.angular.z, -1.5), 1.5)
+            # 限幅值每拍现读一次 ⇒ `ros2 param set` 立刻生效（默认仍是冻结版的 0.5/1.5）
+            lim_vx = float(self.get_parameter('max_vx').value)
+            lim_wz = float(self.get_parameter('max_wz').value)
+            vx = min(max(self.tw.linear.x, -lim_vx), lim_vx)
+            wz = min(max(self.tw.angular.z, -lim_wz), lim_wz)
         self.seq_aa = (self.seq_aa + 1) & 0xFF
         self.rx.send(build_chassis(int(round(vx * 1000)), 0, int(round(wz * 1000)),
                                    0x03 if self.estop else 0x01, self.seq_aa))

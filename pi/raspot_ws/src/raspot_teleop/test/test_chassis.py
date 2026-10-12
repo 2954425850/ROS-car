@@ -275,6 +275,42 @@ def test_node_tick_calls_the_port_exactly_once():
     assert isinstance(gear, ast.Attribute) and gear.attr == 'gear'
 
 
+# --------------------------------------------------------------------------
+# 接线：驱动的底盘限幅（冻结行，2026-10-12 改成读参数）
+# --------------------------------------------------------------------------
+
+def _driver_tree():
+    path = (pathlib.Path(__file__).resolve().parents[1]
+            / 'raspot_teleop' / 'l150pro_driver_node.py')
+    return ast.parse(path.read_text(encoding='utf-8'))
+
+
+def test_driver_clamp_max_vx_is_a_param_with_the_frozen_defaults():
+    """`chassis_tick` 里那两行 ±0.5/±1.5 在冻结名单里，2026-10-12 改成读 ROS 参数
+    （为了台架上量传动上限）。**默认值必须还是 0.5/1.5**，否则冻结的行为就被改了：
+      · `chassis_tick` 里不许再出现写死的 0.5 / 1.5，而且必须真的去读参数
+      · `__init__` 里声明 `max_vx=0.5` / `max_wz=1.5`"""
+    fns = {f.name: f for f in
+           next(n for n in ast.walk(_driver_tree()) if isinstance(n, ast.ClassDef)
+                and any(isinstance(b, ast.FunctionDef) and b.name == 'chassis_tick'
+                        for b in n.body)).body
+           if isinstance(f, ast.FunctionDef)}
+    tick = fns['chassis_tick']
+    lits = {n.value for n in ast.walk(tick)
+            if isinstance(n, ast.Constant) and isinstance(n.value, float)}
+    assert not (lits & {0.5, 1.5}), f'chassis_tick 里还有写死的限幅：{lits}'
+    assert any(isinstance(n, ast.Attribute) and n.attr == 'get_parameter'
+               for n in ast.walk(tick)), 'chassis_tick 没在读限幅参数'
+    declared = {}
+    for n in ast.walk(fns['__init__']):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == 'declare_parameter' and len(n.args) == 2
+                and all(isinstance(a, ast.Constant) for a in n.args)):
+            declared[n.args[0].value] = n.args[1].value
+    assert declared.get('max_vx') == 0.5, declared.get('max_vx')
+    assert declared.get('max_wz') == 1.5, declared.get('max_wz')
+
+
 # ==========================================================================
 # ★ 变异锚点（2026-10-12 逐条改过、确认能红。全绿不算证据）
 #   改 chassis.py / ps2_teleop_node.py 里的**一处**，跑本文件，看它红在哪：
@@ -298,6 +334,10 @@ def test_node_tick_calls_the_port_exactly_once():
 #  10. 节点 tick 里又加一行 `self.sm_th = 0.0`（底盘 LPF 复活）
 #  11. 节点 `__init__` 里删掉 `self.sm_sh = self.sm_bs = 0.0`（顺手清"没用到的"）
 #        → 10/11 都红在 test_node_keeps_arm_state_and_drops_chassis_state
+#
+#  12. 驱动 `chassis_tick`：限幅改回写死的 `min(max(x, -0.5), 0.5)`
+#  13. 驱动 `__init__`：`declare_parameter('max_vx', 0.5)` 的默认值改成 1.8
+#        → 12/13 都红在 test_driver_clamp_max_vx_is_a_param_with_the_frozen_defaults
 #
 #   ★ 一条**等价变异**（故意不上榜）：把 gv 开头 `if s == 0.0 and o == 0.0: return
 #     0.0, 0.0` 整段删掉，**测不出来** —— 走主路径时 r = gear*|0| = 0、
