@@ -5,14 +5,44 @@
 这里在一个连接里做完全部动作：Ctrl-C 猛打 → Ctrl-A → 送码 → Ctrl-D → 收输出 →
 收尾 Ctrl-B + Ctrl-D 软复位把 app 拉回来。
 
-用法：python pc/board_exec.py ../../k230-board/t_tof_locate.py
+用法：
+    python pc/board_exec.py t_tof.py                        # 只送一个脚本
+    python pc/board_exec.py t_tof_locate.py --module tof_locate.py
+                                                            # 先垫上本地模块再送脚本
+
+`--module` 是给**还没部署到板子上的新模块**用的：板子 `/sdcard/k230vision/` 里可能没有它
+（部署是另一回事），而本工具一次只送一个文件。做法是把模块源码拼在脚本前面，再加一个
+`sys.modules` 垫片 —— **模块与测试两个文件都逐字不改**，测试里照常 `import x as y` 就能用。
+
+⚠️ 被 `--module` 垫的模块，其**顶层代码会在板子上的 `__main__` 里执行**。别垫带
+`if __name__ == "__main__":` 副作用的模块。
 """
-import argparse, re, sys, time
+import argparse, os, re, sys, time
 import serial
 
 
-def run(port, code_path, boot_wait_s=40.0, exec_timeout_s=150.0, baud=115200):
-    code = open(code_path, "rb").read()
+def _shim(module_paths):
+    """把本地模块注册进板子的 `sys.modules`，让测试脚本按原样 import 得到。
+
+    ⚠️ MicroPython 的 raw REPL 里**没有** `sys.modules['__main__']`（2026-10-12 实测：
+    直接引用它会 `KeyError: '__main__'`）。所以垫片是"造个空对象、把当前 globals 复制进去"。
+    """
+    out = []
+    for p in module_paths or []:
+        name = os.path.splitext(os.path.basename(p))[0]
+        with open(p, encoding="utf-8") as f:
+            out.append(f.read())
+        out.append("\nimport sys as _sys\n"
+                   "class _Mod(object):\n    pass\n"
+                   "_m = _Mod()\n"
+                   "for _k, _v in globals().items():\n    setattr(_m, _k, _v)\n"
+                   "_sys.modules['%s'] = _m\n\n" % name)
+    return "".join(out).encode("utf-8")
+
+
+def run(port, code_path, modules=None, boot_wait_s=40.0, exec_timeout_s=150.0,
+        baud=115200):
+    code = _shim(modules) + open(code_path, "rb").read()
     s = serial.Serial(port, baud, timeout=0.2)
     s.reset_input_buffer()
 
@@ -69,5 +99,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("script")
     ap.add_argument("--port", default="COM11")
+    ap.add_argument("--module", action="append", default=None,
+                    help="先垫进板子 sys.modules 的本地模块（可重复）；"
+                         "给还没部署到板子上的新模块用")
     a = ap.parse_args()
-    sys.exit(run(a.port, a.script))
+    sys.exit(run(a.port, a.script, modules=a.module))
