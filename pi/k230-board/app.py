@@ -540,7 +540,7 @@ def main():
                         trk_frames += 1
 
                     # ToF 深度：只给配置里的类挂，最多 TOF_MAX_BOXES 个（MicroPython
-                    # 下聚类是逐像素循环，不限量会拖掉 10Hz 节拍）。
+                    # 下逐像素的 Python 循环很慢，不限量会拖掉 10Hz 节拍）。
                     if tof_reader is not None:
                         try:
                             from tof_locate import attach_depths

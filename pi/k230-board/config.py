@@ -162,7 +162,7 @@ TOF_ENABLE = True
 TOF_UNIT = 4            # 4mm/计数，量程上限 1020mm（覆盖 15cm~1m 抓取包络）
 TOF_FAST = True         # 提速到 921600（100x100 实测 6.8fps；不提只有 1.1fps）
 TOF_CLASSES = ("chair",)        # 只给这些类的框算深度（= TRACK_CLASS）
-TOF_MAX_BOXES = 3       # 每拍最多算几个框（MicroPython 下聚类是逐像素循环，要限量）
+TOF_MAX_BOXES = 3       # 每拍最多算几个框（MicroPython 下逐像素的 Python 循环很慢，要限量）
 TOF_PAD = 0.06          # 框四周多留的余量（归一化）
 TOF_MIN_MM = 150        # 量程下限：比这更近的回波是伪影（爪尖/臂身）—— 模块额定下限 15cm
 # ToF 归一化坐标 ← 推流归一化坐标 的仿射映射：tof = a * stream + b
