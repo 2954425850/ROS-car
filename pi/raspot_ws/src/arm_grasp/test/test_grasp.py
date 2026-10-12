@@ -842,3 +842,30 @@ def test_plane_path_still_works_without_depth():
     cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300)
     rep = grasp.run(cfg, FakeLink(Plant(_start_joints()), CAP))
     assert rep['ok'] is True
+
+
+# ---- Task 8: 盲区硬闸 —— 进 descend 前必须见过有效深度 ----------------------------
+
+def test_descend_refuses_when_no_depth_ever_seen():
+    """require_depth 且整轮没见过深度 ⇒ 不许进 descend。"""
+    cfg = _cfg()._replace(hz=10.0, max_seconds=20.0, max_ticks=200,
+                          require_depth=True)
+    rep = grasp.run(cfg, FakeLink(Plant(_start_joints()), CAP), phase='all')
+    assert rep['ok'] is False
+    assert '深度' in (rep['stopped'] or '')
+
+
+def test_descend_proceeds_when_depth_seen():
+    cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300,
+                          require_depth=True)
+    rep = grasp.run(cfg, DepthLink(Plant(_start_joints()), CAP, depth='auto'),
+                    phase='all')
+    assert rep['ok'] is True
+
+
+def test_require_depth_off_by_default():
+    """默认关闸 —— 既有用例（走平面法、没有深度）行为不变。"""
+    cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300)
+    assert cfg.require_depth is False
+    rep = grasp.run(cfg, FakeLink(Plant(_start_joints()), CAP), phase='all')
+    assert rep['ok'] is True

@@ -47,7 +47,7 @@ GraspConfig = namedtuple('GraspConfig',
     'base_comp base_comp_max '
     'joint_comp joint_comp_max '
     'bias_r_m '
-    's_lead_m lead_max_counts')
+    's_lead_m lead_max_counts require_depth')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -112,6 +112,12 @@ GraspConfig.__new__.__defaults__ = (
     #   （= 臂跟不上 / 被挡住）就**原地等**（指令保持），免得指令一路跑飞。
     #   不能"退回从回读起步"：那样指令会往回跳（0.4s 滞后下实测来回顶）。
     0.015, 40.0,
+    # require_depth：盲区硬闸（默认关，既有用例不受影响）。开 = **进 descend 之前**
+    #   本轮必须见过至少一次有效实测深度（`Obs.depth_mm` 非 None）；一次都没见过就
+    #   **拒绝、一步不动**，绝不悄悄退化成"假设目标躺在 1.6cm 平面上"去硬抓。
+    #   为什么必须在进 descend 前判死：ToF 在 <15cm 上瞎，而进 descend 之后 cmd 就开始
+    #   往目标扎 ⇒ 那时再看深度已经晚了（见设计 §6）。
+    False,
 )
 
 
@@ -441,6 +447,7 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         est.update(initial_point)
     rep = {'phase': phase, 'ticks': 0, 'stopped': None, 'ok': False,
            'O_last': None, 'obs_n': 0, 'obs_bad': 0, 'obs_lost': False,
+           'depth_seen': False,
            'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None, 'comp': None,
            'target': None, 's_ach_m': None, 'rows': [], 'phases': [], 'O_phase_end': []}
     dt = 1.0 / cfg.hz
@@ -475,6 +482,11 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         rep['phases'].append((cur, reason, phase_ticks))
         rep['O_phase_end'].append((cur, est.O))      # 每相收尾时在用的 O（查"下扎用的是哪个 O"）
         k = seq.index(cur) + 1
+        if cur == 'aim' and k < len(seq) and seq[k] == 'descend' \
+                and cfg.require_depth and not rep.get('depth_seen'):
+            rep['stopped'] = ('进 descend 前从未拿到有效深度 —— '
+                              'ToF 没给过数，拒绝下扎（不做平面假设兜底）')
+            return False
         if k >= len(seq):
             rep['stopped'] = reason
             return False
@@ -531,6 +543,11 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         elif initial_point is not None and obs_age is not None:
             obs_age += dt
         if obs is not None:
+            # 盲区硬闸（require_depth）：记下"本轮到底见过没有真实 ToF 深度"。
+            # 用 `rep` 而不是局部变量，省得在闭包 `advance_or_stop` 里纠结 `nonlocal`，
+            # 而且报告里也留了证据。（见设计 §6。）
+            if getattr(obs, 'depth_mm', None) is not None:
+                rep['depth_seen'] = True
             if initial_point is None:
                 obs_age = 0.0
             try:

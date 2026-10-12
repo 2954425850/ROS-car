@@ -102,7 +102,7 @@ def parse_box(s):
 
 
 def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
-              joint_comp=None, hz=None, bias_r=None):
+              joint_comp=None, hz=None, bias_r=None, require_depth=None):
     """把 CLI 参数装进 `GraspConfig`。**`--h` 必须真的进 `z_plane_m`**（自检里有闸）。"""
     kw = {'z_plane_m': float(h_m)}
     if max_step is not None:
@@ -115,6 +115,8 @@ def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
         kw['joint_comp'] = float(joint_comp)
     if bias_r is not None:
         kw['bias_r_m'] = float(bias_r) / 100.0      # CLI 用 cm，内部用米
+    if require_depth is not None:
+        kw['require_depth'] = bool(require_depth)
     cfg = grasp.GraspConfig(**kw)
     if hz is not None:
         # ★ 提频时**必须把"按拍数"的判据一起折算**，否则它们在**墙上时间**上被砍短：
@@ -409,6 +411,9 @@ def main(argv=None):
     if args.measure_only or args.scan_preview or args.height_out or args.support_z_mm is not None:
         print('❌ --measure-only / --scan-preview / --height-out / --support-z-mm 需要 --auto-height。')
         return 2
+    # 人**显式**给了 --h ⇒ 走平面兜底、关掉深度闸；没给 ⇒ 用 ToF 实测深度、开闸。
+    # ⚠️ 必须在把 args.h 补成 DEFAULT_H_M **之前**判 —— 否则永远看得出"给过"。
+    explicit_h = args.h is not None
     if args.h is None:
         args.h = DEFAULT_H_M
 
@@ -424,9 +429,12 @@ def main(argv=None):
     cfg = build_cfg(args.h, max_step=args.max_step, patience=args.patience,
                     alpha0=args.alpha0, joint_comp=args.joint_comp, hz=args.hz,
                     bias_r=args.bias_r,
-                    max_seconds=args.max_seconds)
+                    max_seconds=args.max_seconds,
+                    require_depth=not explicit_h)
     print('框 box=%s（归一化）  目标面高 h=%.4f m（%.1f mm）→ cfg.z_plane_m'
           % (want, args.h, args.h * 1000))
+    print('深度来源：%s' % ('实测 ToF（require-depth 开）' if not explicit_h
+                            else '手填 --h 平面假设（require-depth 关）'))
     print('相位 %s   限速 %.2f°/拍   %.0f Hz' % (args.phase, cfg.max_step_deg, cfg.hz))
 
     collect = None
