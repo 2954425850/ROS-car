@@ -137,6 +137,8 @@ pIMUInterface_t imu = &UserICM20948;
 void tim6_init(void)
 {
 	TIM_TimeBaseInitTypeDef  TIM_TimeBaseStructure;
+	TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
 	RCC_APB2PeriphClockCmd(RCC_APB1Periph_TIM6, ENABLE);
 	// 定时器6初始化
 	//Sets the value of the auto-reload register cycle for the next update event load activity

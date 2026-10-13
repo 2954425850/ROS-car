@@ -35,8 +35,19 @@ Output  : none
 void  Adc_Init(void)
 {  
 		GPIO_InitTypeDef       GPIO_InitStructure;
+		GPIO_StructInit(&GPIO_InitStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+		 * as stack garbage */
 		ADC_CommonInitTypeDef ADC_CommonInitStructure;
 		ADC_InitTypeDef       ADC_InitStructure;
+
+		/* ROS FIX 2026-10-13: ADC_InitTypeDef was only partially filled in, and
+		 * ADC_Init() ORs ADC_ExternalTrigConv straight into CR2 (bit 11 = ALIGN).
+		 * Leftover stack contents in that member therefore decided the data
+		 * alignment: garbage with bit 11 set makes the ADC left-aligned and every
+		 * conversion comes back as raw<<4, i.e. 16x high - the battery reading
+		 * then saturates on the 12.6 V clamp and never moves. Defining every
+		 * member removes the dependency on the stack. */
+		ADC_StructInit(&ADC_InitStructure);
 
 		RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOB|RCC_AHB1Periph_GPIOC, ENABLE);//使能GPIOA时钟
 		RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1, ENABLE); //使能ADC1时钟

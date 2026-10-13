@@ -12,7 +12,11 @@ void MiniBalance_PWM_Init(u16 arr,u16 psc)
 {		 					 
 	GPIO_InitTypeDef GPIO_InitStructure;
 	TIM_TimeBaseInitTypeDef  TIM_TimeBaseStructure;
+	TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
 	TIM_OCInitTypeDef  TIM_OCInitStructure;
+	TIM_OCStructInit(&TIM_OCInitStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
 	
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_TIM10,ENABLE);  	  //TIM8时钟使能    
 	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOB, ENABLE); 	//使能PORTB时钟	
@@ -83,7 +87,11 @@ void MiniBalance_PWM11_Init(u16 arr,u16 psc)
 {		 					 
 	GPIO_InitTypeDef GPIO_InitStructure;
 	TIM_TimeBaseInitTypeDef  TIM_TimeBaseStructure;
+	TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
 	TIM_OCInitTypeDef  TIM_OCInitStructure;
+	TIM_OCStructInit(&TIM_OCInitStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
 	
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_TIM11,ENABLE);  	  //TIM11时钟使能    
 	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOB, ENABLE); 	//使能PORTB时钟	
@@ -152,7 +160,11 @@ void MiniBalance_PWM9_Init(u16 arr,u16 psc)
 {		 					 
 	GPIO_InitTypeDef GPIO_InitStructure;
 	TIM_TimeBaseInitTypeDef  TIM_TimeBaseStructure;
+	TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
 	TIM_OCInitTypeDef  TIM_OCInitStructure;
+	TIM_OCStructInit(&TIM_OCInitStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
 	
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_TIM9,ENABLE);  	  //TIM9时钟使能    
 	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOE, ENABLE); 	//使能PORTE时钟	
@@ -225,7 +237,11 @@ void MiniBalance_PWM1_Init(u16 arr,u16 psc)
 {		 					 
 	GPIO_InitTypeDef GPIO_InitStructure;
 	TIM_TimeBaseInitTypeDef  TIM_TimeBaseStructure;
+	TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
 	TIM_OCInitTypeDef  TIM_OCInitStructure;
+	TIM_OCStructInit(&TIM_OCInitStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
 	
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_TIM1,ENABLE);  	  //TIM1时钟使能    
 	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOE, ENABLE); 	//使能PORTE时钟	
@@ -300,6 +316,8 @@ Output  : none
 void Enable_Pin(void)
 {
 	GPIO_InitTypeDef  GPIO_InitStructure;
+	GPIO_StructInit(&GPIO_InitStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
   RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOD, ENABLE);//使能GPIOD时钟
   GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3; //KEY对应引脚
   GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN;//普通输入模式
@@ -322,6 +340,8 @@ void Servo_PWM_Init(u16 arr,u16 psc)
 {
 	GPIO_InitTypeDef GPIO_InitStructure;           //IO
 	TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure; //timer
+	TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
 	TIM_OCInitTypeDef  TIM_OCInitStructure;        //PWM output
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_TIM8,ENABLE);  	//TIM8 clock
 	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOC, ENABLE); 	//PORTC clock
@@ -395,6 +415,8 @@ void Servo_PWM12_Init(u16 arr,u16 psc)
 {
 	GPIO_InitTypeDef GPIO_InitStructure;
 	TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
+	TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
 	TIM_OCInitTypeDef  TIM_OCInitStructure;
 
 	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM12,ENABLE);  /* TIM12 lives on APB1 */
