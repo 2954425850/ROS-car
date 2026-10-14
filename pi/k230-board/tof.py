@@ -205,10 +205,18 @@ class A010(object):
         ⇒ 第一次短等（够"错的波特率"快速跳过），第二次给足时间。
         不这么做的话，`app.py` 开机探测会**系统性失败**（先把 115200 试错一次，
         后面那个真的波特率就再也 ping 不到了）。
+
+        ★ **发的是 `AT+ISP=0` 而不是裸 `AT`**（2026-10-13 真机挖出来的）：
+        模块**刚上电时 ISP 还在跑**，对裸 `AT` 回的是 **`ISP is busy`** 而不是 `OK`
+        —— 于是"只认 OK"的探测**永远选不中它**，也就永远走不到 `init()` 里那句
+        `AT+ISP=0`（那正是用来停 ISP 的）⇒ **死锁**。症状：**每次模块断电重插，
+        `open_tof` 必失败**（`raw=b'ISP is busy\\n'`）。
+        改为直接发 `AT+ISP=0`：正常模块回 `OK`（顺带把流停了，`start_stream` 会再开）；
+        并且**把 `ISP is busy` 也算作"模块在这儿"**（这条留给 init 去解）。
         """
         for attempt in range(2):
             self.uart.read(65536)
-            self.uart.write(CMD_CR_FLUSH + "AT\r")
+            self.uart.write(CMD_CR_FLUSH + "AT+ISP=0\r")
             got = b""
             t0 = time.ticks_ms()
             limit = timeout_ms if attempt else 200      # 第一发短等，别拖累探测
@@ -218,6 +226,8 @@ class A010(object):
                     got += d
                     if b"OK" in got:
                         return True
+                    if b"ISP is busy" in got:
+                        return True          # 人在，但 ISP 还没停 —— init 会处理
                     if b"ERR" in got:
                         break
                 else:
