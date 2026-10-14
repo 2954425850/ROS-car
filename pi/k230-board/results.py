@@ -16,7 +16,7 @@
 import ujson
 
 
-def encode(objs, width, height, frame_no, ts_ms, faces=None):
+def encode(objs, width, height, frame_no, ts_ms, faces=None, tick_ms=None):
     """打包成 JSON bytes，直接可以往 socket 里写。
 
     `faces` 可选，**单独一个数组，不混进 `objs`** ——
@@ -30,6 +30,11 @@ def encode(objs, width, height, frame_no, ts_ms, faces=None):
     **`who` 为 None 有两种含义，下游要区别对待：**
       - `ok=True` 且 `who=None`  -> 脸是好的，但库里没有这个人
       - `ok=False`              -> 这张脸不完整/太靠边，**身份不可信**（不是"不认识"）
+
+    **`ts` vs `tick`（2026-10-14 加）：** `ts` 是 epoch 毫秒，但本平台
+    `time.time()` 只有秒级精度（见 app.py 文件头第 3 条），所以 `ts` 是秒级。
+    `tick_ms` 是 `time.ticks_ms()` 的**单调**毫秒，用来在 Pi 侧对齐 ToF/雷达等
+    其他传感器的相对时间；`tick_ms` 传给 Pi 后别再换算成墙钟时间。
     """
     d = {
         "ts": ts_ms,
@@ -38,6 +43,8 @@ def encode(objs, width, height, frame_no, ts_ms, faces=None):
         "h": height,
         "objs": objs,
     }
+    if tick_ms is not None:
+        d["tick"] = tick_ms
     if faces is not None:
         d["faces"] = faces
     return ujson.dumps(d).encode()

@@ -178,6 +178,20 @@ MicroPython 的 _thread 在这块板子上与 MPP 的配合没验证过，**不�
 
     timeout 1900 ~/.local/bin/mpremote connect /dev/ttyACM0 exec \
         "exec(open('/sdcard/k230vision/app.py').read())"
+
+## 2026-10-14 变更（相对上面历史文档，现状以这里为准）
+
+1. **单编码通道**：删掉 PUSH_CHN/RTSP_CHN 两个编码器（编一模一样的流，纯属双倍白干），
+   改为 `config.STREAM_CHN` 一路。主循环里一次 `GetStream` 后交给
+   `rtsp.feed(sd)` + `pusher.feed(sd)`，Release 也统一做。上面「两个 pump()」的描述已过时。
+2. **A010 ToF 移走**：深度改到 Pi 侧读，本文件不再 import tof / tof_locate，
+   主循环里也没有 ToF 环节（tof.py / a010_frame.py / tof_locate.py 保留供 Pi 复用）。
+3. **人脸降频**：没有 follow 等待时按 `config.FACE_HZ` 隔拍跑（follow 时仍每拍跑）。
+4. **跟踪参考框**：同类框有多个时选与当前跟踪框 IoU 最大的（`tracker.last_box`），
+   不再盲取第一个，避免两把椅子来回抢。
+5. **结果加 `tick`**：`tick_ms`（单调毫秒）随 8556 / 8559 上报，供 Pi 对齐 ToF/雷达。
+6. **GC 隔拍**（`GC_EVERY`）+ **STATS 加 infer / loop 耗时**（能看出节拍紧不紧）。
+7. **崩溃自愈**：main() 返回 True/False，崩溃由 /sdcard/main.py 决定是否 machine.reset()。
 """
 import os
 import sys
@@ -189,6 +203,7 @@ sys.path.insert(0, "/sdcard/k230vision")
 import config
 import netup
 from media.sensor import CAM_CHN_ID_2
+from media.vencoder import StreamData
 from cam import Camera
 from pusher import Pusher
 from rtsp_srv import RtspOut
@@ -204,9 +219,22 @@ from watchdog import Watchdog
 
 INFER_HZ = 10.0                 # 推理 + 上报节拍（计划两块都是 0.1 s）
 STATS_MS = 30000                # 30 s 一行 STATS，给长稳测试留证据
+GC_EVERY = 10                   # 隔几拍 gc.collect() 一次（原来每拍全量 GC）
 
 
-def _obstacles_payload(objs, frame_no, ts_ms):
+def _box_iou(a, b):
+    """两个归一化 [l, t, r, b] 框的交并比（与 tracker._iou 同式）。"""
+    ix = min(a[2], b[2]) - max(a[0], b[0])
+    iy = min(a[3], b[3]) - max(a[1], b[1])
+    if ix <= 0 or iy <= 0:
+        return 0.0
+    inter = ix * iy
+    ua = ((a[2] - a[0]) * (a[3] - a[1])
+          + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+    return inter / ua if ua > 0 else 0.0
+
+
+def _obstacles_payload(objs, frame_no, ts_ms, tick_ms=None):
     """检测结果 -> 8559 那一行 JSON。
 
     组装放在这里（不放进 obstacles.py）是为了让那边**保持纯函数、不依赖 config** ——
@@ -221,10 +249,11 @@ def _obstacles_payload(objs, frame_no, ts_ms):
                           config.OBSTACLE_PRIO_HIGH, config.OBSTACLE_PRIO_LOW,
                           zones, bottom_min, h_min)
     free = obstacles.free_zones(objs, zones, bottom_min, h_min)
-    return obstacles.encode(obs, free, frame_no, ts_ms)
+    return obstacles.encode(obs, free, frame_no, ts_ms, tick_ms=tick_ms)
 
 
 def main():
+    crashed = False          # 崩溃退出时置 True，好让 main.py 决定要不要 machine.reset()
     netup.init(config.WIFI_SSID, config.WIFI_PASS)
     while not netup.connect():
         # ★ 这里以前**没有 os.exitpoint()** —— 于是 WiFi 起不来时，板子会卡在一条
@@ -302,20 +331,21 @@ def main():
     else:
         print("FACE disabled (config.FACE_ENABLE=False)")
 
-    # ---- 摄像头：chn0 推流 / chn1 RTSP / chn2 AI ----
+    # ---- 摄像头：单编码通道（同时喂 RTSP + 推流）+ chn2 AI ----
+    # 2026-10-14 合并：原来 PUSH_CHN=0 / RTSP_CHN=1 两个编码器编一模一样的流，
+    # 纯属双倍白干。现在只编一路，主循环里一次 GetStream 后交给两条消费路 feed。
     cam = Camera(config.WIDTH, config.HEIGHT)
-    cam.add_channel(config.PUSH_CHN, config.BITRATE_KBPS)
-    cam.add_channel(config.RTSP_CHN, config.BITRATE_KBPS)
+    cam.add_channel(config.STREAM_CHN, config.BITRATE_KBPS)
     cam.add_ai_channel(config.AI_WIDTH, config.AI_HEIGHT)
     cam.start()
     print("CAM OK chans=%s ai=%sx%s" % (cam.chans, config.AI_WIDTH, config.AI_HEIGHT))
 
-    pusher = Pusher(config.PUSH_HOST, config.PUSH_PORT,
-                    cam.encoder(config.PUSH_CHN), config.PUSH_CHN)
+    enc = cam.encoder(config.STREAM_CHN)
+    pusher = Pusher(config.PUSH_HOST, config.PUSH_PORT, enc, config.STREAM_CHN)
     print("PUSH connect=%s %s:%s" % (pusher.connect(),
                                      config.PUSH_HOST, config.PUSH_PORT))
 
-    rtsp = RtspOut(cam.encoder(config.RTSP_CHN), config.RTSP_CHN,
+    rtsp = RtspOut(enc, config.STREAM_CHN,
                    config.RTSP_PORT, config.RTSP_SESSION,
                    config.WIDTH, config.HEIGHT)
     rtsp.start()
@@ -365,22 +395,17 @@ def main():
     face_added = 0          # **增量入库**加进去的特征条数（"边用边长"）
     face_err = 0            # 人脸环节报错的次数（只打第一条，免得刷屏）
     t_face_save = time.ticks_ms()   # 上次把库落盘的时刻
+    face_ctr = 0            # 人脸降频计数器（0 = 这一拍跑人脸）
+    face_period = max(1, int(INFER_HZ / config.FACE_HZ))
+    # GC / 耗时统计
+    gc_ctr = 0              # 隔几拍 gc.collect()（原来每拍全量）
+    infer_sum = 0           # 10Hz 推理块累计耗时（ms）
+    infer_cnt = 0
+    infer_max = 0
+    loop_max = 0            # 主循环单轮最大耗时（ms）
 
-    # ---- A010 ToF（可选：模块不在/线没接好都不能拖垮 app）----
-    tof_dev, tof_reader = None, None
-    if config.TOF_ENABLE:
-        try:
-            from tof import open_tof, TofReader
-            tof_dev, tof_baud = open_tof(fast=config.TOF_FAST, unit=config.TOF_UNIT)
-            if tof_dev is not None:
-                tof_reader = TofReader(tof_dev)
-                print("TOF OK baud=%s unit=%d fast=%s"
-                      % (tof_baud, config.TOF_UNIT, config.TOF_FAST))
-            else:
-                print("TOF WARN 探测不到模块 —— depth_mm 一律 null")
-        except Exception as e:
-            print("TOF EXC", e)
-            tof_dev, tof_reader = None, None
+    # （A010 ToF 已于 2026-10-14 移到 Pi 侧，K230 这里不再读深度。tof.py /
+    #  a010_frame.py / tof_locate.py 三个文件保留，供 Pi 侧复用。）
 
     try:
         while True:
@@ -395,9 +420,23 @@ def main():
             # → 下面 except 打印 + finally 清理 → 回到 REPL。
             # **开机自启和"随时能救回来"这件事就不冲突了。**
             os.exitpoint()
+            loop_start = time.ticks_ms()
 
-            # 1) 推流：每轮尽量取，不空转
-            rc = pusher.pump()
+            # 1) 单编码通道：一次 GetStream，同时喂 RTSP 和推流（2026-10-14 合并）。
+            #    原来 pusher / rtsp 各管一个编码器、各 GetStream 一次；合并后取帧
+            #    只能取一次，必须在这里统一做，再交给两条消费路 feed。
+            sd = StreamData()
+            ret = enc.GetStream(config.STREAM_CHN, sd, timeout=100)
+            if ret == 0:
+                try:
+                    rtsp.feed(sd)
+                    rc = pusher.feed(sd)
+                finally:
+                    # 无论 feed 是否抛异常都要 Release，否则 VENC 的 8 个输出缓冲
+                    # 会被占满、MPP 卡死（只能断电）。
+                    enc.ReleaseStream(config.STREAM_CHN, sd)
+            else:
+                rc = -1
             if rc == -2:
                 # 断线：**到点了才试一次**重连。不要在这里重建 MPP 管线（见文件头）。
                 #
@@ -412,21 +451,12 @@ def main():
                     t_push_retry = time.ticks_add(now_ms, config.PUSH_RETRY_MS)
                     if pusher.connect():
                         print("PUSH RECONNECTED connects=%d" % pusher.connects)
-                        cam.request_idr(config.PUSH_CHN)   # 显式 no-op，见文件头第 4 条
+                        cam.request_idr(config.STREAM_CHN)   # 显式 no-op，见文件头第 4 条
             # 看门狗每轮都喂（计划只在 rc==0 时喂，那样完全断流时它永不触发）
             wd.tick(pusher.frames_sent)
 
-            # 2) RTSP 通道（非阻塞；没有客户端时也要 GetStream->Release，
-            #    否则 VENC 的 8 个输出缓冲会被填满把 MPP 顶住）
-            rtsp.pump()
-
             # 2b) 外部目标框入口（非阻塞；只有人来命令时才有活）
             rx.poll()
-
-            # 2c) ToF：非阻塞取帧。**每拍只读几块，绝不长等** —— 本循环同时喂着
-            #     推流/RTSP/推理，板子上有"主循环里一个 sleep 拖到 1Hz"的前科。
-            if tof_reader is not None:
-                tof_reader.pump()
 
             # 3) 10 Hz：推理 + 上报（同一节拍，见文件头"偏离"）
             now = time.ticks_ms()
@@ -478,11 +508,22 @@ def main():
                                   % (px, trk.last_reject))
 
                     # ---- 跟踪器：给锁定目标补上帧间连续性 ----
+                    # 同类框可能不止一个（比如两把椅子）。锁定中选与**当前跟踪框**
+                    # IoU 最大的那个做参考，否则用第一个同类框会把两个目标来回抢：
+                    # IoU 算到另一个上 -> 误判 lost -> 释放 -> 重锁，来回抖。
                     ref = None
+                    cur = trk.last_box if trk.locked else None
+                    best_iou = -1.0
                     for o in objs:
-                        if o["cls"] == config.TRACK_CLASS:
+                        if o["cls"] != config.TRACK_CLASS:
+                            continue
+                        if cur is None:
                             ref = o["box"]
                             break
+                        _i = _box_iou(o["box"], cur)
+                        if _i > best_iou:
+                            best_iou = _i
+                            ref = o["box"]
                     t_objs = []
                     if not trk.locked:
                         if ref is not None and det_auto:
@@ -509,9 +550,13 @@ def main():
                                 if tk["iou"] is not None:
                                     trk_iou = tk["iou"]
                     # ---- 人脸：谁在场 ----
-                    # 与检测器同源同一帧。约 17ms/张脸，10 Hz 下有富余。
+                    # 2026-10-14 降频：人脸约 17ms/张脸还叠一个活体模型，不必每拍跑。
+                    # 没有 follow 等待时降到 config.FACE_HZ，省下的时间还给推理节拍；
+                    # 但 follow_who 在等正脸时**必须每拍跑**，否则可能错过那张脸。
                     fobjs = []
-                    if frec is not None:
+                    run_face = frec is not None and (
+                        follow_who is not None or face_ctr == 0)
+                    if run_face:
                         try:
                             f4 = arr.reshape((1, 3, config.AI_HEIGHT, config.AI_WIDTH))
                             got = frec.analyze(f4)
@@ -568,6 +613,7 @@ def main():
                                 _s2.print_exception(e)
                                 print("FACE ERR (之后不再逐条打)")
                             face_err += 1
+                    face_ctr = (face_ctr + 1) % face_period
 
                     # 增量入库后**隔一段时间**落盘 —— 别每帧写 SD（写坏卡、也拖慢循环）
                     if fdb is not None and time.ticks_diff(now, t_face_save) >= config.FACE_SAVE_EVERY_MS:
@@ -624,20 +670,6 @@ def main():
                     if trk.locked:
                         trk_frames += 1
 
-                    # ToF 深度：只给配置里的类挂，最多 TOF_MAX_BOXES 个（MicroPython
-                    # 下聚类是逐像素循环，不限量会拖掉 10Hz 节拍）。
-                    if tof_reader is not None:
-                        try:
-                            from tof_locate import attach_depths
-                            attach_depths(objs + t_objs, tof_reader.latest_frame,
-                                          config.TOF_UNIT, config.TOF_MAP,
-                                          classes=config.TOF_CLASSES,
-                                          max_boxes=config.TOF_MAX_BOXES,
-                                          pad=config.TOF_PAD,
-                                          min_mm=config.TOF_MIN_MM)
-                        except Exception as e:
-                            print("TOF attach EXC", e)
-
                     # 上报 = **本帧真实的检测结果** + 跟踪器的连续目标。
                     #
                     # ⚠️ 这里**不再沿用上一帧的 last_objs**。原来的写法会把陈旧坐标当新数据
@@ -646,8 +678,9 @@ def main():
                     #
                     # w/h 用**推流**分辨率：前端拿归一化坐标 × 自己的显示尺寸
                     ts_ms = int(time.time() * 1000)   # 平台限制：只有秒级精度（见文件头第 3 条）
+                    tick_ms = time.ticks_ms()         # 单调毫秒，供 Pi 对齐 ToF/雷达
                     payload = encode(objs + t_objs, config.WIDTH, config.HEIGHT,
-                                     frame_no, ts_ms, faces=fobjs)
+                                     frame_no, ts_ms, faces=fobjs, tick_ms=tick_ms)
                     if not r_pi.ok:
                         r_pi.connect()
                     r_pi.send(payload)
@@ -660,10 +693,18 @@ def main():
                     if r_obs is not None:
                         if not r_obs.ok:
                             r_obs.connect()
-                        r_obs.send(_obstacles_payload(objs, frame_no, ts_ms))
+                        r_obs.send(_obstacles_payload(objs, frame_no, ts_ms, tick_ms))
                 else:
                     print("SNAPSHOT None")
-                gc.collect()
+                gc_ctr += 1
+                if gc_ctr >= GC_EVERY:
+                    gc_ctr = 0
+                    gc.collect()
+                _infer_ms = time.ticks_diff(time.ticks_ms(), now)
+                infer_sum += _infer_ms
+                infer_cnt += 1
+                if _infer_ms > infer_max:
+                    infer_max = _infer_ms
 
             # 4) 30 s 一行 STATS
             if time.ticks_diff(now, t_stats) >= STATS_MS:
@@ -672,7 +713,8 @@ def main():
                       "conns=%d rtsp=%d rtsp_empty=%d stall=%d report=%d/%d "
                       "obs=%d/%d "
                       "trk=%d lock=%d rel=%d iou=%.2f tgt=%d/%d auto=%d "
-                      "face=%d ok=%d known=%d add=%d err=%d mem=%d"
+                      "face=%d ok=%d known=%d add=%d err=%d "
+                      "infer=%d/%dms loop=%dms mem=%d"
                       % (time.ticks_diff(now, t_start) // 1000, frame_no, obj_frames,
                          pusher.frames_sent, pusher.frames_dropped,
                          pusher.lost_events, pusher.connects,
@@ -683,11 +725,19 @@ def main():
                          trk_frames, trk_locks, trk_releases, trk_iou,
                          rx.recv_ok, rx.recv_bad, 1 if det_auto else 0,
                          face_seen, face_ok, face_known, face_added, face_err,
+                         infer_sum // max(1, infer_cnt), infer_max, loop_max,
                          gc.mem_free()))
 
+            _loop_ms = time.ticks_diff(time.ticks_ms(), loop_start)
+            if _loop_ms > loop_max:
+                loop_max = _loop_ms
+
+    except KeyboardInterrupt:
+        print("APP INTERRUPTED (Ctrl-C)")
     except BaseException as e:
         import sys as _s
         _s.print_exception(e)
+        crashed = True
     finally:
         print("APP CLEANUP_START")
         try:
@@ -721,14 +771,9 @@ def main():
             det.deinit()
         except Exception as e:
             print("app: det.deinit EXC", e)
-        try:
-            if tof_dev is not None:
-                tof_dev.stop_stream()
-                tof_dev.close()
-        except Exception as e:
-            print("app: tof.close EXC", e)
         gc.collect()
         print("APP CLEANUP_DONE MEM %d" % gc.mem_free())
+    return not crashed
 
 
 if __name__ == "__main__":

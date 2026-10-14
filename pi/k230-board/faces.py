@@ -377,13 +377,20 @@ class FaceDB:
         return False
 
     def flush(self):
-        """把内存里的库落盘。返回写了几个人。没改动就什么都不做。"""
+        """把内存里的库落盘。返回写了几个人。没改动就什么都不做。
+
+        **原子写**（2026-10-14 改）：先写 `<name>.bin.tmp` 再 `os.rename` 覆盖正式文件。
+        车上是移动环境、随时可能掉电，直接覆盖写到一半会留下一个损坏的库，
+        下次 reload 读出来是坏数据。rename 要么整个成功、要么整个失败。
+        """
         if not self._dirty:
             return 0
         n = 0
         for name, arr in self.names:
-            with open(self._path(name), "wb") as fh:
+            tmp = self._path(name) + ".tmp"
+            with open(tmp, "wb") as fh:
                 fh.write(arr.tobytes())
+            os.rename(tmp, self._path(name))
             n += 1
         self._dirty = False
         return n

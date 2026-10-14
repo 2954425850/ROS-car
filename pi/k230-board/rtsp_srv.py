@@ -8,7 +8,7 @@
 
 官方例程和 WBCRtsp 都用 `_thread.start_new_thread` 开推流线程。本项目**要单线程**：
 MicroPython 的 `_thread` 与 MPP 的配合在本平台没验证过（设计文档 Task 7 有说明）。
-所以这里由主循环调 `pump()` 推进。
+所以这里由主循环调 `feed()` 推进（取帧/还帧在 app.py 主循环里统一做）。
 
 **`rtspserver_sendvideodata_byphyaddr` 从主循环调用是否与官方线程版等效 —— 待实测。**
 （Task 4 的板子在写这一版时已卡死，此项**未验证**。）
@@ -54,22 +54,18 @@ class RtspOut:
     def get_url(self):
         return self.srv.rtspserver_getrtspurl(self.session)
 
-    def pump(self):
-        """取一帧并交给 RTSP 服务器。
+    def feed(self, sd):
+        """把**已 GetStream 拿到**的一帧交给 RTSP 服务器。
 
-        返回：0 送出一帧；-1 当前没有码流（或未启动）。
+        无返回值（错误吞掉，别拖主循环）。
 
-        **未连接/没有客户端时也要继续 GetStream->Release**，否则 VENC 的
-        8 个输出缓冲会被填满，把 MPP 管线顶住（同 Task 3 在 pusher.py 里的教训）。
-        这里的 GetStream 用非阻塞 timeout=0，取不到就返回 -1，帧留在队列里给下一轮。
+        GetStream / ReleaseStream 由调用方（app.py）统一做 —— 现在单编码通道
+        要同时喂 RTSP 和推流，一次取帧必须由两条消费路共享（见 app.py 主循环）。
+        没有客户端时 rtspserver_sendvideodata_byphyaddr 也会照常调用并内部丢弃，
+        不需要判断客户端。
         """
         if not self.running:
-            return -1
-        sd = StreamData()
-        ret = self.enc.GetStream(self.chn, sd, timeout=0)
-        if ret != 0:
-            self.empty += 1
-            return -1
+            return
         try:
             for i in range(sd.pack_cnt):
                 self.srv.rtspserver_sendvideodata_byphyaddr(
@@ -78,9 +74,8 @@ class RtspOut:
                 self.bytes_sent += sd.data_size[i]
                 self.packs += 1
             self.frames += 1
-        finally:
-            self.enc.ReleaseStream(self.chn, sd)
-        return 0
+        except Exception as e:
+            print("rtsp.feed EXC", e)
 
     def stop(self):
         if not self.running:

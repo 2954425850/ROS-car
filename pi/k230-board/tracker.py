@@ -109,6 +109,17 @@ class Tracker:
     def locked(self):
         return self._locked
 
+    @property
+    def last_box(self):
+        """上一帧 update() 输出的归一化框 [l,t,r,b]；尚未锁过/没跟过则 None。
+
+        供 app.py 在「同类框有多个」时选与当前跟踪框 IoU 最大的那个做参考，
+        而不是盲目取第一个（否则两把椅子会来回抢）。
+        """
+        if self._last is not None and "box" in self._last:
+            return self._last["box"]
+        return None
+
     def init(self, frame, box_px):
         """用一帧 + 一个**紧**框初始化。
 

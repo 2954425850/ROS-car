@@ -20,7 +20,7 @@ H.264 的 P 帧有参考链。**发半帧、或丢单个 NAL，会污染整条�
 
     连接断了也要把码流取出来 Release 掉（丢弃），保持 MPP 流动。
 
-`pump()` 因此在**未连接时也走 GetStream->ReleaseStream**，把这帧计入
+`feed()` 因此在**未连接时也丢弃这一帧**（GetStream/ReleaseStream 由 app.py 统一做），把这帧计入
 `frames_dropped`。这就是"要么立刻发走，要么丢弃"，与 GLOBAL 约束一致：绝不排队。
 
 ## 为什么不缓冲
@@ -119,23 +119,19 @@ class Pusher:
                 raise OSError("partial send: %d/%d" % (n, len(buf)))
             self.bytes_sent += n
 
-    def pump(self):
-        """取一帧编码码流并处理掉（发走，或丢弃）。
+    def feed(self, stream_data):
+        """把**已 GetStream 拿到**的一帧发出去，或丢弃。
 
-        返回：0 送出一帧；-1 当前没有码流；-2 未连接 / 连接刚故障
+        返回：0 送出一帧；-2 未连接 / 连接刚故障。
 
-        **注意：未连接时也会 GetStream->Release**（丢弃）。否则接收端离开的
-        这几秒里 VENC 的 8 个输出缓冲会被填满，把 MPP 管线顶住。
+        GetStream / ReleaseStream 由调用方（app.py）统一做 —— 现在单编码通道
+        要同时喂 RTSP 和推流，一次取帧必须由两条消费路共享（见 app.py 主循环）。
+        未连接时也照常丢弃这一帧，保持 MPP 流动（宁可丢弃，绝不排队）。
         """
-        stream_data = StreamData()
-        ret = self.enc.GetStream(self.chn, stream_data, timeout=100)
-        if ret != 0:
-            return -1
-
         rc = 0
         try:
             if not self.ok:
-                # 断线期间：取出来立刻放掉，保持 MPP 流动（宁可丢弃，绝不排队）
+                # 断线期间：直接丢弃，保持 MPP 流动（宁可丢弃，绝不排队）
                 self.frames_dropped += 1
                 rc = -2
             else:
@@ -147,6 +143,4 @@ class Pusher:
             self.lost_events += 1
             self.close()
             rc = -2
-        finally:
-            self.enc.ReleaseStream(self.chn, stream_data)
         return rc

@@ -157,16 +157,21 @@ def build(objs, near_hi, mid_hi, prio_high, prio_low,
     return out
 
 
-def encode(obstacles, free, frame_no, ts_ms):
+def encode(obstacles, free, frame_no, ts_ms, tick_ms=None):
     """打包成一行 NDJSON 的 bytes（不含换行，由 Reporter 补）。
 
         {"ts": <epoch_ms>, "frame": <n>, "obstacles": [...], "free_zones": [[u0,u1],...]}
 
     坐标一律**归一化到 AI 帧**（与 results 同约定）—— 调用方乘自己的显示尺寸即可。
+    `ts` 是秒级精度的 epoch 毫秒；`tick_ms` 是 `time.ticks_ms()` 的单调毫秒，
+    供 Pi 侧对齐其他传感器的相对时间（见 results.encode 的注释）。
     """
-    return ujson.dumps({
+    d = {
         "ts": ts_ms,
         "frame": frame_no,
         "obstacles": obstacles,
         "free_zones": free,
-    }).encode()
+    }
+    if tick_ms is not None:
+        d["tick"] = tick_ms
+    return ujson.dumps(d).encode()

@@ -100,12 +100,13 @@ FPS = 25                 # 目标帧率，走 VENC 的 dst_frame_rate
 SENSOR_FPS = 30
 BITRATE_KBPS = 2048      # 每帧预算，非硬上限；总码率 ≈ bit_rate × 实际fps / SENSOR_FPS
 GOP = 25                 # 1 秒，任何损伤 1 秒内自愈。**逐通道可覆盖**：cam.add_channel(gop=)
-# ⚠️ 下面两个是 **VENC 通道号**，**不是 sensor 通道号**（这两套编号是独立的）。
-#    现在两条都挂在 sensor **根**上，所以分辨率**必然相同**（= WIDTH×HEIGHT）。
-#    想单独降某一路的分辨率，缺的不是参数而是一条未验证的链接路径 ——
-#    见 cam.py 的 add_channel() 文档，别照着"加个 width"想当然。
-PUSH_CHN = 0             # VENC0 -> 主动推到 PUSH_HOST
-RTSP_CHN = 1             # VENC1 -> 局域网 RTSP，任何设备可直拉
+# 单个 VENC 通道，**同时**喂给 RTSP 和主动推流（一次 GetStream，两条消费路）。
+# 2026-10-14 合并：原来 PUSH_CHN=0 / RTSP_CHN=1 是两个编码器在编**一模一样**的
+# 720p 流（都挂 sensor 根、同码率同 GOP），纯属双倍白干。现在只编一路，
+# app.py 主循环里一次 GetStream 后分别交给 RtspOut.feed() 和 Pusher.feed()。
+# ⚠️ 这是 **VENC 通道号**，不是 sensor 通道号。想单独降某一路分辨率仍缺一条
+# 未验证的链接路径 —— 见 cam.py 的 add_channel() 文档。
+STREAM_CHN = 0           # VENC0 -> 同时喂 RTSP 和主动推流
 RTSP_PORT = 8554
 RTSP_SESSION = "k230"
 
@@ -202,6 +203,9 @@ FOLLOW_TIMEOUT_MS = 8000
 # 特征库在 /sdcard/k230vision/facedb/<名字>.bin（每人多帧，比对取最大）。
 # **身份字符串就是注册时的名字**（ASCII，如 id1）；映射到"小a/小b"是消费侧的事。
 FACE_ENABLE = True
+# 人脸不用每拍都跑（约 17ms/张脸，还叠一个活体模型）。没有 follow 等待时降频到
+# 5 Hz 足够"谁在场"，省下的时间还给 10 Hz 的推理节拍。见 app.py 主循环的隔拍判断。
+FACE_HZ = 5.0
 FACE_ANCHORS = "/sdcard/k230vision/vendor/prior_data_320.bin"
 FACE_DB_DIR = "/sdcard/k230vision/facedb"
 FACE_THRESHOLD = 0.78   # ⚠️ 暂定 —— 依据见 faces.py 的注释（分离窗口只有 0.047 宽，
@@ -222,19 +226,6 @@ FACE_DB_MAX = 40              # 每人最多存多少条（超了丢最早的，
                               #      20KB/条 = 1.6MB/人，装不下两个）
 FACE_SAVE_EVERY_MS = 30000    # 落盘间隔（别每帧写 SD）
 FACE_SEED_SECONDS = 4.0       # **种子**注册的时间预算（之后靠增量长）
-
-
-# ---- A010 ToF 深度（2026-10-10）----
-TOF_ENABLE = True
-TOF_UNIT = 4            # 4mm/计数，量程上限 1020mm（覆盖 15cm~1m 抓取包络）
-TOF_FAST = True         # 提速到 921600（100x100 实测 6.8fps；不提只有 1.1fps）
-TOF_CLASSES = ("chair",)        # 只给这些类的框算深度（= TRACK_CLASS）
-TOF_MAX_BOXES = 3       # 每拍最多算几个框（MicroPython 下聚类是逐像素循环，要限量）
-TOF_PAD = 0.06          # 框四周多留的余量（归一化）
-TOF_MIN_MM = 150        # 量程下限：比这更近的回波是伪影（爪尖/臂身）—— 模块额定下限 15cm
-# ToF 归一化坐标 ← 推流归一化坐标 的仿射映射：tof = a * stream + b
-# 默认恒等（假设 ToF 与相机近似共轴同视场）。**这四个数就是标定要量的东西**（Task 4）。
-TOF_MAP = {"ax": 1.0, "bx": 0.0, "ay": 1.0, "by": 0.0}
 
 
 # ============================================================================
