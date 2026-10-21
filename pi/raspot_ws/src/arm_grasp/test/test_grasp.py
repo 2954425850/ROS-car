@@ -869,3 +869,71 @@ def test_require_depth_off_by_default():
     assert cfg.require_depth is False
     rep = grasp.run(cfg, FakeLink(Plant(_start_joints()), CAP), phase='all')
     assert rep['ok'] is True
+
+
+# ---- 2026-10-21: 下扎到机械极限 ⇒ 直接合爪（不整轮 refuse）------------------------
+
+class BoxLink(FakeLink):
+    """给 `initial_point` 路径用的假链路：观测带一个**包住已测目标**的框。
+
+    裸 `FakeLink.obs()` 的 `box_norm=None`，`validate_measured_observation` 会拒收
+    （"已测目标核验失败"）—— 这是刻意的：多视角测到的点必须由跟踪框确认可见。
+    """
+
+    def obs(self):
+        obs = super().obs()
+        if obs is None:
+            return None
+        u, v = geom.project(self.p.j, CAP)
+        x, y = u / 320.0, v / 180.0
+        box = [max(0.0, x - .04), max(0.0, y - .03),
+               min(1.0, x + .08), min(1.0, y + .04)]
+        return obs._replace(box_norm=box)
+
+
+def test_descend_closes_when_s_stop_unreachable_but_gripper_is_on_target(monkeypatch):
+    """★ 真机 2026-10-21 黄椒：s=25mm 处 α=−79° 无解（shoulder 要 872/875），
+    但臂实际停在 40.6mm、爪尖离目标点 16.2mm —— 爪已经套住物体却整轮 refuse。
+
+    这里用 monkeypatch 精确制造"只在 s_stop 处无解"：命令走到 s_stop 那一拍，
+    `pick_target` 抛 Refused。期望：**进合爪**，而不是 `stopped='refuse…'`。
+    """
+    start = _start_joints(s_m=0.08)          # ★ 在打桩之前算，别让假函数参与起步姿态
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900,
+                          close_reach_m=0.05)
+    real = grasp.pick_target
+
+    def fake(O, c, s, prefer, vis=None, span=None, balance=False):
+        if span is not None and s <= c.s_stop_m + 1e-9:
+            raise Refused('模拟：s_stop 处无可行姿态')
+        return real(O, c, s, prefer, vis, span, balance)
+
+    monkeypatch.setattr(grasp, 'pick_target', fake)
+    plant = Plant(start)
+    link = BoxLink(plant, CAP, grip_block=400.0)
+    rep = grasp.run(cfg, link, phase='all', initial_point=CAP, log=lambda *_: None)
+
+    assert [p[0] for p in rep['phases']] == ['aim', 'descend', 'close', 'lift'], rep['phases']
+    assert rep['ok'], rep['stopped']
+    assert '机械极限' in rep['phases'][1][1], rep['phases'][1]
+    assert '合爪窗口' in rep['phases'][1][1]
+
+
+def test_descend_close_fallback_can_be_disabled(monkeypatch):
+    """`close_reach_m=0` = 关掉兜底：同样的"只在 s_stop 无解"必须原样 refuse。"""
+    start = _start_joints(s_m=0.08)
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900,
+                          close_reach_m=0.0)
+    real = grasp.pick_target
+
+    def fake(O, c, s, prefer, vis=None, span=None, balance=False):
+        if span is not None and s <= c.s_stop_m + 1e-9:
+            raise Refused('模拟：s_stop 处无可行姿态')
+        return real(O, c, s, prefer, vis, span, balance)
+
+    monkeypatch.setattr(grasp, 'pick_target', fake)
+    rep = grasp.run(cfg, BoxLink(Plant(start), CAP), phase='all',
+                    initial_point=CAP, log=lambda *_: None)
+    assert rep['ok'] is False
+    assert (rep['stopped'] or '').startswith('refuse'), rep['stopped']
+

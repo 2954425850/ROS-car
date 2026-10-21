@@ -103,7 +103,7 @@ def parse_box(s):
 
 def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
               joint_comp=None, hz=None, bias_r=None, require_depth=None,
-              s_stop_mm=None):
+              s_stop_mm=None, close_reach_mm=None):
     """把 CLI 参数装进 `GraspConfig`。**`--h` 必须真的进 `z_plane_m`**（自检里有闸）。"""
     kw = {'z_plane_m': float(h_m)}
     if s_stop_mm is not None:
@@ -123,6 +123,9 @@ def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
         kw['bias_r_m'] = float(bias_r) / 100.0      # CLI 用 cm，内部用米
     if require_depth is not None:
         kw['require_depth'] = bool(require_depth)
+    if close_reach_mm is not None:
+        # 下扎到 s_stop 无解时，爪尖离目标点多近还允许直接合爪（0 = 关掉兜底）。
+        kw['close_reach_m'] = float(close_reach_mm) / 1000.0
     cfg = grasp.GraspConfig(**kw)
     if hz is not None:
         # ★ 提频时**必须把"按拍数"的判据一起折算**，否则它们在**墙上时间**上被砍短：
@@ -431,6 +434,10 @@ def main(argv=None):
                     help='覆盖 cfg.s_stop_m（合爪前的下扎停点，默认 3mm）。'
                          '目标在工作空间下边缘、计划器 refuse 但当前高度已可夹时，'
                          '把它设到实际能停住的留量（如 25）。')
+    ap.add_argument('--close-reach-mm', type=float, default=None,
+                    help='下扎到 s_stop **解不出姿态**时，爪尖离目标点多近仍允许直接合爪'
+                         '（默认 30mm，0 = 关掉兜底、退回整轮 refuse）。'
+                         '目标在工作空间边缘、臂已套住物体但计划器要更深才肯合时用。')
     ap.add_argument('--alpha0', type=float, default=None,
                     help='覆盖 cfg.alpha0（下扎轴角的**搜索种子**，默认 −58°）。'
                          '**α0 不是"选哪个 α"，是"从哪开始搜"**：每拍每相位都拿 `prev_alpha` 当'
@@ -494,6 +501,7 @@ def main(argv=None):
     cfg = build_cfg(args.h, max_step=args.max_step, patience=args.patience,
                     alpha0=args.alpha0, joint_comp=args.joint_comp, hz=args.hz,
                     s_stop_mm=args.s_stop_mm,
+                    close_reach_mm=args.close_reach_mm,
                     bias_r=args.bias_r,
                     max_seconds=args.max_seconds,
                     require_depth=not explicit_h)

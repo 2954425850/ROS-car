@@ -47,7 +47,8 @@ GraspConfig = namedtuple('GraspConfig',
     'base_comp base_comp_max '
     'joint_comp joint_comp_max '
     'bias_r_m '
-    's_lead_m lead_max_counts require_depth')
+    's_lead_m lead_max_counts require_depth '
+    'close_reach_m')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -118,6 +119,16 @@ GraspConfig.__new__.__defaults__ = (
     #   为什么必须在进 descend 前判死：ToF 在 <15cm 上瞎，而进 descend 之后 cmd 就开始
     #   往目标扎 ⇒ 那时再看深度已经晚了（见设计 §6）。
     False,
+    # close_reach_m：下扎到 s_stop **解不出姿态**时的合爪窗口（米）。
+    #   2026-10-21 真机：黄椒在工作空间边缘（S0 slack 24），aim 收在 α=−85°，
+    #   下扎时 α 每拍重选、漂到 −79°，到 s=25mm 处 shoulder 要 872/上限 875 ⇒
+    #   `pick_target` refuse。可**臂实际停在 40.6mm、爪尖离目标点只有 16.2mm**，
+    #   爪已经套在椒上 —— 再拒绝就是整轮白跑。
+    #   ⇒ 下扎已到 s_stop 地板却无解、且爪尖离目标点 ≤ 这个窗口时，**直接进合爪**
+    #   （`run()` 的 descend 分支）。0 = 关掉这个兜底（退回旧的"整轮 refuse"）。
+    #   取 30mm：爪张开时指尖到指根的跨度约 5~6cm，目标中心进到 3cm 以内才认为
+    #   "已经套住"；比它远就仍然按几何拒绝，不去赌。
+    0.030,
 )
 
 
@@ -629,13 +640,31 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                              to_fields(hold_j, close_cmd, cfg.wrist_roll),
                              0.0, 0.0, True, 0.0, 0.0)
             else:
-                # ★ 一旦离开 aim 就把 α **冻住**（span=0）：下扎必须是一条**直线**。
+                # ★ 一旦离开 aim 就把 α **冻住**：下扎必须是一条**直线**。
                 #   实机实测（2026-10-01）：下扎中 α 自己从 −60° 漂到 −67° ⇒ 轴线转向 ⇒
                 #   爪尖沿旧轴走下去、横向偏出 4.6cm（比瓶盖还大）⇒ 夹在瓶盖**后面**。
+                # ⚠️ 中心必须跟上一拍的 α（±span 内搜）：可行 α 区间**随留量 s 移动**，
+                #   钉死进相那一刻的 α 会在半路无解（2026-10-21 试过冻结中心，
+                #   `test_descend_reaches_s_stop_despite_feedback_lag` 立刻红）。
                 tgt = pick_target(O_u, cfg, s_cmd, prev_alpha,
                                   span=(None if cur == 'aim' else cfg.alpha_freeze_span),
                                   balance=(cur == 'aim'))
         except Refused as e:
+            # ★★ 下扎已经到 s_stop 地板、几何上解不出更深的姿态，但**爪尖已经进合爪窗口**：
+            #   这不是"这轮抓不了"，而是"机械极限先到了" ⇒ 直接进合爪。
+            #   2026-10-21 真机：s=25mm 处 α=−79° 无解（shoulder 要 872/875），
+            #   但臂实际停在 40.6mm、爪尖离目标点 16.2mm，爪已套在黄椒上。
+            #   旧行为是整轮 refuse、臂已经到位却不合爪 —— 用户明确说这是 bug。
+            if cur == 'descend' and s_cmd <= cfg.s_stop_m + 1e-9:
+                err_now = math.dist(tip_open_m(j_cur_m), O_u)
+                if err_now <= cfg.close_reach_m:
+                    if not advance_or_stop(
+                            '下扎到机械极限：s=%.1fmm 处无可行姿态（%s）；'
+                            '爪尖离目标点 %.1fmm ≤ 合爪窗口 %.0fmm ⇒ 直接合爪'
+                            % (s_cmd * 1000.0, e, err_now * 1000.0,
+                               cfg.close_reach_m * 1000.0)):
+                        break
+                    continue
             rep['stopped'] = 'refuse：%s' % e
             break
         if cur != 'close':
