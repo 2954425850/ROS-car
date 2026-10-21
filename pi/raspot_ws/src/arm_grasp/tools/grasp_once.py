@@ -48,6 +48,7 @@
   服务一秒都不停**（板子侧只有"锁框"和收尾的"释放"两条网络写，那不叫动臂）。
 """
 import argparse
+import json
 import math
 import os
 import sys
@@ -434,6 +435,9 @@ def main(argv=None):
                     help='覆盖 cfg.s_stop_m（合爪前的下扎停点，默认 3mm）。'
                          '目标在工作空间下边缘、计划器 refuse 但当前高度已可夹时，'
                          '把它设到实际能停住的留量（如 25）。')
+    ap.add_argument('--rows-out', default=None,
+                    help='把每拍数据落盘成 JSON（rows / phases / 每拍指令与回读）。'
+                         '查"接近相为什么抖/慢"时用；不影响控制。')
     ap.add_argument('--close-reach-mm', type=float, default=None,
                     help='下扎到 s_stop **解不出姿态**时，爪尖离目标点多近仍允许直接合爪'
                          '（默认 30mm，0 = 关掉兜底、退回整轮 refuse）。'
@@ -703,6 +707,29 @@ def main(argv=None):
                           % (rep['err_m'] * 1000.0,
                              '-' if rep['target'] is None
                              else '%.0f' % rep['target'].slack))
+                if args.rows_out:
+                    # ★ 诊断用：把**每一拍**都留住（控制回路本身不看它）。
+                    #   rows = (t, err, s_ach, α, slack, has_obs)；link_log = (t, 发, 读)。
+                    try:
+                        with open(args.rows_out, 'w', encoding='utf-8') as f:
+                            json.dump({'phase': ph,
+                                       'phases': rep['phases'],
+                                       'rows': [list(r) for r in rep['rows']],
+                                       'O_phase_end': [[p[0], list(p[1])]
+                                                       for p in rep['O_phase_end']],
+                                       'link_log': [[t, list(c), None if fb is None
+                                                     else list(fb)]
+                                                    for t, c, fb in link.log],
+                                       'cfg': dict(cfg._asdict()),
+                                       'box': want,
+                                       'O_last': None if rep['O_last'] is None
+                                       else list(rep['O_last']),
+                                       'stopped': rep['stopped']},
+                                      f, ensure_ascii=False)
+                        print('   每拍数据 -> %s（%d 拍）'
+                              % (args.rows_out, len(rep['rows'])))
+                    except Exception as e:                    # noqa: BLE001
+                        print('⚠️ 落盘每拍数据失败：%s' % e)
                 if not rep['ok']:
                     print('❌ [%s] 没到位：%s' % (ph, rep['stopped']))
                     rc_all = 1
