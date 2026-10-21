@@ -169,7 +169,9 @@ class ProfileStore:
             return
         for pid, name in (m or {}).items():
             if _ID_RE.match(str(pid)) and pid not in self._cache:
-                self.ensure(pid, name=str(name or ""))
+                # people.json 里"称呼就是 id 本身"（如 id1→id1）= 其实不知道叫什么，别让模型念 id
+                name = str(name or "")
+                self.ensure(pid, name="" if name == pid else name)
 
     def _write(self, d: dict) -> None:
         """**调用方持锁**。原子写：先写临时文件再 rename。"""

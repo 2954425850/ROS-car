@@ -243,3 +243,10 @@ def test_speaker_change_is_flagged(tmp_path):
     _show(st, "u002", 0.92)
     m.begin_turn()
     assert m.speaker_changed()
+
+
+def test_seed_placeholder_name_is_not_a_name(tmp_path):
+    people = tmp_path / "people.json"
+    people.write_text(json.dumps({"id1": "id1"}), encoding="utf-8")
+    st = ProfileStore(tmp_path / "p", seed_people_json=str(people))
+    assert st.get("id1")["name"] == ""
