@@ -647,9 +647,15 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                     #   这个固件的夹爪回读滞后很大（实测指令 240→354 走了 0.4s，读回还趴在
                     #   234 不动）⇒ 一进 close 相就"读回不动 = 碰上东西"，其实它只是**还没开始动**。
                     #   所以只有读回**真的动过**（离起点超过一个死区宽）之后，卡住计数才算数。
-                    p1_start, close_armed = p1_read, False
+                    # ⚠️ p1=0 = **该拍没读到**（协议约定），不是位置 0：
+                    #   2026-10-21 真机 close 相读到 0（令 553 那拍起），旧代码把
+                    #   "0 和 0 差 <5"当成"连续 3 拍不动 = 碰上东西"，提前冻结。
+                    p1_start = p1_read if p1_read > 0.0 else cfg.gripper
+                    close_armed = False
                 if close_cmd is None:
-                    close_cmd = p1_read          # 起点 = **真回读**（不是上一拍的指令）
+                    # 起点 = **真回读**；没读到就用张开位（cfg.gripper）当起点，
+                    # 绝不拿 0 起步（那会让 p1 先"从 0 往 578 爬"）。
+                    close_cmd = p1_read if p1_read > 0.0 else cfg.gripper
                 close_cmd = min(cfg.close_field, close_cmd + cfg.close_step)
                 tgt = Target(prev_alpha, cfg.s_stop_m, dict(hold_j),
                              to_fields(hold_j, close_cmd, cfg.wrist_roll),
@@ -867,13 +873,20 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
             #   **没有能红的测试覆盖这条**。留着它是因为它只可能更保守（要求夹爪真的跟了一步），
             #   代价是"移动不到 30 count 就真碰上"的情况会漏判、退到合到底/兜底（不会过力）。
             #   真因待查：下次上机要抓 `close` 相每拍的 (令, 读) 原始对。
-            if not close_armed and abs(p1_read - p1_start) > cfg.close_step:
-                close_armed = True          # ★ 读回真的跟了一步，卡住计数从这里才开始算
-            if close_armed and p1_prev is not None and abs(p1_read - p1_prev) < 5.0:
-                close_stuck += 1
+            # ⚠️ p1_read = 0 是**该拍没读到**（协议约定），不是"爪停在 0"：
+            #   2026-10-21 真机 close 相从令 553 那拍起读回恒 0，旧代码按
+            #   "0 与 0 差 <5"数满 3 拍 ⇒ 误报"碰上东西"、提前冻结。
+            #   没读到的样本**不参与**起振/卡住判据，只让合爪指令继续按步长爬。
+            if p1_read > 0.0:
+                if not close_armed and abs(p1_read - p1_start) > cfg.close_step:
+                    close_armed = True      # ★ 读回真的跟了一步，卡住计数从这里才开始算
+                if close_armed and p1_prev is not None and abs(p1_read - p1_prev) < 5.0:
+                    close_stuck += 1
+                else:
+                    close_stuck = 0
+                p1_prev = p1_read
             else:
                 close_stuck = 0
-            p1_prev = p1_read
             if close_stuck >= cfg.close_stall:
                 if not advance_or_stop('合爪完成：读回连续 %d 拍不动（p1 令 %.0f/读 %.0f）'
                                        '⇒ 碰上东西、冻结不再加压'

@@ -165,6 +165,12 @@ class Ps2TeleopNode(Node):
         if len(pos) < 6:
             return
         if self.targets is None:
+            # ★ 首帧可能是"该拍没读到"（协议里 0 = 没读到）。拿 0 当目标 =
+            #   把对应关节往 0 推。2026-10-21 真机：抓完恢复服务时首帧 p1=0，
+            #   目标被初始化成 0 ⇒ **夹爪张开、刚抓到的椒掉了**。
+            #   先等一帧**完整**的回读再同步（25Hz，等一拍而已）。
+            if any(pos[i] == 0.0 for i in range(5)):
+                return
             # 首次同步：目标 = 当前实际位姿，绝不用硬编码姿态去推臂
             self.targets = [clamp(pos[i], 0, CFG['GRIP_MAX'] if i == 0 else 1000)
                             for i in range(5)]

@@ -997,3 +997,29 @@ def test_aim_freezes_O_once_close(monkeypatch):
 
     assert n_on < n_off, ('冻结没有减少 O 更新：开 %d / 关 %d（%s）'
                           % (n_on, n_off, rep2['stopped']))
+
+
+class ZeroP1Link(BoxLink):
+    """合爪指令进入后半段后，p1 回读恒为 0（= 该拍没读到；2026-10-21 真机实测）。"""
+
+    def fb(self):
+        f = super().fb()
+        if f is not None and self.pub is not None and self.pub[0] >= 500.0:
+            f = list(f)
+            f[0] = 0.0
+        return f
+
+
+def test_close_does_not_treat_missing_p1_as_stuck():
+    """★ 真机 close 相：令 p1 从 553 起读回恒 0，旧代码把"0 与 0 差 <5"当成
+    "连续 3 拍不动 = 碰上东西"，提前冻结。0 是**没读到**，不能参与判据。
+
+    期望：不报"碰上东西"，而是指令爬满后按 close_ticks **超时兜底**收尾。
+    """
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900)
+    link = ZeroP1Link(Plant(_start_joints(s_m=0.05)), CAP, grip_block=400.0)
+    rep = grasp.run(cfg, link, phase='all', initial_point=CAP, log=lambda *_: None)
+    close_reason = rep['phases'][2][1]
+    assert '碰上东西' not in close_reason, close_reason
+    assert '超时兜底' in close_reason, close_reason
+    assert rep['ok'], rep['stopped']
