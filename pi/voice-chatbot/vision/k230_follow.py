@@ -74,6 +74,10 @@ class K230Target:
     def forget(self, pid: str) -> str:
         return self._run(["forget", str(pid)])
 
+    def box(self, l: float, t: float, r: float, b: float) -> str:
+        """直接给一个归一化框（推流系），板子用它初始化 NanoTrack。"""
+        return self._run(["box"] + [repr(float(v)) for v in (l, t, r, b)])
+
     def point(self, u: float, v: float, size: float | None = None) -> str:
         argv = ["pt", repr(float(u)), repr(float(v))]
         if size is not None:

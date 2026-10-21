@@ -134,7 +134,8 @@ def register_follow_tools(registry: ToolRegistry, target, config=None, resolver=
             name="follow_stop",
             group="follow",
             description=(
-                "**别再跟着他了**。用户说「别跟了」「不用跟了」「停下别跟」时调用。"
+                "**别再跟着他了 / 别盯着那个东西了**。用户说「别跟了」「不用跟了」「停下别跟」"
+                "「别盯了」时调用（人和物体的跟踪都用这个停）。"
                 "注意：让**车**停下是 car_stop，这个是停「跟随」这件事，两者不一样。"
             ),
             parameters={"type": "object", "properties": {}, "required": []},

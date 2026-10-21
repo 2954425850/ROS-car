@@ -76,6 +76,8 @@ from tools.car import register_car_tools
 from tools.vision import register_vision_tools
 from tools.follow import register_follow_tools
 from tools.identity import register_identity_tools, restrict_to_owner
+from tools.track import register_track_tools
+from vision.locate import Locator, VlmBoxer
 from identity.manager import IdentityManager
 from vision.k230_state import K230State
 from car.controller import CarController
@@ -343,6 +345,10 @@ class ConversationManager:
         register_follow_tools(self._registry, self._target, config=config,
                               resolver=self._identity.resolve_name if self._identity else None)
         register_identity_tools(self._registry, self._identity)
+        # 「盯住那个 X」：Qwen3-VL 画框 → NanoTrack（目标指定不用 YOLO，见 vision/locate.py）
+        if self._vision is not None and self._target is not None:
+            register_track_tools(self._registry, Locator(self._vision, VlmBoxer(config)),
+                                 self._target, self._k230_state)
         if self._identity is not None and config.get("identity.restrict_to_owner", False):
             n = restrict_to_owner(self._registry, self._identity, {"car", "follow"})
             logger.info(f"身份：{n} 个车/跟随工具只听主人 {sorted(self._identity.owners)}")
