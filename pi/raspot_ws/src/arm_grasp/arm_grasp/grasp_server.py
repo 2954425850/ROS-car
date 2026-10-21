@@ -33,6 +33,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
+from std_srvs.srv import Trigger
 
 from raspot_interfaces.action import Grasp
 
@@ -42,6 +43,13 @@ from arm_grasp.grasp_codes import code_for
 
 OBS_WAIT_S = 5.0          # 锁框后等结果流出现这个框
 REC_MAX_AGE_S = 1.5       # 结果记录超过这么老就不用（同 observe.fresh_result）
+
+# 上电复位位姿：p2(腕旋) p3(腕俯) p4(小臂) p5(大臂) base。夹爪 p1 保持当前闭合值不回。
+# 值来自开机时 ps2_teleop 按实际位姿初始化的 targets=[214,496,180,129,415,3]。
+HOME_JOINTS = (496.0, 180.0, 129.0, 415.0, 0.0)
+HOME_STEP = 20.0          # 回位时限速：每拍每关节最多多少 counts（@10Hz）
+HOME_TOL = 3.0            # 到位判据
+HOME_MAX_S = 12.0
 
 
 class _Abort(Exception):
@@ -138,6 +146,9 @@ class GraspServer(Node):
             except ImportError as e:
                 self.get_logger().warn(f'没有 tof_a010：{e}')
 
+        self._grip_last = None           # 最近非零的夹爪回读（回位时保持夹住）
+        self.create_service(Trigger, 'arm/go_home', self._go_home_srv, callback_group=cb)
+
         self._as = ActionServer(self, Grasp, 'arm/grasp', execute_callback=self._execute,
                                 goal_callback=self._on_goal, cancel_callback=self._on_cancel,
                                 callback_group=cb)
@@ -147,6 +158,8 @@ class GraspServer(Node):
 
     def _on_fb(self, msg):
         self.fb = list(msg.position)
+        if len(msg.position) > 0 and msg.position[0] > 0:
+            self._grip_last = float(msg.position[0])
 
     def _on_cmd(self, msg):
         if self._busy and msg.header.frame_id == 'teleop':
@@ -211,6 +224,49 @@ class GraspServer(Node):
         # estimate_point 用 t_arrive - latency_s 当拍摄时刻 ⇒ 这里反加回去，正好落在 t_cap
         return grasp.Obs(t_cap + latency_s, u, v, rec.get('frame'), b.get('src', 'det'),
                          b['box'], d)
+
+    def _go_home_srv(self, req, resp):
+        if self._busy:
+            resp.success, resp.message = False, '抓取进行中，先等它结束或取消'
+            return resp
+        try:
+            self._go_home()
+            resp.success, resp.message = True, '已回到复位位姿（夹爪保持）'
+        except _Abort as a:
+            resp.success, resp.message = False, a.reason
+        except Exception as e:         # noqa: BLE001
+            resp.success, resp.message = False, repr(e)
+        return resp
+
+    def _go_home(self):
+        """回到上电复位位姿，**夹爪保持闭合**（用户 2026-10-21）。流式限速，超时兜底。"""
+        grip = self._grip_last if self._grip_last and self._grip_last > 0 else 500.0
+        tgt = [grip] + list(HOME_JOINTS)
+        end = time.monotonic() + HOME_MAX_S
+        self.get_logger().info(f'go_home：目标 [grip={grip:.0f}, '
+                               f'{", ".join("%.0f" % v for v in HOME_JOINTS)}]')
+        while time.monotonic() < end:
+            self.check_abort()
+            fb = self.fb
+            if not _stable(fb):
+                time.sleep(0.05)
+                continue
+            f = [float(v) for v in fb]
+            grip = self._grip_last if (self._grip_last and self._grip_last > 0) else grip
+            out = [grip]
+            done = True
+            for i in range(1, 6):
+                d = tgt[i] - f[i]
+                if abs(d) <= HOME_TOL:
+                    out.append(tgt[i])
+                else:
+                    out.append(f[i] + (HOME_STEP if d > 0 else -HOME_STEP))
+                    done = False
+            self.publish_arm(out)
+            if done:
+                return
+            time.sleep(0.1)
+        self.get_logger().warn('go_home 超时（%.0fs），臂停在半路' % HOME_MAX_S)
 
     def _feedback(self, gh, phase, detail):
         fb = Grasp.Feedback()
@@ -333,7 +389,12 @@ class GraspServer(Node):
                 pass
             if rep.get('O_last') is not None:
                 res.target_xyz = [float(v) for v in rep['O_last']]
-            (gh.succeed if res.ok else gh.abort)()
+            if res.ok:
+                self._feedback(gh, 'home', '回复位位姿（保持夹爪）')
+                self._go_home()
+                gh.succeed()
+            else:
+                gh.abort()
             return res
         except _Abort as a:
             res.ok, res.code, res.reason = False, a.code, a.reason
