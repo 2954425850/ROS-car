@@ -77,6 +77,7 @@ from tools.vision import register_vision_tools
 from tools.follow import register_follow_tools
 from tools.identity import register_identity_tools, restrict_to_owner
 from tools.track import register_track_tools
+from tools.grasp import register_grasp_tools
 from vision.locate import Locator, VlmBoxer
 from identity.manager import IdentityManager
 from vision.k230_state import K230State
@@ -346,9 +347,18 @@ class ConversationManager:
                               resolver=self._identity.resolve_name if self._identity else None)
         register_identity_tools(self._registry, self._identity)
         # 「盯住那个 X」：Qwen3-VL 画框 → NanoTrack（目标指定不用 YOLO，见 vision/locate.py）
-        if self._vision is not None and self._target is not None:
-            register_track_tools(self._registry, Locator(self._vision, VlmBoxer(config)),
-                                 self._target, self._k230_state)
+        self._locator = Locator(self._vision, VlmBoxer(config)) if self._vision is not None else None
+        if self._locator is not None and self._target is not None:
+            register_track_tools(self._registry, self._locator, self._target, self._k230_state)
+        # 「抓那个 X」：画框 → /arm/grasp。起不来只降级（工具照注册，调用时说明原因）。
+        try:
+            from car.grasp_client import GraspClient
+            self._grasp = GraspClient()
+            self._grasp.start()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"抓取客户端：起不来 —— {e}")
+            self._grasp = None
+        register_grasp_tools(self._registry, self._locator, self._grasp)
         if self._identity is not None and config.get("identity.restrict_to_owner", False):
             n = restrict_to_owner(self._registry, self._identity, {"car", "follow"})
             logger.info(f"身份：{n} 个车/跟随工具只听主人 {sorted(self._identity.owners)}")
@@ -424,6 +434,8 @@ class ConversationManager:
         self._car.close()
         if self._k230_state is not None:
             self._k230_state.close()
+        if getattr(self, '_grasp', None) is not None:
+            self._grasp.close()
         self._mcp.close()  # 关 portal + 终止 MCP server 子进程，防僵尸
         self._tool_executor.shutdown(wait=False)
         self._mic.close()

@@ -49,3 +49,24 @@ def test_track_object_not_found_does_not_touch_board():
     register_track_tools(reg, Locator(_Snap(), _Boxer(None)), tg, None)
     out = reg.dispatch("track_object", {"target_desc": "独角兽"}).result
     assert tg.boxes == [] and "没能找到" in out
+
+
+def test_grasp_tool_routes_box_to_client():
+    from tools.grasp import register_grasp_tools
+    class _G:
+        def __init__(self):
+            self.boxes = []
+        def grasp(self, box):
+            self.boxes.append(box)
+            return "抓好了"
+    class _Snap:
+        def snap(self):
+            return "/tmp/x.jpg"
+    class _Boxer:
+        def box(self, p, q):
+            return (0.1, 0.2, 0.3, 0.4), "raw"
+    g = _G()
+    reg = ToolRegistry()
+    register_grasp_tools(reg, Locator(_Snap(), _Boxer()), g)
+    assert reg.dispatch("grasp_object", {"target_desc": "辣椒"}).result == "抓好了"
+    assert g.boxes == [(0.1, 0.2, 0.3, 0.4)]

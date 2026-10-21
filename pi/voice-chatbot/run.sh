@@ -19,7 +19,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 不能直接 `source` 了事：`set -e` 下 source 一个不存在的文件会立刻退出，
 # 而 systemd 单元是 Restart=on-failure —— 那就变成每 10 秒重启一次的
 # 崩溃循环，且症状看起来像「加了小车之后助手起不来了」。
-for setup in /opt/ros/jazzy/setup.bash "$HERE/../l150pro_ws/install/setup.bash"; do
+for setup in /opt/ros/jazzy/setup.bash "$HERE/../raspot_ws/install/setup.bash" "$HERE/../l150pro_ws/install/setup.bash"; do
     if [ -f "$setup" ]; then
         # shellcheck disable=SC1090
         source "$setup"
