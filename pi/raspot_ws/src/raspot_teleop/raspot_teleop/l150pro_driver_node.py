@@ -16,6 +16,7 @@
   /imu/data_raw     sensor_msgs/Imu     只有 angular_velocity.z 可信（同老驱动：不发 orientation）
   /driver_fault     std_msgs/Int16MultiArray [fault, 0, 0, dropped] —— 与老驱动同格式（语音/云端读 data[0]）
   /yaw_loop         std_msgs/Float32MultiArray [wz_ref, wz_meas, wz_out, I]（偏航闭环诊断）
+  /chassis/raw55    std_msgs/Float32MultiArray [vA,vB,vC,vD, roll,pitch,yaw, gz, tick_ms]（0x55 原值，排错用）
   TF odom→base_footprint（publish_odom_tf，默认开；以后上 EKF 时关掉、由 EKF 发）
   ★ 2026-10-21：以上四个话题 + TF + 偏航闭环原来在 l150pro_ws 的老驱动里，
     老驱动不会说机械臂协议、和本节点抢串口，一直关着 ⇒ 语音的 car_move/car_turn
@@ -253,6 +254,7 @@ class L150ProDriverNode(Node):
         self.pub_imu = self.create_publisher(Imu, 'imu/data_raw', 10)
         self.pub_driver_fault = self.create_publisher(Int16MultiArray, 'driver_fault', 10)
         self.pub_yaw_loop = self.create_publisher(Float32MultiArray, 'yaw_loop', 10)
+        self.pub_raw55 = self.create_publisher(Float32MultiArray, 'chassis/raw55', 10)
         self.tf_bc = TransformBroadcaster(self)
 
         # 串口线程（喂陀螺/积分里程计）与 chassis_tick（闭环 step）共用
@@ -443,6 +445,12 @@ class L150ProDriverNode(Node):
         im.linear_acceleration_covariance[0] = -1.0
         im.orientation_covariance[0] = -1.0        # yaw 纯陀螺积分会漂，不发姿态
         self.pub_imu.publish(im)
+
+        raw = Float32MultiArray()
+        raw.data = [float(v) for v in d['wheels']] + [
+            float(d['roll']), float(d['pitch']), float(d['yaw']), float(d['gz']),
+            float(d['tick_ms'])]
+        self.pub_raw55.publish(raw)
 
         df = Int16MultiArray()
         df.data = [int(d['faults']), 0, 0, min(int(self.dropped55), 32767)]
