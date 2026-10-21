@@ -674,11 +674,16 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
             #   但臂实际停在 40.6mm、爪尖离目标点 16.2mm，爪已套在黄椒上。
             #   旧行为是整轮 refuse、臂已经到位却不合爪 —— 用户明确说这是 bug。
             if cur == 'descend' and s_cmd <= cfg.s_stop_m + 1e-9:
-                err_now = math.dist(tip_open_m(j_cur_m), O_u)
+                # ★ 判据是"爪尖离 **s_stop 目标点** 多远"，不是离 O —— 离 O 的距离里
+                #   还含着整段沿轴留量（真机 s_ach≈50mm），拿它比 30mm 永远不会触发
+                #   （2026-10-21 第一次上机就是栽在这：err_act=26.3mm 已经能夹，
+                #   但 dist(tip,O)≈51mm > 30mm ⇒ 兜底没进，仍然整轮 refuse）。
+                T_stop = axis_point(O_u, cfg.s_stop_m, prev_alpha)
+                err_now = math.dist(tip_open_m(j_cur_m), T_stop)
                 if err_now <= cfg.close_reach_m:
                     if not advance_or_stop(
                             '下扎到机械极限：s=%.1fmm 处无可行姿态（%s）；'
-                            '爪尖离目标点 %.1fmm ≤ 合爪窗口 %.0fmm ⇒ 直接合爪'
+                            '爪尖离 s_stop 目标点 %.1fmm ≤ 合爪窗口 %.0fmm ⇒ 直接合爪'
                             % (s_cmd * 1000.0, e, err_now * 1000.0,
                                cfg.close_reach_m * 1000.0)):
                         break

@@ -901,8 +901,11 @@ def test_descend_closes_when_s_stop_unreachable_but_gripper_is_on_target(monkeyp
     `pick_target` 抛 Refused。期望：**进合爪**，而不是 `stopped='refuse…'`。
     """
     start = _start_joints(s_m=0.08)          # ★ 在打桩之前算，别让假函数参与起步姿态
+    # ★ s_stop=25mm 是关键：真机失败时臂实际停在 s≈50mm，**离 O 有 50mm**，
+    #   但离 s_stop 目标点只有 26mm。用默认 3mm 时两者都小，测不出"拿离 O 的距离
+    #   当判据"那个 bug（2026-10-21 上机就是这么漏过去的）。
     cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900,
-                          close_reach_m=0.05)
+                          s_stop_m=0.025, close_reach_m=0.04)
     real = grasp.pick_target
 
     def fake(O, c, s, prefer, vis=None, span=None, balance=False):
