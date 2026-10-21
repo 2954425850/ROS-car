@@ -104,7 +104,7 @@ def parse_box(s):
 
 def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
               joint_comp=None, hz=None, bias_r=None, require_depth=None,
-              s_stop_mm=None, close_reach_mm=None):
+              s_stop_mm=None, close_reach_mm=None, aim_hold_mm=None):
     """把 CLI 参数装进 `GraspConfig`。**`--h` 必须真的进 `z_plane_m`**（自检里有闸）。"""
     kw = {'z_plane_m': float(h_m)}
     if s_stop_mm is not None:
@@ -127,6 +127,9 @@ def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
     if close_reach_mm is not None:
         # 下扎到 s_stop 无解时，爪尖离目标点多近还允许直接合爪（0 = 关掉兜底）。
         kw['close_reach_m'] = float(close_reach_mm) / 1000.0
+    if aim_hold_mm is not None:
+        # 接近相贴到这个距离内就冻结 O/α（0 = 关掉，退回每拍更新）。
+        kw['aim_hold_m'] = float(aim_hold_mm) / 1000.0
     cfg = grasp.GraspConfig(**kw)
     if hz is not None:
         # ★ 提频时**必须把"按拍数"的判据一起折算**，否则它们在**墙上时间**上被砍短：
@@ -435,6 +438,9 @@ def main(argv=None):
                     help='覆盖 cfg.s_stop_m（合爪前的下扎停点，默认 3mm）。'
                          '目标在工作空间下边缘、计划器 refuse 但当前高度已可夹时，'
                          '把它设到实际能停住的留量（如 25）。')
+    ap.add_argument('--aim-hold-mm', type=float, default=None,
+                    help='接近相贴到距目标点 ≤ 这个距离后**冻结 O/α**（默认 30mm，0=关）。'
+                         '治"在目标上方原地抖、回读进不了死区连续 3 拍"——抖动时目标点本身在漂。')
     ap.add_argument('--rows-out', default=None,
                     help='把每拍数据落盘成 JSON（rows / phases / 每拍指令与回读）。'
                          '查"接近相为什么抖/慢"时用；不影响控制。')
@@ -506,6 +512,7 @@ def main(argv=None):
                     alpha0=args.alpha0, joint_comp=args.joint_comp, hz=args.hz,
                     s_stop_mm=args.s_stop_mm,
                     close_reach_mm=args.close_reach_mm,
+                    aim_hold_mm=args.aim_hold_mm,
                     bias_r=args.bias_r,
                     max_seconds=args.max_seconds,
                     require_depth=not explicit_h)

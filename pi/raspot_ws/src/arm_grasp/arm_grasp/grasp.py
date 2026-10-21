@@ -48,7 +48,7 @@ GraspConfig = namedtuple('GraspConfig',
     'joint_comp joint_comp_max '
     'bias_r_m '
     's_lead_m lead_max_counts require_depth '
-    'close_reach_m')
+    'close_reach_m aim_hold_m')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -128,6 +128,15 @@ GraspConfig.__new__.__defaults__ = (
     #   （`run()` 的 descend 分支）。0 = 关掉这个兜底（退回旧的"整轮 refuse"）。
     #   取 30mm：爪张开时指尖到指根的跨度约 5~6cm，目标中心进到 3cm 以内才认为
     #   "已经套住"；比它远就仍然按几何拒绝，不去赌。
+    0.030,
+    # aim_hold_m：接近相**冻结 O**的窗口（米）。爪尖离当前目标点 ≤ 这个距离后，
+    #   不再用新观测更新 O、α 搜索窗也从 ±alpha_span 收到 ±alpha_freeze_span。
+    #   2026-10-21 真机（椒在 r≈20.8cm 的工作空间边缘）：α 稳在 −75°，但 p3 指令
+    #   仍在 ±27 count 来回、err 10~42mm 抖满 150s 到超时。原因是接近时相机还在动，
+    #   K230 的框有 0.1~0.2s 龄、ToF 是当前帧，两者配出来的 O 每拍都在漂 ⇒ 目标点
+    #   跟着漂 ⇒ 舵机被指挥着来回追，"回读进死区连续 3 拍"永远不成立。
+    #   冻结后臂在一个**固定** O 上收敛；前几拍已经把 O 收敛到 1~2cm 内。
+    #   0 = 关掉（退回旧行为，靠近时仍每拍更新 O）。
     0.030,
 )
 
@@ -480,6 +489,7 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
     grip_hold = None      # 'lift' 相：沿用 close 收尾时的 p1 指令（冻结值，**不是** close_field）
     j_prev_cmd = None     # 上一拍的**未补偿**关节指令（限速的起点，见 ④）
     phase_ticks = 0       # 本相已走几拍
+    aim_hold = False      # 'aim' 相：已贴到目标 ⇒ 冻结 O 与 α（见 cfg.aim_hold_m）
 
     def advance_or_stop(reason):
         """本相结束：有下一相就切过去（返回 True 继续），最后一相就定稿（返回 False）。
@@ -566,6 +576,11 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                     validate_measured_observation(trace, obs, initial_point, cfg.latency_s)
                     obs_age = 0.0
                     rep['obs_n'] += 1
+                elif cur == 'aim' and aim_hold:
+                    # ★ 已经贴到目标（见 cfg.aim_hold_m）：**不再更新 O**。
+                    #   观测照旧算"见到目标"（上面的 obs_age 已清零），
+                    #   但运动中的框/深度配出来的 O 会漂，不能拿来移动目标点。
+                    rep['obs_n'] += 1
                 else:
                     O_new, C_obs, d_obs, j_obs, t_fr = estimate_point(
                         trace, obs, cfg.z_plane_m, cfg.latency_s)
@@ -646,9 +661,12 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                 # ⚠️ 中心必须跟上一拍的 α（±span 内搜）：可行 α 区间**随留量 s 移动**，
                 #   钉死进相那一刻的 α 会在半路无解（2026-10-21 试过冻结中心，
                 #   `test_descend_reaches_s_stop_despite_feedback_lag` 立刻红）。
+                # aim 贴住之后也把 α 搜索窗收到 ±alpha_freeze_span：
+                # 否则 O 虽冻结，±alpha_span(14°) 的候选仍会随余量排序换来换去。
+                span = (None if (cur == 'aim' and not aim_hold)
+                        else cfg.alpha_freeze_span)
                 tgt = pick_target(O_u, cfg, s_cmd, prev_alpha,
-                                  span=(None if cur == 'aim' else cfg.alpha_freeze_span),
-                                  balance=(cur == 'aim'))
+                                  span=span, balance=(cur == 'aim'))
         except Refused as e:
             # ★★ 下扎已经到 s_stop 地板、几何上解不出更深的姿态，但**爪尖已经进合爪窗口**：
             #   这不是"这轮抓不了"，而是"机械极限先到了" ⇒ 直接进合爪。
@@ -690,6 +708,10 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         T_goal = axis_point(O_u, s_cmd, tgt.alpha)
         err_act = math.dist(tip_act, T_goal)
         s_ach = standoff_along_axis(tip_act, O_u, tgt.alpha)
+        # ★ 贴近 s_pre 之后冻结 O/α（见 cfg.aim_hold_m）：第一次进窗口就锁住，
+        #   之后臂在一个固定的目标点上收敛。窗口外的接近段照常每拍更新。
+        if cur == 'aim' and not aim_hold and err_act <= cfg.aim_hold_m:
+            aim_hold = True
         # ★★ 限速的**起点**用上一拍的指令（未补偿的那份），不用回读（2026-10-01 复查）：
         #   回读滞后 ~0.2~0.4s，从回读起步 ⇒ 每拍指令都被拽回臂"过去"的位置（和上面 s_cmd
         #   是同一个病）。指令领先回读超过 `lead_max_counts`（臂跟不上/被挡住）⇒ **原地等**

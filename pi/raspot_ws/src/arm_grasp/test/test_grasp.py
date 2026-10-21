@@ -404,7 +404,9 @@ def test_loop_rejects_noisy_observations():
     判据是 `obs_bad > 0`：20px 的噪声折到平面上 ≈ 2~3cm，超过 `gate_m=0.03` 的
     抖动会被 `Est.update` 整条丢掉。把门限改成 `1e6` ⇒ 什么都不丢 ⇒ 这条红。
     """
-    cfg = _cfg()._replace(hz=10.0, max_seconds=5.0, max_ticks=50)
+    # ⚠️ `aim_hold_m=0`：这条测的是**估计器的门限**，不是接近相冻结。
+    #   开着冻结时臂一贴近就停止更新 O，晚段的噪声根本进不了 Est.update。
+    cfg = _cfg()._replace(hz=10.0, max_seconds=5.0, max_ticks=50, aim_hold_m=0.0)
     plant = Plant(_start_joints())
     link = FakeLink(plant, CAP, noise_px=20.0)
     rep = grasp.run(cfg, link, phase='aim', log=lambda *a: None)
@@ -937,3 +939,58 @@ def test_descend_close_fallback_can_be_disabled(monkeypatch):
     assert rep['ok'] is False
     assert (rep['stopped'] or '').startswith('refuse'), rep['stopped']
 
+
+
+# ---- 2026-10-21: 接近相贴住后冻结 O（治"上方原地抖"）------------------------------
+
+class DriftLink(FakeLink):
+    """观测到的目标点在 ±2cm 正弦漂移（模拟"框有龄 + ToF 是当前帧"配错位姿）。
+
+    每拍变化很小（不会触发 Est 的 3cm 门限），但整圈 ±2cm ⇒ 目标点一直在动。
+    """
+
+    def __init__(self, *a, amp=0.020, period=40, **kw):
+        super().__init__(*a, **kw)
+        self.k = 0
+        self.amp = amp
+        self.period = period
+
+    def obs(self):
+        self.k += 1
+        self.O = (CAP[0] + self.amp * math.sin(2.0 * math.pi * self.k / self.period),
+                  CAP[1], CAP[2])
+        return super().obs()
+
+
+def test_aim_freezes_O_once_close(monkeypatch):
+    """★ 真机 2026-10-21：α 稳在 −75°，O 每拍漂 ⇒ 指令 p3 ±27 count 来回、
+    err 10~42mm 抖 150s 超时。贴到 s_pre（err ≤ aim_hold_m）后必须**停止更新 O**。
+
+    这里直接数 `Est.update` 的调用：冻结后不再增长。不走"没冻结就一定超时"的断言 ——
+    假臂比真机干净（正弦漂移下它偶尔也能凑巧连续 3 拍进死区并宣布完成），
+    拿"收敛/不收敛"当判据会脆。
+    """
+    calls = []
+    real_update = grasp.Est.update
+
+    def spy(self, O_new):
+        calls.append(O_new)
+        return real_update(self, O_new)
+
+    monkeypatch.setattr(grasp.Est, 'update', spy)
+
+    start = _start_joints(s_m=0.08)
+    cfg = _cfg()._replace(hz=10.0, max_seconds=20.0, max_ticks=300)
+    rep = grasp.run(cfg, DriftLink(Plant(start), CAP), phase='aim',
+                    log=lambda *_: None)
+    assert rep['ok'], rep['stopped']
+    n_on = len(calls)
+
+    calls.clear()
+    off = cfg._replace(aim_hold_m=0.0)
+    rep2 = grasp.run(off, DriftLink(Plant(start), CAP), phase='aim',
+                     log=lambda *_: None)
+    n_off = len(calls)
+
+    assert n_on < n_off, ('冻结没有减少 O 更新：开 %d / 关 %d（%s）'
+                          % (n_on, n_off, rep2['stopped']))
