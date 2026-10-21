@@ -90,6 +90,34 @@ def cmd_follow(args):
     return _send({"cmd": "follow", "who": who}, args)
 
 
+def cmd_enroll(args):
+    """录入画面里的那张脸为 <id>。板子回 ok 只是受理；等 8556 里的 enroll 结果。"""
+    rc = _send({"cmd": "enroll", "id": args.id}, args)
+    if rc or args.no_wait:
+        return rc
+    return _wait_enroll(args.id, "enroll", timeout=args.timeout)
+
+
+def cmd_forget(args):
+    rc = _send({"cmd": "forget", "id": args.id}, args)
+    if rc or args.no_wait:
+        return rc
+    return _wait_enroll(args.id, "forget", timeout=5.0)
+
+
+def _wait_enroll(pid, what, timeout):
+    import time
+    t_end = time.time() + timeout
+    while time.time() < t_end:
+        st = (k230pi.read_latest_result() or {}).get("enroll") or {}
+        if st.get("id") == pid and st.get("cmd") == what and st.get("state") in ("done", "fail"):
+            print("%s %s: %s  n=%s  %s" % (what, pid, st["state"], st.get("n"), st.get("why") or ""))
+            return 0 if st["state"] == "done" else 1
+        time.sleep(0.2)
+    print("%s %s: 等结果超时（%.0fs）" % (what, pid, timeout), file=sys.stderr)
+    return 1
+
+
 def cmd_auto(args):
     return _send({"cmd": "auto"}, args)
 
@@ -174,6 +202,19 @@ def main(argv=None):
     f.add_argument("who", help="faces 里的名字，如 id1")
     f.add_argument("--json", action="store_true")
     f.set_defaults(func=cmd_follow)
+
+    en = sub.add_parser("enroll", help="把画面里唯一那张脸录成 <id>（ASCII），等结果")
+    en.add_argument("id")
+    en.add_argument("--timeout", type=float, default=10.0)
+    en.add_argument("--no-wait", action="store_true")
+    en.add_argument("--json", action="store_true")
+    en.set_defaults(func=cmd_enroll)
+
+    fg = sub.add_parser("forget", help="从板子人脸库删掉 <id>")
+    fg.add_argument("id")
+    fg.add_argument("--no-wait", action="store_true")
+    fg.add_argument("--json", action="store_true")
+    fg.set_defaults(func=cmd_forget)
 
     au = sub.add_parser("auto", help='切回"检测器自动锁定"')
     au.add_argument("--json", action="store_true")

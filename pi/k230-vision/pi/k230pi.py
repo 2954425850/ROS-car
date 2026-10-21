@@ -18,7 +18,9 @@ import socket
 import subprocess
 import time
 
-K230_HOST = "192.168.1.112"
+# 兜底地址。**实际用 board_host()**：板子 DHCP，地址会变（2026-10-21 是 .109，
+# 这里写的 .112 早就过期了 —— 跟随/点框命令因此一直发错地方）。
+K230_HOST = os.environ.get("K230_HOST", "192.168.1.112")
 RTSP_PORT = 8554
 RTSP_SESSION = "k230"
 RTSP_URL = "rtsp://%s:%d/%s" % (K230_HOST, RTSP_PORT, RTSP_SESSION)
@@ -85,7 +87,7 @@ def build_snap_cmd(tmp_path, proto="tcp", latency=200):
     """
     return [
         "gst-launch-1.0", "-e", "-q",
-        "rtspsrc", "location=%s" % RTSP_URL, "protocols=%s" % proto,
+        "rtspsrc", "location=%s" % rtsp_url(), "protocols=%s" % proto,
         "latency=%d" % latency, "drop-on-latency=true",
         "!", "rtph264depay",
         "!", "h264parse",
@@ -392,15 +394,33 @@ def read_status():
         return None
 
 
-def send_target(payload, host=K230_HOST, port=TARGET_PORT, timeout=TARGET_TIMEOUT):
+def board_host():
+    """K230 的当前地址：优先取 resultd 记下的**结果流对端**（板子主动连上来的那个 IP，
+    总是对的），其次环境变量 K230_HOST，最后兜底常量。grasp_once 早就是这么干的。"""
+    if "K230_HOST" in os.environ:
+        return os.environ["K230_HOST"]
+    st = read_status() or {}
+    peer = st.get("peer")
+    if isinstance(peer, str) and ":" in peer:
+        return peer.rsplit(":", 1)[0]
+    return K230_HOST
+
+
+def rtsp_url():
+    return "rtsp://%s:%d/%s" % (board_host(), RTSP_PORT, RTSP_SESSION)
+
+
+def send_target(payload, host=None, port=TARGET_PORT, timeout=TARGET_TIMEOUT):
     """给 K230 发一条目标命令（**一次连接一条**），返回它的应答 dict。
 
     板子那边的约定：连接 → 发一行 JSON → 收一行 JSON → 关。没有长连接。
 
-    ⚠️ `{"cmd":"follow","who":...}` 是**锁上之后才回 ok** 的 —— 中间那几秒
-    板子在等人脸，所以 timeout 默认给到 10s（板子的 FOLLOW_TIMEOUT_MS 是 8s）。
+    ⚠️ 板子**一收到就回 ok**（targets.TargetRx.poll），follow/enroll 的真实结果要看
+    8556 结果流（follow：objs 里出现 src=track；enroll：`enroll` 字段）。
+    （这里原来写"follow 锁上之后才回 ok"，与板子代码不符，2026-10-21 更正。）
     """
     import socket
+    host = host or board_host()
     line = json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
