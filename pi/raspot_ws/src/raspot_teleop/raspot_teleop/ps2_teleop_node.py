@@ -87,6 +87,7 @@ CFG = {
     'R_MIN': 0.6,
     'V_MIN': 0.12,
     'LAT_EPS': 0.02,
+    'CHASSIS_TAIL_S': 0.30,       # 松杆后继续发零速 N 秒（明确刹车），之后不发、让出 cmd_mux
     'STICK_DEADZONE': 0.12,       # 底盘轮盘的**径向**死区（云端 joystickDeadzone）
     'DEADZONE': 0.15,             # 臂摇杆的**逐轴**死区（和上面那条不是一回事）
     'SMOOTHING': 0.35,            # 臂摇杆低通系数（底盘已照抄云端：没有低通）
@@ -134,7 +135,10 @@ class Ps2TeleopNode(Node):
         self.gear = clamp(float(self.get_parameter('gear_default').value),
                           CFG['GEAR_MIN'], CFG['GEAR_MAX'])
 
-        self.pub_cmd = self.create_publisher(Twist, 'cmd_vel', 10)
+        # ★ 2026-10-21：'cmd_vel' → 'cmd_vel_teleop'，经 cmd_mux 仲裁后才到驱动。
+        #   原来 25Hz 恒发（含全零），任何别的速度源（语音/云端/导航）都会和这串 0 交替。
+        #   现在只在摇杆有输入时发（外加 CHASSIS_TAIL_S 的零速尾巴），松手即让出控制权。
+        self.pub_cmd = self.create_publisher(Twist, 'cmd_vel_teleop', 10)
         self.pub_arm = self.create_publisher(JointState, 'arm/command', 10)
         self.pub_estop = self.create_publisher(Bool, 'estop', 10)
         self.cli_rehome = self.create_client(Trigger, 'arm/rehome')
@@ -157,6 +161,7 @@ class Ps2TeleopNode(Node):
         self.targets = None           # 首条 /arm/feedback 到达后按实际位姿初始化
         self.base_t = None
         self.last_arm_input = 0.0
+        self.last_drive_input = None  # 最近一次底盘非零输入的时刻（None = 从没动过）
         self.arm_hold_cnt = {}        # 臂通道去抖计数
         self.arm_vel = [0.0] * 6      # 各臂通道当前速度 raw/s（加速度限幅后的）
 
@@ -249,10 +254,14 @@ class Ps2TeleopNode(Node):
             y = c['PAD_Y_DIR'] * norm(axes.get(c['AX_PAD_Y'], 0))
             vx, wz = stick_to_drive(x, y, self.gear, c)
 
-        msg = Twist()
-        msg.linear.x = clamp(vx, -c['VX_MAX'], c['VX_MAX'])
-        msg.angular.z = clamp(wz, -c['WZ_MAX'], c['WZ_MAX'])
-        self.pub_cmd.publish(msg)
+        if vx != 0.0 or wz != 0.0:
+            self.last_drive_input = now
+        if (self.last_drive_input is not None
+                and now - self.last_drive_input <= c['CHASSIS_TAIL_S']):
+            msg = Twist()
+            msg.linear.x = clamp(vx, -c['VX_MAX'], c['VX_MAX'])
+            msg.angular.z = clamp(wz, -c['WZ_MAX'], c['WZ_MAX'])
+            self.pub_cmd.publish(msg)
 
         # 机械臂：增量目标积分
         active = False

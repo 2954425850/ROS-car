@@ -146,8 +146,6 @@ def register_vision_tools(registry: ToolRegistry, vision, config=None) -> None:
                 "用户问「前面有什么」「这是什么」「看看那边」「帮我看看」"
                 "「上面写的什么」这类**需要看画面才能回答**的问题时调用。"
                 "把用户的问题原话写进 question。"
-                "只是想转动云台、不需要知道画面里有什么（「往左看看」）用 car_camera；"
-                "需要知道那边有什么、要一个答案时才用本工具。"
                 "注意：这个操作要花几秒到十几秒，一次就够，同一个问题不要连着调好几次。"
             ),
             parameters={

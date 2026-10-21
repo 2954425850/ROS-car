@@ -31,6 +31,13 @@ def generate_launch_description():
                 'require_online': False,
             }],
         ),
+        # 速度仲裁：cmd_vel_teleop > cmd_vel(云端/兼容) > cmd_vel_voice > cmd_vel_nav → cmd_vel_mux → 驱动
+        Node(
+            package='raspot_teleop',
+            executable='cmd_mux_node',
+            name='cmd_mux',
+            output='screen',
+        ),
         Node(
             package='raspot_teleop',
             executable='arm_recorder_node',

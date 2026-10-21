@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from loguru import logger
 
-from car.kinematics import camera_direction_names, direction_names
+from car.kinematics import direction_names
 from tools.registry import Tool, ToolRegistry
 
 _UNAVAILABLE = (
@@ -123,37 +123,9 @@ def register_car_tools(registry: ToolRegistry, controller) -> None:
         )
     )
 
-    registry.register(
-        Tool(
-            name="car_camera",
-            group="car",
-            description=(
-                "转动小车上的云台摄像头。"
-                "用户说「往左看看」「往右看看」「抬头」「低头」「云台回正」时调用。"
-                "用户没给具体角度就不要传 degrees（会转一个固定小步）；"
-                "只有明确说了「转 30 度」这类角度时才传。"
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "direction": {
-                        "type": "string",
-                        "enum": camera_direction_names(),
-                        "description": (
-                            "left=往左转，right=往右转，up=抬头，"
-                            "down=低头，center=回中位。"
-                        ),
-                    },
-                    "degrees": {
-                        "type": "number",
-                        "description": "转动角度。留空 = 固定小步。",
-                    },
-                },
-                "required": ["direction"],
-            },
-            handler=guarded("camera_move"),
-        )
-    )
+    # ★ 2026-10-21：car_camera 不再注册 —— 云台没了（相机挪到了机械臂手腕上），
+    #   现役驱动也不订阅 servo_cmd，模型调它只会"成功"但什么都没动。
+    #   控制器里的 camera_move / camera_nudge 先留着，等腕部相机的"看向某处"工具来替换。
 
     registry.register(
         Tool(

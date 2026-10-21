@@ -73,7 +73,8 @@ class RosBridge:
                          history=HistoryPolicy.KEEP_LAST)
 
         # ---- 下行 ----
-        self._pub_vel = self._node.create_publisher(Twist, "cmd_vel", qos)
+        # ★ 2026-10-21：经 cmd_mux 仲裁（PS2 > 云端 > 语音 > 导航），不再直接发 cmd_vel
+        self._pub_vel = self._node.create_publisher(Twist, "cmd_vel_voice", qos)
         self._pub_servo = self._node.create_publisher(JointState, "servo_cmd", qos)
 
         # ---- 上行（全部只读，供闭环与 car_status 用）----
@@ -165,12 +166,12 @@ class RosBridge:
                 time.sleep(0.1)
 
     def _check_link(self) -> None:
-        """只跑一次：cmd_vel 上没有订阅者 = 底盘驱动没在跑。"""
+        """只跑一次：cmd_vel_voice 上没有订阅者 = cmd_mux（ps2-teleop 服务）没在跑。"""
         self._node.destroy_timer(self._link_timer)
         if self._pub_vel.get_subscription_count() == 0:
             logger.warning(
-                "小车：cmd_vel 上没有订阅者 —— 底盘驱动没在跑？"
-                "另开终端执行：roslaunch 见 ~/l150pro_start_driver.sh"
+                "小车：cmd_vel_voice 上没有订阅者 —— cmd_mux 没在跑？"
+                "查 systemctl status ps2-teleop（cmd_mux 随它一起起）"
             )
 
     def _on_odom(self, msg) -> None:

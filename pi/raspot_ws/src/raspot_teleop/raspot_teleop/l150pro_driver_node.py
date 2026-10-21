@@ -3,7 +3,7 @@
 """l150pro 串口驱动节点：/cmd_vel + /arm/command → STM32 固件 V2.0（机械臂版）。
 
 订阅:
-  /cmd_vel      geometry_msgs/Twist     底盘 vx/wz；超 0.5s 无消息按零速处理（上游死亡保护）
+  /cmd_vel_mux  geometry_msgs/Twist     底盘 vx/wz（cmd_mux 仲裁后的；参数 cmd_topic）；超 0.5s 无消息按零速
   /arm/command  sensor_msgs/JointState  position=[p1..p5 raw, base field]，每条消息即发一帧 0xAC(t_ms=40)
   /estop        std_msgs/Bool           急停锁存（true: 底盘清零+机械臂保持）
 服务:
@@ -240,7 +240,11 @@ class L150ProDriverNode(Node):
         # so other Pi nodes do not mistake it for a modulo potentiometer.
         self.pub_base_angle = self.create_publisher(Float32, 'arm/base_angle_deg', 10)
 
-        self.sub_twist = self.create_subscription(Twist, 'cmd_vel', self.on_twist, 10)
+        # ★ 2026-10-21：默认听 cmd_mux 的输出，不再直接听 cmd_vel（那现在是 mux 的兼容输入口）。
+        #   单独起本节点调试时可 `-p cmd_topic:=cmd_vel` 退回直连。
+        self.declare_parameter('cmd_topic', 'cmd_vel_mux')
+        self.sub_twist = self.create_subscription(
+            Twist, self.get_parameter('cmd_topic').value, self.on_twist, 10)
         self.sub_arm = self.create_subscription(JointState, 'arm/command', self.on_arm, 10)
         self.sub_estop = self.create_subscription(Bool, 'estop', self.on_estop, 10)
         self.srv_rehome = self.create_service(Trigger, 'arm/rehome', self.on_rehome)

@@ -24,6 +24,7 @@ setup(
             'ps2_teleop_node = raspot_teleop.ps2_teleop_node:main',
             'l150pro_driver_node = raspot_teleop.l150pro_driver_node:main',
             'arm_recorder_node = raspot_teleop.arm_recorder_node:main',
+            'cmd_mux_node = raspot_teleop.cmd_mux:main',
         ],
     },
 )

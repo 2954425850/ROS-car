@@ -9,7 +9,6 @@
 ## 和另外两个工具的分界（写进 description，别写进 system_prompt）
 
 - `look`：**看一眼、要个答案**（"前面有什么"）
-- `car_camera`：**转云台看看那边**（"往左看看"）
 - `follow_person`：**让镜头一直盯着某个人**（"跟着张三"）
 
 ## 描述怎么写
@@ -107,7 +106,7 @@ def register_follow_tools(registry: ToolRegistry, target, config=None) -> None:
                 "name 填用户说的那个名字（原话最好）。"
                 "⚠️ 这个动作**要等对方正对镜头露出脸**才能锁上，可能等几秒；"
                 "人不在画面里、或者一直没露正脸，会失败。"
-                "只是想知道「他在哪」「那是谁」用 look；只是想转过去看看用 car_camera。"
+                "只是想知道「他在哪」「那是谁」用 look。"
             ),
             parameters={
                 "type": "object",

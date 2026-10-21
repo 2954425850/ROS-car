@@ -91,11 +91,12 @@ def test_both_tools_are_in_follow_group():
 
 # ---------------------------------------------------------------- 描述守则
 
-def test_description_separates_follow_from_look_and_camera():
+def test_description_separates_follow_from_look():
     """★ 「何时使用」只能由 description 承担（不动 system_prompt）——
-    而且必须把三个容易混的工具划清界限，别把它写没了。"""
+    而且必须把容易混的工具划清界限，别把它写没了。
+    （2026-10-21 云台拆了、car_camera 下线，三选一变成二选一。）"""
     desc = _schema(_registry(), "follow_person")["description"]
-    assert "look" in desc and "car_camera" in desc
+    assert "look" in desc
 
 
 def test_description_warns_about_waiting_for_face():

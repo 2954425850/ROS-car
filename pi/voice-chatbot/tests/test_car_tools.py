@@ -31,7 +31,7 @@ class _StubController:
         return "电池 11.6 伏，故障码 正常，停着。"
 
 
-EXPECTED_TOOLS = {"car_move", "car_turn", "car_stop", "car_camera", "car_status"}
+EXPECTED_TOOLS = {"car_move", "car_turn", "car_stop", "car_status"}
 
 
 def _registry():
@@ -63,13 +63,11 @@ def test_schemas_enum_is_not_a_hand_copy():
     抄一份会静默漂移：schema 发给模型，漂了就变成「模型传一个控制器不认的方向」，
     而且没有任何东西会报错。
     """
-    from car.kinematics import camera_direction_names, direction_names
+    from car.kinematics import direction_names
 
     schemas = {s["function"]["name"]: s for s in _registry().schemas()}
     move_enum = schemas["car_move"]["function"]["parameters"]["properties"]["direction"]["enum"]
-    camera_enum = schemas["car_camera"]["function"]["parameters"]["properties"]["direction"]["enum"]
     assert move_enum == direction_names()
-    assert camera_enum == camera_direction_names()
 
 
 def test_car_move_direction_enum_has_six_values():
@@ -89,7 +87,6 @@ def test_optional_params_are_not_required():
     schemas = {s["function"]["name"]: s for s in _registry().schemas()}
     assert "speed" not in schemas["car_move"]["function"]["parameters"]["required"]
     assert "speed" not in schemas["car_turn"]["function"]["parameters"]["required"]
-    assert "degrees" not in schemas["car_camera"]["function"]["parameters"]["required"]
 
 
 def test_car_stop_takes_no_parameters():
@@ -156,7 +153,7 @@ def test_schemas_can_filter_by_group():
 def test_schemas_without_groups_returns_everything():
     registry = ToolRegistry()
     register_car_tools(registry, _StubController())
-    assert len(registry.schemas()) == 5
+    assert len(registry.schemas()) == len(EXPECTED_TOOLS)
 
 
 def test_duplicate_registration_still_raises():

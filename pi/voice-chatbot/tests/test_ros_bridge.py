@@ -66,7 +66,7 @@ def test_bridge_publishes_velocity_that_others_can_hear(bridge):
         received.append((msg.linear.x, msg.angular.z))
         done.set()
 
-    listener.create_subscription(Twist, "cmd_vel", _on_msg, qos)
+    listener.create_subscription(Twist, "cmd_vel_voice", _on_msg, qos)
 
     # 给 DDS 发现留时间：反复发，同时自旋收
     deadline = time.monotonic() + 5.0
