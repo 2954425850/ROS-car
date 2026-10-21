@@ -4,6 +4,19 @@
 
 本版适用于静止场景、周围可见的有纹理支撑面、具有足够纹理且近似平整的可见顶面。物体顶面相对支撑面的倾斜最多 15°，支撑面相对车体安装面最多 30°。测高失败会退出，不会退回 1.6 cm 等默认高度。物体选择仍沿用现有的 `--box` 入口；这次自动化的是支撑面与物体高度测量。
 
+## Base angle and support height
+
+The STM32 0x56 `base` field is the firmware's continuous absolute estimate,
+not a modulo potentiometer reading. Pi decodes it at `0.36 deg/count` and
+publishes `/arm/base_angle_deg`; `/arm/status` bit `0x02` must be set before
+the value is used for a default table height. The shared implementation is
+`arm_grasp/base_angle.py`.
+
+When no explicit `--support-z-mm` is supplied, a known angle in the front
+half-plane selects `support_z = -135.5 mm`; the rear half-plane selects
+`support_z = 0 mm`. Boundary or unknown angles refuse measurement. An
+explicit support height is recorded as `explicit_operator` and takes priority.
+
 ## 使用
 
 在树莓派的 `arm_grasp` 包目录运行，例如 `/home/cy/raspot_ws/src/arm_grasp`。机械臂、K230 结果流与 RTSP 按现有方式启动。当前观察姿态须能完整看见目标及其周围桌面，腕自转保持标定位置（field 496 附近），观察范围没有障碍。路径检查只检查运动学包络和固件限位，不提供场景碰撞检测。

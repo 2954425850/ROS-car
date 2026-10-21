@@ -1,0 +1,201 @@
+# -*- coding: utf-8 -*-
+"""抓取链路侧的 ToF 取数：`/tof/depth` → 「框 → 毫米」。
+
+给 `arm_grasp` 用。设计要求（用户定）：**抓取路径保持能降级** ——
+rclpy 起不来、话题没人发、帧太旧，一律返回 `None`，**绝不抛异常、绝不回落成常数**。
+下游 `grasp.require_depth` 那道闸会因此拒绝下扎，这正是我们要的。
+
+## ★ 为什么是"自己的执行器 + 后台线程"，不是 `rclpy.spin_once`
+
+先说走过的弯路：一开始照 `collect.ArmIO` 的写法用
+`rclpy.spin_once(node, timeout_sec=0.0)`（全局执行器）**"拉"**消息。
+结果**收不到帧**（实测：连等 3 秒、`msgs==0`；同一时刻一个正经 `rclpy.spin()`
+的订阅者能稳稳收到 40 帧）。原因是 `spin_once(timeout_sec=0)` 走的是全局执行器，
+而它**每次都把节点加进去、跑一次、再从 `finally` 里摘出来**
+（`rclpy/__init__.py:64-72`）—— 零超时的等待和 DDS 的投递是赛跑，
+99% 的情况它先返回，消息永远轮不上。
+
+**所以这里换成**：自己建一个 `SingleThreadedExecutor`（**不是全局那个**），
+加进 ToF 节点，在一条 daemon 线程里一直 `spin()`。
+`ArmIO` 那份仍然用全局执行器 —— 两个执行器是**不同对象**，
+所以不违反 rclpy 那条"全局执行器不许跨线程共用"的规矩，互不干扰。
+
+好处是这条路的**新鲜度**也更好：线程一直在转，`depth_for_box()` 直接从内存里
+读最新一帧，不用等主循环来"拉"。
+"""
+from __future__ import annotations
+
+import threading
+import time
+
+from . import a010, config as tof_config
+
+
+class TofClient(object):
+
+    def __init__(self, cfg=None, topic="/tof/depth", node_name="tof_a010_client"):
+        self.cfg = cfg or tof_config.load()
+        self.topic = topic
+        self.node_name = node_name
+
+        self.node = None
+        self.executor = None
+        self.thread = None
+        self.enabled = False
+        self.reason = "还没 start()"
+        self.n_msgs = 0
+        self.n_null = 0
+
+        self._mm = None            # 最新一帧的毫米数组（一维，0 = 无效）
+        self._rows = self._cols = 0
+        self._t = None
+
+    # -- 生命周期 -----------------------------------------------------------
+
+    def start(self):
+        """建节点 + 订阅 + 后台 spin 线程。**任何失败都只是降级**，不抛。"""
+        try:
+            import rclpy
+            from rclpy.executors import SingleThreadedExecutor
+            from rclpy.node import Node
+            from sensor_msgs.msg import Image
+        except ImportError as e:
+            self.reason = "没有 rclpy（%s）" % e
+            return False
+        try:
+            # ArmIO 可能已经 init 过了；重复 init 会抛，吞掉即可
+            try:
+                rclpy.init(args=None)
+            except Exception:                       # noqa: BLE001
+                pass
+            self.node = Node(self.node_name)
+            # best-effort：和发布端一致。用默认的 RELIABLE 会和 best-effort 发布端
+            # 匹配不上（QoS 不兼容 ⇒ **一句错都不报，只是永远收不到**）。
+            qos = _sensor_qos()
+            self.node.create_subscription(Image, self.topic, self._on_depth, qos)
+            # ★ 自己的执行器 —— 不是 `rclpy.get_global_executor()`，
+            #   这样它和 ArmIO 那份互不干扰（见模块头）。
+            self.executor = SingleThreadedExecutor()
+            self.executor.add_node(self.node)
+            self.thread = threading.Thread(target=self.executor.spin,
+                                           daemon=True, name="tof-client-spin")
+            self.thread.start()
+        except Exception as e:                      # noqa: BLE001
+            self.reason = "建订阅失败：%r" % (e,)
+            self.node = None
+            return False
+        self.enabled = True
+        self.reason = "ok（%s）" % self.topic
+        return True
+
+    def stop(self):
+        """收尾。**顺序不能乱**：先让 `spin()` 返回、**join 线程**，再 destroy 节点。
+
+        ⚠️ 2026-10-20 实测：执行器 `shutdown()` 之后线程要过一会儿才退出；
+        如果紧接着 `destroy_node()`，rclpy 的 C 层会和还在跑的 spin 撞上，
+        进程直接 `terminate called without an active exception` **core dump**。
+        这条会在**每次抓取收尾**触发（`grasp_once` 的 finally 里就调它）。
+        """
+        if self.executor is not None:
+            try:
+                self.executor.shutdown(timeout_sec=0.5)
+            except Exception:                       # noqa: BLE001
+                pass
+        if self.thread is not None:
+            self.thread.join(timeout=3.0)           # ★ 必须等它真的退出
+        if self.node is not None:
+            try:
+                self.node.destroy_node()
+            except Exception:                       # noqa: BLE001
+                pass
+        self.executor = None
+        self.thread = None
+        self.node = None
+        self.enabled = False
+
+    def _on_depth(self, msg):
+        try:
+            import numpy as np
+        except ImportError:
+            return
+        if msg.encoding != "16UC1":
+            self.reason = "encoding 不是 16UC1 而是 %s" % msg.encoding
+            return
+        arr = np.frombuffer(msg.data, dtype=np.uint16)
+        if arr.size < msg.height * msg.width:
+            return
+        self._mm = arr[:msg.height * msg.width]
+        self._rows, self._cols = msg.height, msg.width
+        self._t = time.monotonic()
+        self.n_msgs += 1
+
+    # -- 取数 ---------------------------------------------------------------
+
+    def wait_for_first(self, timeout=3.0, poll=0.02):
+        """等到**第一帧**深度（或超时）。返回是否等到。
+
+        ★ 必须真的 `sleep`：DDS 的**发现期**是墙上时间（subscriber 与 publisher
+          配对要几百 ms），不是 CPU 时间。因此"紧循环查几十次"是无效的。
+        """
+        if not self.enabled:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._mm is not None:
+                return True
+            time.sleep(poll)
+        return self._mm is not None
+
+    def age(self):
+        return None if self._t is None else time.monotonic() - self._t
+
+    def depth_for_box(self, box_norm):
+        """`box_norm`（归一化 l,t,r,b，1280x720 推流系）→ `（毫米, 说明）`。
+
+        ★ **超龄当没拿到**（`max_age_s`，默认 250ms）：深度必须对应这一拍的手臂姿态，
+          拿个 1 秒前的深度去乘射线的意义不大 —— 那时臂还在别处。
+        """
+        if self._mm is None:
+            self.n_null += 1
+            return None, {"why": "还没有任何深度帧", "src": "tof"}
+        age = self.age()
+        max_age = float(self.cfg.get("max_age_s", 0.25))
+        if age is not None and age > max_age:
+            self.n_null += 1
+            return None, {"why": "帧太旧 %.0fms > %.0fms" % (age * 1000, max_age * 1000),
+                          "src": "tof", "age_s": age}
+        d = a010.box_depth_mm(self._mm, self._rows, self._cols, list(box_norm),
+                              unit_mm=float(self.cfg["unit_mm_per_count"]),
+                              map_cfg=self.cfg.get("map"),
+                              pad=float(self.cfg["pad"]),
+                              min_mm=float(self.cfg["min_mm"]),
+                              val_max=int(self.cfg["val_max"]),
+                              exclude=self.cfg.get("exclude") or None)
+        if d is None:
+            self.n_null += 1
+            return None, {"why": "框内没有落在 [%.0f, %.0f]mm 的有效回波"
+                                  % (float(self.cfg["min_mm"]),
+                                     int(self.cfg["val_max"]) * float(self.cfg["unit_mm_per_count"])),
+                          "src": "tof", "age_s": age}
+        # ★ 基准偏置**必须加在阈值之后**：`min_mm`（150 量程下限）和
+        #   `val_max*unit`（饱和）说的是**传感器的读数**，加完偏移再去比会把
+        #   那道近场假回波的防线整体平移掉。所以先按原始读数判定，最后才换算到
+        #   "相机光心轴向深度"这个 `geom` 要的基准上。
+        raw = int(d)
+        off = float(self.cfg.get("offset_mm", 0.0))
+        return int(round(raw + off)), {"src": "tof", "age_s": age,
+                                       "n_msgs": self.n_msgs,
+                                       "raw_mm": raw, "offset_mm": off}
+
+    def info(self):
+        return {"enabled": self.enabled, "reason": self.reason,
+                "msgs": self.n_msgs, "null": self.n_null,
+                "age_s": self.age(), "shape": (self._rows, self._cols)}
+
+
+def _sensor_qos(depth=5):
+    from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
+                           QoSReliabilityPolicy)
+    return QoSProfile(history=QoSHistoryPolicy.KEEP_LAST, depth=depth,
+                      reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                      durability=QoSDurabilityPolicy.VOLATILE)

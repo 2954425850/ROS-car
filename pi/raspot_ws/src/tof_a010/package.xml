@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>tof_a010</name>
+  <version>0.1.0</version>
+  <description>MetaSense/MaixSense A010 (Lite) ToF：Pi 侧直读 + ROS2 发布 + 抓取链路取深</description>
+  <maintainer email="cy@nepu.local">cy</maintainer>
+  <license>Proprietary</license>
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>python3-serial</depend>
+  <depend>python3-numpy</depend>
+  <test_depend>python3-pytest</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

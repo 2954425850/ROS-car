@@ -193,6 +193,10 @@ class L150ProDriverNode(Node):
         self.pub_online = self.create_publisher(Bool, 'arm/online', 10)
         self.pub_pot = self.create_publisher(Int32, 'arm/pot_raw', 10)
         self.pub_status = self.create_publisher(Int32, 'arm/status', 10)
+        # Firmware 0x56 ``base`` is already the unwrapped cumulative angle
+        # estimate (0.36 degree per field count).  Publish the decoded value
+        # so other Pi nodes do not mistake it for a modulo potentiometer.
+        self.pub_base_angle = self.create_publisher(Float32, 'arm/base_angle_deg', 10)
 
         self.sub_twist = self.create_subscription(Twist, 'cmd_vel', self.on_twist, 10)
         self.sub_arm = self.create_subscription(JointState, 'arm/command', self.on_arm, 10)
@@ -370,6 +374,9 @@ class L150ProDriverNode(Node):
             im = Int32()
             im.data = pot_raw
             self.pub_pot.publish(im)
+            angle = Float32()
+            angle.data = float(base) * (360.0 / 1000.0)
+            self.pub_base_angle.publish(angle)
 
         if estop_fb:
             self.get_logger().warn('固件急停反馈置位（0x56 bit7）', throttle_duration_sec=5.0)

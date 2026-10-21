@@ -1,5 +1,13 @@
 # K230 开发笔记
 
+## Current network memory (2026-10-02)
+
+- Pi host address: `192.168.5.107`.
+- K230 address: DHCP on `192.168.5.0/24`; the last octet changes after power-up. The currently reported address is `192.168.5.208`, but it must not be treated as permanent.
+- Before any K230 operation, discover the live host on the `192.168.5.*` subnet, then probe its RTSP/result ports. Do not reuse historical `192.168.1.*` addresses.
+- This network record is operational state; older IPs below are historical test notes only.
+- STM32 0x56 `base` is the firmware-maintained continuous absolute angle (`0.36 deg/count`); Pi publishes the decoded value as `/arm/base_angle_deg` and uses status bit `0x02` as the known-angle gate.
+
 ## 2026-09-17
 
 - 测 WiFi 吞吐**必须等连接稳定后**再测。connect() 后十几秒内测出的 0.04 Mbps 是假的

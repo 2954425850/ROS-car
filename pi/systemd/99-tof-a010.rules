@@ -1,0 +1,22 @@
+# SIPEED MetaSense Lite (MaixSense A010 Lite) —— FT2232D 双通道 UART, USB ID 0403:6010
+#
+# 装卸：
+#     sudo cp systemd/99-tof-a010.rules /etc/udev/rules.d/
+#     sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=tty
+#     ls -l /dev/a010
+#
+# ⚠️ **这条规则不是跑起来的前提。** udev **自带**的稳定名
+#     /dev/serial/by-id/usb-SIPEED_SIPEED_Meta_Sense_Lite_*-if00-port0
+#     已经够用（`if00` 就是通道 A = 数据口），`tof_a010.config.resolve_device`
+#     会自动兜到那里。这条规则只是给个短名字、顺手把权限钉死。
+#
+# ⚠️ **必须按 interface 号区分通道。** 同一颗 FT2232 出两个 tty：
+#     1.0 → ttyUSB0 = 通道 A = **数据口**（用这个）
+#     1.1 → ttyUSB1 = 通道 B = 没用
+#    只按 vid/pid 匹配时**两个口会抢同一个名字**，后枚举的赢。
+#    症状极具迷惑性：`/dev/a010` 确实存在、打开也不报错，但**一个字节都收不到**
+#    （因为接到了通道 B）。实测 2026-10-14 确认。
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6010", ENV{ID_USB_INTERFACE_NUM}=="00", MODE="0666", GROUP="dialout", SYMLINK+="a010"
+
+# 排除 ModemManager：它会探测 ttyACM/ttyUSB 并抢走串口（和底盘板那条同源）。
+ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6010"

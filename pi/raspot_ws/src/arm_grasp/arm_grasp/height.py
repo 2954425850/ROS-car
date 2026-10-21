@@ -195,6 +195,49 @@ def _plane_height_se(points, normal, offset, xy):
     return float(math.sqrt(sigma2 * float(x0 @ np.linalg.solve(a.T @ a, x0))) / abs(normal[2]))
 
 
+def _fit_known_horizontal_top(points, config, support_z):
+    """Fallback for a blurred, supported horizontal top.
+
+    The normal is fixed by the known horizontal support frame; the top height
+    is still selected by RANSAC over reconstructed target points. This keeps a
+    low-texture cap from being rejected solely because its fitted normal is
+    unstable, while retaining coverage and height consistency gates.
+    """
+    p = _points(points, config.min_top_points)
+    candidates = p[:, 2]
+    median_z = float(np.median(candidates))
+    median_tol = max(config.plane_tol_m, .003)
+    median_mask = np.abs(candidates - median_z) <= median_tol
+    minimum = max(config.min_top_points, math.ceil(len(p) * config.min_top_fraction))
+    if int(median_mask.sum()) >= minimum:
+        inliers = p[median_mask]
+        span = np.ptp(inliers[:, :2], axis=0)
+        if np.min(span) >= config.min_top_span_m:
+            top_z = float(np.median(inliers[:, 2]))
+            return {'normal': np.array([0., 0., 1.]), 'offset_m': -top_z,
+                    'mask': median_mask, 'rms_m': float(np.std(inliers[:, 2])),
+                    'source': 'known_horizontal_median'}
+    best_count, best_z = 0, None
+    for z in candidates:
+        height = float(z - support_z)
+        if not config.min_object_height_m <= height <= config.max_object_height_m:
+            continue
+        count = int(np.count_nonzero(np.abs(candidates - z) <= config.plane_tol_m))
+        if count > best_count:
+            best_count, best_z = count, float(z)
+    if best_z is None or best_count < minimum:
+        raise HeightRefused('top plane lacks coherent evidence')
+    mask = np.abs(candidates - best_z) <= config.plane_tol_m
+    inliers = p[mask]
+    span = np.ptp(inliers[:, :2], axis=0)
+    if np.min(span) < config.min_top_span_m:
+        raise HeightRefused('top plane coverage too small')
+    top_z = float(np.median(inliers[:, 2]))
+    return {'normal': np.array([0., 0., 1.]), 'offset_m': -top_z,
+            'mask': mask, 'rms_m': float(np.std(inliers[:, 2])),
+            'source': 'known_horizontal_fallback'}
+
+
 def measure_cloud(support, target, config=None, known_support_z=None):
     """Measure a supported flat top from foreground and local background points.
 
@@ -213,7 +256,12 @@ def measure_cloud(support, target, config=None, known_support_z=None):
     else:
         plane = fit_plane(s, cfg, tol=cfg.support_tol_m)
         n, offset = plane['normal'], plane['offset_m']
-    top = fit_plane(t, cfg, n, (n, offset))
+    try:
+        top = fit_plane(t, cfg, n, (n, offset))
+    except HeightRefused:
+        if not known:
+            raise
+        top = _fit_known_horizontal_top(t, cfg, known_support_z)
     top_points = t[top['mask']]
     point = np.median(top_points, axis=0)
     point[2] = -(top['offset_m'] + top['normal'][:2] @ point[:2]) / top['normal'][2]
@@ -246,6 +294,7 @@ def measure_cloud(support, target, config=None, known_support_z=None):
                         'top_inliers': int(top['mask'].sum()),
                         'support_rms_m': plane['rms_m'], 'top_rms_m': top['rms_m'],
                         'support_z_se_m': support_se,
+                        'top_plane_source': top.get('source', 'fitted'),
                         'support_plane_source': 'known' if known else 'measured',
                         'accuracy_verified': False,
                         'meaning': 'geometric consistency; pose/calibration bias is unbounded'}}

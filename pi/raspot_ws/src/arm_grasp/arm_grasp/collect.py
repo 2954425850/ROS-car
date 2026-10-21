@@ -28,6 +28,7 @@ import sys
 import time
 
 from .arm_kin import (FIELD_HI, FIELD_LO, Unreachable, fk, ikine, to_fields)
+from .base_angle import BaseAngleTracker
 from .calib_solve import Sample, save_samples
 
 SERVICE = 'ps2-teleop.service'
@@ -406,6 +407,30 @@ def capture_frame(path, host, timeout=8.0, upright_suffix='-up.jpg'):
     """
     # ★ 2026-09-29：先建目录。/tmp 会被清空（重启/清理），目录一没了 gst 只会报
     #   "Error while writing to file ..."（看不懂），其实就差个 mkdir。别让它再坑一次。
+    # Prefer the Pi-side snap helper. It waits for a complete GOP and avoids
+    # the dark GStreamer tail frame seen after a view change.
+    try:
+        k230_dir = '/home/cy/k230-vision/pi'
+        if os.path.isdir(k230_dir):
+            if k230_dir not in sys.path:
+                sys.path.insert(0, k230_dir)
+            import k230pi
+            k230pi.K230_HOST = str(host)
+            k230pi.RTSP_URL = 'rtsp://%s:8554/k230' % host
+            result = k230pi.snap(out=path, min_frames=30,
+                                 timeout=max(12.0, float(timeout)), attempts=2)
+            if (not result.get('suspect') and os.path.exists(path)
+                    and os.path.getsize(path) > 2000):
+                try:
+                    from PIL import Image
+                    up = path[:-4] + upright_suffix if path.endswith('.jpg') else path + upright_suffix
+                    Image.open(path).rotate(180).save(up, quality=85)
+                except Exception:
+                    pass
+                return True
+    except Exception as e:                                      # noqa: BLE001
+        print('        snap backend unavailable, falling back to gst: %s' % e)
+
     _d = os.path.dirname(path)
     if _d:
         try:
@@ -689,19 +714,42 @@ class ArmIO:
         self.fb = None
         self.fb_n = 0
         self.online = None
+        self.status56 = None
+        self.pot_raw = None
+        self.base_angle = BaseAngleTracker()
         self.sub = self.node.create_subscription(
             JointState, '/arm/feedback', self._on_fb, 10)
         self.sub_on = self.node.create_subscription(
             Bool, '/arm/online', self._on_online, 10)
+        from std_msgs.msg import Int32
+        self.sub_status = self.node.create_subscription(
+            Int32, '/arm/status', self._on_status, 10)
+        self.sub_pot = self.node.create_subscription(
+            Int32, '/arm/pot_raw', self._on_pot, 10)
         self.pub = self.node.create_publisher(JointState, '/arm/command', 10)
         self._js = JointState
 
     def _on_fb(self, msg):
         self.fb = [float(v) for v in msg.position]
+        if len(self.fb) >= 6:
+            self.base_angle.update(field=self.fb[5], pot_raw=self.pot_raw,
+                                   status=self.status56)
         self.fb_n += 1
 
     def _on_online(self, msg):
         self.online = bool(msg.data)
+
+    def _on_status(self, msg):
+        self.status56 = int(msg.data)
+        if self.fb is not None and len(self.fb) >= 6:
+            self.base_angle.update(field=self.fb[5], pot_raw=self.pot_raw,
+                                   status=self.status56)
+
+    def _on_pot(self, msg):
+        self.pot_raw = int(msg.data)
+        if self.fb is not None and len(self.fb) >= 6:
+            self.base_angle.update(field=self.fb[5], pot_raw=self.pot_raw,
+                                   status=self.status56)
 
     def spin(self, seconds):
         t0 = time.time()

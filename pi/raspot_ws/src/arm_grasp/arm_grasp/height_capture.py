@@ -26,6 +26,10 @@ class ScanConfig:
     # is ~8 cm from the axis, so a 25 mm tip move needs 17 deg of base, while
     # the camera (~15 cm out) already moves >20 mm for 8 deg.
     lateral_base_deg: float = 8.0
+    # The base is a motor-mode joint with measurable residual creep. Live
+    # height acquisition can disable its side excursions and use radial arm
+    # views first; the legacy planner keeps them enabled by default.
+    use_base_views: bool = True
     # Forward/back at constant tip height: shoulder/elbow/wrist are accurate
     # (<2 deg on real data) and the move is across the line of sight. The old
     # lift moved mostly along it (<2 deg parallax), and the base alone stalls
@@ -43,8 +47,14 @@ class ScanConfig:
     # Live stationary scatter: wrist roll 495-499, loaded shoulder 610-614.
     max_feedback_drift: float = 2.0
     max_feedback_spike: float = 6.0
+    # The existing image pose refinement can correct small base readback
+    # errors. Keep position joints strict, but allow bounded base creep to be
+    # reconstructed instead of discarding an otherwise usable exposure.
+    max_base_exposure_drift: float = 10.0
     arrived_tolerance: float = 12.0
-    stationary_seconds: float = .6
+    # The firmware base velocity loop can finish with a short residual drift;
+    # hold the commanded view for a full second before exposing the frame.
+    stationary_seconds: float = 1.0
     move_timeout_s: float = 12.0
     shot_timeout_s: float = 4.0
 
@@ -80,8 +90,17 @@ def validate_path(start, finish, fields, config=None, floor_z=None, require_marg
                 or np.any(np.array(f[2:5]) > high + 1e-7)
                 or abs(f[5]) > 1000):
             raise HeightRefused('scan path near firmware limit')
-        if margin and (min(f[2:5]) < FIELD_LO + margin or max(f[2:5]) > FIELD_HI - margin):
-            raise HeightRefused('scan endpoint near firmware limit')
+        if margin:
+            # A user-provided reference pose may already sit close to a
+            # firmware limit. Keep that joint fixed, but refuse any candidate
+            # that moves it closer to the hard limit or introduces a new
+            # near-limit endpoint.
+            near_low = np.asarray(f[2:5]) < FIELD_LO + margin
+            near_high = np.asarray(f[2:5]) > FIELD_HI - margin
+            ref = reference_fields[2:5]
+            unchanged = np.isclose(np.asarray(f[2:5]), ref, atol=1e-7, rtol=0)
+            if np.any((near_low | near_high) & ~unchanged):
+                raise HeightRefused('scan endpoint near firmware limit')
         if (t == 1 and not require_margin and (min(f[2:5]) < FIELD_LO or max(f[2:5]) > FIELD_HI)
                 and not np.allclose(f[2:5], reference_fields[2:5], atol=1e-6, rtol=0)):
             raise HeightRefused('out-of-range endpoint is not recorded reference pose')
@@ -137,7 +156,9 @@ def plan_scan(joints, fields, config=None, box=None):
         for scale in (1., .75, .5):
             yield lambda: dict(joints, base=joints['base'] + sign * cfg.lateral_base_deg * scale)
 
-    moves = [radial_move(1), radial_move(-1), base_move(1), base_move(-1)]
+    moves = [radial_move(1), radial_move(-1)]
+    if cfg.use_base_views:
+        moves += [base_move(1), base_move(-1)]
     poses = [dict(joints)]
     skipped = []
     centre0 = np.array(geom.camera_center(joints))
@@ -322,8 +343,17 @@ def snapshot(io, host, path, hold_fields, config=None, capture=None,
                     values.append(fields)
                     fresh_count += 1
                     last_fresh = time.monotonic()
-                    if _max_deviation(values) > cfg.max_feedback_spike:
+                    joint_values = np.asarray(values, dtype=float)[:, 1:5]
+                    joint_dev = float(np.max(np.abs(
+                        joint_values - np.median(joint_values, axis=0))))
+                    base_dev = float(np.max(np.abs(
+                        np.asarray(values, dtype=float)[:, 5]
+                        - np.median(np.asarray(values, dtype=float)[:, 5]))))
+                    if joint_dev > cfg.max_feedback_spike:
                         raise HeightRefused('feedback drift during exposure; image discarded',
+                                            _drift_diagnostics(hold_fields, values))
+                    if base_dev > cfg.max_base_exposure_drift:
+                        raise HeightRefused('base drift during exposure exceeds pose-refinement bound',
                                             _drift_diagnostics(hold_fields, values))
             if time.monotonic() - last_fresh > .5:
                 raise HeightRefused('feedback stale during exposure; image discarded')
@@ -334,7 +364,14 @@ def snapshot(io, host, path, hold_fields, config=None, capture=None,
     after = stationary_feedback(io, hold_fields, cfg, publish=publish)
     exposure = values[1:]
     values.append(after)
-    if max(_median_shift(exposure, [before]), _median_shift([after], [before])) > cfg.max_feedback_drift:
+    exposure_joints = np.asarray(exposure, dtype=float)[:, 1:5]
+    before_joints = np.asarray([before], dtype=float)[:, 1:5]
+    after_joints = np.asarray([after], dtype=float)[:, 1:5]
+    joint_shift = max(
+        float(np.max(np.abs(np.median(exposure_joints, axis=0)
+                            - before_joints[0]))),
+        float(np.max(np.abs(after_joints[0] - before_joints[0]))))
+    if joint_shift > cfg.max_feedback_drift:
         raise HeightRefused('feedback changed across exposure; image discarded',
                             _drift_diagnostics(hold_fields, values))
     fields = np.median(np.array(values), axis=0).tolist()
@@ -372,7 +409,8 @@ def restore_pose(io, fields, config=None, publish=publish_fields, home_timeout=4
 
 
 def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
-                 publish=publish_fields, reference_command=None, known_support_z=None):
+                 publish=publish_fields, reference_command=None, known_support_z=None,
+                 support_z_source=None, base_angle=None):
     cfg, start = config or ScanConfig(), time.monotonic()
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=False)
@@ -393,6 +431,10 @@ def capture_scan(io, host, box, out_dir, config=None, capture=None, log=print,
     if known_support_z is not None:
         # Operator-measured plane the object stands on; replay uses it too.
         session['known_support_z_m'] = float(known_support_z)
+    if support_z_source is not None:
+        session['support_z_source'] = str(support_z_source)
+    if base_angle is not None:
+        session['base_angle'] = dict(base_angle)
     path = directory / 'session.json'
     try:
         for i, pose in enumerate(poses):

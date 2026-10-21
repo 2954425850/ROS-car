@@ -6,8 +6,10 @@ import uuid
 
 from arm_grasp import geom, grasp, observe
 from arm_grasp.arm_kin import from_fields
+from arm_grasp.base_angle import BaseAngleTracker, resolve_support
 from arm_grasp.height import HeightRefused, measurement_target
-from arm_grasp.height_capture import capture_scan, plan_scan, restore_pose, stationary_feedback
+from arm_grasp.height_capture import (ScanConfig, capture_scan, plan_scan,
+                                      restore_pose, stationary_feedback)
 from arm_grasp.height_vision import load_session, measure_session, save_diagnostic
 
 
@@ -28,6 +30,11 @@ def measured_cfg(args, report):
 
 
 def print_measurement(report):
+    angle = report.get('base_angle') or {}
+    if angle:
+        print('Base absolute angle: %.1f deg; orientation=%s; support source=%s'
+              % (angle.get('angle_deg'), angle.get('orientation', 'unknown'),
+                 report.get('support_z_source', 'unknown')))
     print('自动测高：支撑 z=%.1f mm，顶面 z=%.1f mm，物体法向高度=%.1f mm'
           % tuple(report[k] * 1000 for k in ('support_z_m', 'top_z_m', 'object_height_m')))
     print('已测目标点：(%.4f, %.4f, %.4f) m；几何检查通过，真机精度未验证。'
@@ -110,12 +117,41 @@ def run_auto_height(args):
     # closed-on-object gripper reads wider than commanded, so its reading
     # would loosen the grip). A failed grasp or Ctrl-C leaves the arm alone.
     start_fields, end_fields = None, None
+    support = None
     try:
         io = collect.ArmIO()
         io.wait_feedback()
         fields = stationary_feedback(io)
+        tracker = getattr(io, 'base_angle', None)
+        if tracker is None:
+            tracker = BaseAngleTracker()
+            tracker.update(field=fields[5])
+        try:
+            support = resolve_support(
+                None if args.support_z_mm is None else args.support_z_mm, tracker)
+        except ValueError as e:
+            raise HeightRefused('cannot resolve absolute base angle: %s' % e)
+        try:
+            support['orientation'] = tracker.orientation()
+        except ValueError:
+            support['orientation'] = None
+        print('Base absolute angle %.1f deg; orientation=%s; support %.1f mm; source=%s'
+              % (support.get('angle_deg'), support.get('orientation') or 'explicit',
+                 support['support_z_mm'], support['source']))
         start_fields = list(fields)
-        poses = plan_scan(from_fields(fields), fields, box=box)
+        # Avoid the unreliable base motor for live acquisition when radial
+        # arm views already provide the required camera baseline.
+        scan_cfg = ScanConfig(use_base_views=False)
+        try:
+            poses = plan_scan(from_fields(fields), fields, config=scan_cfg, box=box)
+        except HeightRefused as radial_error:
+            # Some user poses are too close to a shoulder/elbow limit for a
+            # radial baseline. Fall back to bounded base views; snapshot()
+            # accepts only small, explicitly bounded base creep and the
+            # existing image pose refinement must still validate it.
+            scan_cfg = ScanConfig(use_base_views=True)
+            poses = plan_scan(from_fields(fields), fields, config=scan_cfg, box=box)
+            print('径向视差不足，回退到有界底座视角：%s' % radial_error)
         print('扫描预检：%d 个观察姿态；每次从起始姿态小范围平移，再返回。' % len(poses))
         for i, j in enumerate(poses):
             print('  %d：光心 (%.4f, %.4f, %.4f) m' % ((i + 1,) + geom.camera_center(j)))
@@ -146,8 +182,9 @@ def run_auto_height(args):
             time.strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8])
         # Snapshot supports raw imaging without locking a potentially stale ROI.
         session_path = capture_scan(
-            io, host, box, directory, reference_command=start_fields,
-            known_support_z=None if args.support_z_mm is None else args.support_z_mm / 1000.0)
+            io, host, box, directory, config=scan_cfg, reference_command=start_fields,
+            known_support_z=support['support_z_mm'] / 1000.0,
+            support_z_source=support['source'], base_angle=support)
         try:
             report = measure_session(session_path)
             save_diagnostic(session_path, report, directory / 'height-report.jpg')
@@ -192,8 +229,14 @@ def run_auto_height(args):
     except (ValueError, OSError, RuntimeError, ImportError) as e:
         print('自动测高流程失败：%s；不使用手填/默认高度继续抓取。' % e)
         if directory is not None and directory.exists() and not (directory / 'height-report.json').exists():
-            write_report(directory, {'schema': 'arm_grasp.height/v1', 'ok': False, 'reason': str(e),
-                                     'diagnostics': getattr(e, 'diagnostics', {})})
+            failure = {'schema': 'arm_grasp.height/v1', 'ok': False,
+                       'reason': str(e),
+                       'diagnostics': getattr(e, 'diagnostics', {})}
+            if support is not None:
+                failure.update(support_z_m=support['support_z_mm'] / 1000.0,
+                               support_z_source=support['source'],
+                               base_angle=support)
+            write_report(directory, failure)
         return 1
     finally:
         cleanup_errors = []

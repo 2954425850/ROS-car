@@ -102,9 +102,15 @@ def parse_box(s):
 
 
 def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
-              joint_comp=None, hz=None, bias_r=None, require_depth=None):
+              joint_comp=None, hz=None, bias_r=None, require_depth=None,
+              s_stop_mm=None):
     """把 CLI 参数装进 `GraspConfig`。**`--h` 必须真的进 `z_plane_m`**（自检里有闸）。"""
     kw = {'z_plane_m': float(h_m)}
+    if s_stop_mm is not None:
+        # 目标在工作空间下边缘时，s_stop=3mm 要求的那段下扎可能无解 ⇒ pick_target 直接
+        # refuse。2026-10-20 实测：爪尖停在离椒面 ~25mm 处，合爪能夹到，但计划器要到
+        # 3mm 才肯合。把停点抬到够得着的高度再合。
+        kw['s_stop_m'] = float(s_stop_mm) / 1000.0
     if max_step is not None:
         kw['max_step_deg'] = float(max_step)
     if patience is not None:
@@ -133,7 +139,45 @@ def build_cfg(h_m, max_step=None, patience=None, max_seconds=None, alpha0=None,
     return cfg
 
 
-def one_obs(want_norm, timeout=OBS_WAIT_S):
+def _depth_for_box(box_norm, k230_obj, tof):
+    """**深度来源的唯一一处裁决**：ToF 优先 → K230 结果流里的 `depth_mm` → `None`。
+
+    - `tof` 是 `tof_a010.tof_client.TofClient`（可能为 None = 没开/没起来）。
+    - 返回 `(depth_mm | None, 来源字符串 | None)`。
+
+    ★ **绝不回落成常数**：拿不到就是 `None`，让 `grasp.require_depth` 那道闸去拒绝。
+      回落到 `--h` 的 1.6cm 平面正是那道闸要防的失效模式。
+    """
+    if tof is not None:
+        try:
+            d, info = tof.depth_for_box(box_norm)
+        except Exception as e:                # noqa: BLE001
+            # ★ ToF 出任何毛病都**不许中断抓取主循环** —— 降级成"没深度"，
+            #   让 require_depth 那道闸去拒绝，比抛出去把整轮掀掉强。
+            _LAST_TOF_WHY.append('ToF 异常：%r' % (e,))
+            d, info = None, None
+        if d is not None:
+            _LAST_TOF_INFO.clear()
+            if isinstance(info, dict):
+                _LAST_TOF_INFO.update(info)
+            return d, 'tof'
+        why = info.get('why') if isinstance(info, dict) else info
+        _LAST_TOF_WHY.append(why)
+    kd = (k230_obj or {}).get('depth_mm')
+    if kd is not None:
+        return kd, 'k230'
+    return None, None
+
+
+_LAST_TOF_WHY = []          # 只管最近几条，给打印用（模块级，避免改 Obs 的字段）
+_LAST_TOF_INFO = {}         # 最近一次成功的 ToF 读数信息（raw_mm / offset_mm）
+
+
+def _fmt_age(age):
+    return '无' if age is None else '%.0fms' % (age * 1000.0)
+
+
+def one_obs(want_norm, timeout=OBS_WAIT_S, tof=None):
     """从结果流里**挑一条**框观测（只读、不碰臂）。挑不到返回 None。
 
     锁框刚下发的那一小会儿，`/tmp/k230/latest-result.json` 里还是**锁之前**那一帧
@@ -146,9 +190,9 @@ def one_obs(want_norm, timeout=OBS_WAIT_S):
             b = observe.pick_box(r, want_norm)
             if b is not None:
                 u, v = observe.box_center_ai(b['box'])
+                d, src = _depth_for_box(b['box'], b, tof)
                 return grasp.Obs(time.monotonic(), u, v, r.get('frame'),
-                                 b.get('src', 'det'), b['box'],
-                                 b.get('depth_mm'))
+                                 b.get('src', 'det'), b['box'], d), src
         time.sleep(0.05)
     return None
 
@@ -169,15 +213,19 @@ class GraspLink(ArmLink):
       * 观测时刻 = 现在 − 结果文件的年龄（mtime），不是"读到的那一刻"——文件最旧可到 1.5s。
     """
 
-    def __init__(self, io, host, want_norm, hz=10.0):
+    def __init__(self, io, host, want_norm, hz=10.0, tof=None):
         super().__init__(io, (0.0, 0.0, 0.0), hz=hz)   # ArmLink 的模型相机在这里用不上
         self.host, self.want = host, want_norm
         self.follow = observe.BoxFollower(want_norm)
+        self.tof = tof                  # TofClient | None
         self.last_frame = None
         self.last_box = None
         self.last_src = None
+        self.last_depth_src = None      # 'tof' / 'k230' / None，收尾统计用
         self.n_obs = 0        # 交出去的观测条数
         self.n_none = 0       # 结果流里挑不出框（跟踪丢了 / IoU 不达标）的拍数
+        self.n_depth = 0      # 其中带有效深度的条数
+        self.n_depth_tof = 0
 
     def obs(self):
         got = observe.fresh_result_aged()
@@ -193,9 +241,15 @@ class GraspLink(ArmLink):
             return None
         self.last_box, self.last_src = b['box'], b.get('src', 'det')
         u, v = observe.box_center_ai(b['box'])
+        d, src = _depth_for_box(b['box'], b, self.tof)
+        self.last_depth_src = src
         self.n_obs += 1
+        if d is not None:
+            self.n_depth += 1
+            if src == 'tof':
+                self.n_depth_tof += 1
         return grasp.Obs(self.now() - age, u, v, r.get('frame'), self.last_src, b['box'],
-                         b.get('depth_mm'))
+                         d)
 
 
 # --------------------------------------------------------------------------
@@ -353,6 +407,13 @@ def main(argv=None):
                     help='自动测高数据根目录；每次创建独立会话，默认 ~/arm-height（重启不丢）')
     ap.add_argument('--k230-host', default=None,
                     help='显式指定 K230 当前地址；默认从结果流来源读取')
+    tof_grp = ap.add_mutually_exclusive_group()
+    tof_grp.add_argument('--tof', dest='tof', action='store_true', default=True,
+                         help='用 Pi 侧 A010 ToF 的实测深度（默认开）。'
+                              '订阅 /tof/depth（由 `ros2 run tof_a010 tof_node` 发）。'
+                              '拿不到就**交 None**，让 require_depth 那道闸拒绝下扎。')
+    tof_grp.add_argument('--no-tof', dest='tof', action='store_false',
+                         help='关掉 ToF，只认结果流里 K230 给的 depth_mm（A/B 对照用）')
     ap.add_argument('--dry-run', action='store_true',
                     help='只读：锁框 → 读关节 → 算 O/S0 → 打印；不发 /arm/command、不停服务')
     ap.add_argument('--phase', choices=('aim', 'descend', 'close', 'lift', 'all'), default='aim',
@@ -366,6 +427,10 @@ def main(argv=None):
                     help='arm_t_ms：每条 0xAC 的移动时长（默认 100 ≈ 10Hz 一拍）')
     ap.add_argument('--max-seconds', type=float, default=None,
                     help='覆盖 cfg.max_seconds（默认 40）')
+    ap.add_argument('--s-stop-mm', type=float, default=None,
+                    help='覆盖 cfg.s_stop_m（合爪前的下扎停点，默认 3mm）。'
+                         '目标在工作空间下边缘、计划器 refuse 但当前高度已可夹时，'
+                         '把它设到实际能停住的留量（如 25）。')
     ap.add_argument('--alpha0', type=float, default=None,
                     help='覆盖 cfg.alpha0（下扎轴角的**搜索种子**，默认 −58°）。'
                          '**α0 不是"选哪个 α"，是"从哪开始搜"**：每拍每相位都拿 `prev_alpha` 当'
@@ -428,17 +493,22 @@ def main(argv=None):
 
     cfg = build_cfg(args.h, max_step=args.max_step, patience=args.patience,
                     alpha0=args.alpha0, joint_comp=args.joint_comp, hz=args.hz,
+                    s_stop_mm=args.s_stop_mm,
                     bias_r=args.bias_r,
                     max_seconds=args.max_seconds,
                     require_depth=not explicit_h)
     print('框 box=%s（归一化）  目标面高 h=%.4f m（%.1f mm）→ cfg.z_plane_m'
           % (want, args.h, args.h * 1000))
-    print('深度来源：%s' % ('实测 ToF（require-depth 开）' if not explicit_h
-                            else '手填 --h 平面假设（require-depth 关）'))
+    if not explicit_h:
+        print('深度来源：实测（require-depth 开）—— %s'
+              % ('Pi 侧 ToF 优先 → K230 结果流兜底' if args.tof
+                 else '**ToF 已关**，只认 K230 结果流里的 depth_mm'))
+    else:
+        print('深度来源：手填 --h 平面假设（require-depth 关）')
     print('相位 %s   限速 %.2f°/拍   %.0f Hz' % (args.phase, cfg.max_step_deg, cfg.hz))
 
     collect = None
-    io, drv, stopped, locked = None, None, False, False
+    io, drv, stopped, locked, tof = None, None, False, False, None
     host = None
     try:
         try:
@@ -455,11 +525,20 @@ def main(argv=None):
             print('❌ 拿不到板子地址：%s' % e)
             return 2
         print('\n板子 %s' % host)
-        rep_lock = observe.k230_cmd(host, {'box': want})
-        print('锁框应答：%s' % (rep_lock,))
+        # ★ 锁框要**重试**，超时给到 5s（默认 3s 卡在板子的响应边上）。
+        #   实测 2026-10-20：同一个框、同一个板子，3s 超时里时成时不成；
+        #   给到 4s 后连打 5 次 **5/5 成功**。板子单线程、WiFi 又抖，
+        #   一次 timeout 就整个退出太脆了 —— 而这步失败时臂还一步没动，重试是安全的。
+        rep_lock = {}
+        for _try in range(3):
+            rep_lock = observe.k230_cmd(host, {'box': want}, timeout=5.0)
+            print('锁框应答（第 %d 次）：%s' % (_try + 1, rep_lock))
+            if rep_lock.get('ok'):
+                break
+            time.sleep(0.5)
         if not rep_lock.get('ok'):
-            print('❌ 板子没锁上框 —— **不动臂**，退出。（检查：VLC 关了吗？'
-                  '板子在线吗？框在画面里吗？）')
+            print('❌ 板子没锁上框（已重试 3 次）—— **不动臂**，退出。'
+                  '（检查：VLC 关了吗？板子在线吗？框在画面里吗？）')
             return 1
         locked = True
 
@@ -473,12 +552,52 @@ def main(argv=None):
         trace = ltrace.Trace()
         trace.add(time.monotonic(), fb, fb)     # 塞进这一帧（cmd 用 fb 顶，auto 会取 fb）
 
+        # ---------------------------------------------------------------- ②b ToF
+        # ★ 必须**在 ArmIO 之后**起：`collect.ArmIO.__init__` 会 `rclpy.init()`，
+        #   反过来先起 TofClient 再建 ArmIO，ArmIO 里那句 init() 会抛
+        #   "already been called"。TofClient 自己吞掉了这个异常，所以顺序只能是这样。
+        tof = None
+        if args.tof:
+            try:
+                from tof_a010.tof_client import TofClient
+                tof = TofClient()
+                if tof.start():
+                    # ★ 要**真等**（DDS 发现期是墙上时间）。紧循环调 pump() 是无效的。
+                    got = tof.wait_for_first(timeout=3.0)
+                    print('ToF：%s  首帧=%s  帧龄 %s'
+                          % (tof.reason, '有' if got else '**超时没有**',
+                             _fmt_age(tof.age())))
+                else:
+                    print('⚠️ ToF 没起来：%s —— 深度只能靠 K230 结果流' % tof.reason)
+                    tof = None
+            except ImportError as e:
+                print('⚠️ 没有 tof_a010 包（%s）—— source 一下 workspace，或加 --no-tof' % e)
+                tof = None
+
         # ---------------------------------------------------------------- ③ 一条观测 → O
         print('\n等结果流刷出这个框（最多 %.0fs）...' % OBS_WAIT_S)
-        obs = one_obs(want)
-        if obs is None:
+        got = one_obs(want, tof=tof)
+        if got is None:
             print('❌ 结果流里挑不出这个框（跟踪丢了 / IoU 不达标 / 结果文件太旧）'
                   '—— 不动臂。')
+            return 1
+        obs, depth_src = got
+        if obs.depth_mm is None:
+            print('深度：**没拿到**（%s）'
+                  % (_LAST_TOF_WHY[-1] if _LAST_TOF_WHY else '无来源'))
+        elif depth_src == 'tof' and 'raw_mm' in _LAST_TOF_INFO:
+            print('深度：%d mm = 原始 %d + 偏置 %+.1f（来源 tof）'
+                  % (obs.depth_mm, _LAST_TOF_INFO['raw_mm'],
+                     _LAST_TOF_INFO['offset_mm']))
+        else:
+            print('深度：%d mm（来源 %s）' % (obs.depth_mm, depth_src))
+        # ★ 硬闸前置：要求实测深度却没拿到 ⇒ **现在**就停，不要先进 aim 把臂动到
+        #   一个用 1.6cm 假平面算出来的位置上再拒。`grasp.require_depth` 那道闸只管
+        #   "不让下扎"，管不到"前面的接近是不是已经跑偏了"。
+        if cfg.require_depth and obs.depth_mm is None:
+            print('❌ 要求实测深度，但这一条观测没有 —— **不动臂**。')
+            print('   检查：tof_node 起了吗（ros2 topic hz /tof/depth）？'
+                  '模块对着工作区吗？config 的 map 标了吗？')
             return 1
         print('框：src=%s box=[%s]  中心（AI 帧）=(%.1f, %.1f)  frame=%s'
               % (obs.src, ' '.join('%.3f' % v for v in obs.box_norm),
@@ -489,8 +608,11 @@ def main(argv=None):
         except Exception as e:                                # noqa: BLE001
             print('❌ 算不出目标点 O：%s —— 不动臂。' % e)
             return 1
-        print('O = (%.4f, %.4f, %.4f) m   （射线∩z=%.1fmm 平面；延迟 %.0fms）'
-              % (O + (cfg.z_plane_m * 1000, cfg.latency_s * 1000)))
+        print('O = (%.4f, %.4f, %.4f) m   （%s；延迟 %.0fms）'
+              % (O + ('射线 × 实测深度 %dmm（%s）' % (obs.depth_mm, depth_src)
+                      if obs.depth_mm is not None
+                      else '射线∩z=%.1fmm 平面' % (cfg.z_plane_m * 1000),
+                      cfg.latency_s * 1000)))
         tip = grasp.tip_open_m(j_fr)
         print('拍这张图时的爪尖 (%.4f, %.4f, %.4f) m   爪尖→O = %.1f mm'
               % (tip + (math.dist(tip, O) * 1000,)))
@@ -550,7 +672,7 @@ def main(argv=None):
             io.wait_feedback()
             print('→ /arm/feedback 有了（fb_n=%d），开始流式' % io.fb_n)
 
-            link = GraspLink(io, host, want, hz=cfg.hz)
+            link = GraspLink(io, host, want, hz=cfg.hz, tof=tof)
             # ★ 'all' 交给 grasp.run **一次**走完四相：分段调用会丢估计器与时间缓冲，
             #   相位之间就"断流"了（而设计要求的正是连续流式）。
             phases = [args.phase]
@@ -566,6 +688,8 @@ def main(argv=None):
                              rep['target'].alpha))
                 print('   拍了 %d 拍  观测 %d 条（挑不出框 %d 次）'
                       % (rep['ticks'], link.n_obs, link.n_none))
+                print('   带深度 %d 条（其中 ToF %d 条）'
+                      % (link.n_depth, link.n_depth_tof))
                 if rep['err_m'] is not None:
                     print('   最终 爪尖→目标点 %.2fmm  余量 slack=%s'
                           % (rep['err_m'] * 1000.0,
@@ -594,6 +718,12 @@ def main(argv=None):
         print('\n❌ 出错了：%s' % e)
         return 1
     finally:
+        if tof is not None:
+            try:
+                print('ToF 统计：%s' % (tof.info(),))
+                tof.stop()
+            except Exception as e:                            # noqa: BLE001
+                print('⚠️ 收 ToF 客户端出错：%s' % e)
         if io is not None:
             try:
                 io.close()

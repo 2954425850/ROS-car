@@ -108,6 +108,50 @@ def mutual_matches(desc_ref, desc_other, ratio=.7):
     return {i: j for i, j in forward.items() if backward.get(j) == i}
 
 
+def _flow_candidates(images, foreground, support_mask):
+    """Recover weak texture with bounded forward/backward LK tracks.
+
+    This is only a candidate generator.  Pose refinement and the existing
+    geometric gates remain responsible for accepting or rejecting a track.
+    """
+    enhanced = []
+    for image in images:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        enhanced.append(cv2.createCLAHE(4.0, (16, 16)).apply(gray))
+    masks = {
+        'support': np.uint8((support_mask > 0) & (foreground == 0)) * 255,
+        'target': cv2.erode(foreground, np.ones((31, 31), np.uint8)),
+    }
+    result = []
+    for kind, mask in masks.items():
+        points = cv2.goodFeaturesToTrack(enhanced[0], maxCorners=1200,
+                                         qualityLevel=.001, minDistance=3,
+                                         blockSize=5, mask=mask)
+        if points is None:
+            continue
+        tracks = []
+        for other in enhanced[1:]:
+            forward, st, err = cv2.calcOpticalFlowPyrLK(
+                enhanced[0], other, points, None, winSize=(31, 31), maxLevel=4,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, .01))
+            backward, st_back, _ = cv2.calcOpticalFlowPyrLK(
+                other, enhanced[0], forward, None, winSize=(31, 31), maxLevel=4,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, .01))
+            good = ((st[:, 0] > 0) & (st_back[:, 0] > 0)
+                    & (np.linalg.norm(points[:, 0] - backward[:, 0], axis=1) < 1.0)
+                    & (err[:, 0] < 15.0))
+            tracks.append((forward[:, 0], good))
+        for index in range(len(points)):
+            visible = [(0, points[index, 0].tolist())]
+            for view, (pixels, good) in enumerate(tracks, 1):
+                if good[index]:
+                    visible.append((view, pixels[index].tolist()))
+            if len(visible) >= 3:
+                result.append({'kind': kind, 'pixel': points[index, 0].tolist(),
+                               'visible': visible})
+    return result
+
+
 def match_tracks(images, box, config=None, contrast_threshold=None):
     """Reference features seen in at least three views; no geometry applied."""
     cfg = config or HeightConfig()
@@ -126,7 +170,15 @@ def match_tracks(images, box, config=None, contrast_threshold=None):
         sift = cv2.SIFT_create(nfeatures=3500, contrastThreshold=threshold)
         weak, _ = sift.detectAndCompute(gray_reference, support_mask)
         if len(weak) < cfg.min_support_points:
-            raise HeightRefused('support has insufficient texture (%d candidate features)' % len(weak))
+            flow = _flow_candidates(images, foreground, support_mask)
+            if flow:
+                return flow, {'reference_features': len(weak),
+                              'sift_contrast_threshold': threshold,
+                              'feature_backend': 'lk_flow',
+                              'flow_candidates': len(flow)}
+            raise HeightRefused(
+                'support has insufficient texture (%d candidate features)' % len(weak),
+                {'reference_features': len(weak), 'feature_backend': 'sift'})
     keypoints, descriptors = [], []
     for i, image in enumerate(images):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -149,12 +201,20 @@ def match_tracks(images, box, config=None, contrast_threshold=None):
         u, v = map(lambda q: int(round(q)), kp.pt)
         candidates.append({'kind': 'target' if foreground[v, u] else 'support',
                            'pixel': list(kp.pt), 'visible': visible})
+    if sum(c['kind'] == 'support' for c in candidates) < cfg.min_known_support_points:
+        flow = _flow_candidates(images, foreground, support_mask)
+        if flow:
+            return flow, {'reference_features': len(keypoints[0]),
+                          'sift_contrast_threshold': threshold,
+                          'feature_backend': 'lk_flow',
+                          'flow_candidates': len(flow)}
     return candidates, {'reference_features': len(keypoints[0]),
                         'sift_contrast_threshold': threshold,
+                        'feature_backend': 'sift',
                         'pair_matches': [len(m) for m in mappings]}
 
 
-def gate_tracks(candidates, views, config=None):
+def gate_tracks(candidates, views, config=None, known_support_z=None):
     """Triangulate candidates with the given poses; keep geometrically sound ones."""
     cfg = config or HeightConfig()
     centres_all = [np.array(geom.camera_center(v['joints'])) for v in views]
@@ -167,6 +227,27 @@ def gate_tracks(candidates, views, config=None):
             centres.append(c)
             directions.append(d)
         try:
+            if cand['kind'] == 'support' and known_support_z is not None:
+                points = []
+                for centre, direction in zip(centres, directions):
+                    centre, direction = np.asarray(centre), np.asarray(direction)
+                    if abs(direction[2]) < 1e-6:
+                        raise HeightRefused('support ray parallel to known plane')
+                    distance = (float(known_support_z) - centre[2]) / direction[2]
+                    if not (cfg.min_range_m <= distance <= cfg.max_range_m):
+                        raise HeightRefused('support ray range invalid')
+                    points.append(centre + distance * direction)
+                point = np.median(np.asarray(points), axis=0)
+                spread = max(float(np.linalg.norm(p - point)) for p in points)
+                if spread > cfg.max_split_point_m:
+                    raise HeightRefused('support plane point disagreement')
+                tracks.append({'kind': 'support', 'pixel': cand['pixel'],
+                               'point_m': point.tolist(),
+                               'split_a': point.tolist(), 'split_b': point.tolist(),
+                               'views': [j for j, _ in visible],
+                               'reprojection_px': 0.0, 'parallax_deg': 0.0,
+                               'ray_rms_m': spread})
+                continue
             result = triangulate(centres, directions, cfg)
             errors = []
             for j, pixel in visible:
@@ -220,7 +301,8 @@ def refined_tracks(images, views, box, config=None, contrast_threshold=None, ref
         except HeightRefused as e:
             e.diagnostics.update(counts)
             raise
-    tracks, counts['rejected_geometric_tracks'] = gate_tracks(candidates, views, config)
+    tracks, counts['rejected_geometric_tracks'] = gate_tracks(
+        candidates, views, config, known_support_z=support_z)
     return tracks, counts
 
 
@@ -271,7 +353,16 @@ def _finish_measurement(path, cfg, start, session, tracks, counts):
     box = session['reference_box']
     box_area = (box[2] - box[0]) * geom.STREAM_W * (box[3] - box[1]) * geom.STREAM_H
     coverage = float(area / box_area)
-    if coverage < cfg.min_image_coverage:
+    if session.get('known_support_z_m') is not None:
+        # The operator supplied the metric support plane. A cap can occupy a
+        # small fraction of a deliberately conservative ROI while its
+        # reconstructed top points still satisfy the plane, span, and split
+        # view gates below.
+        coverage_limit = 0.025
+    else:
+        coverage_limit = (0.05 if report['quality'].get('top_plane_source', '').startswith(
+            'known_horizontal_') else cfg.min_image_coverage)
+    if coverage < coverage_limit:
         raise HeightRefused('top feature image coverage insufficient (%.1f%%)' % (coverage * 100))
     a, _ = _measure_tracks(tracks, cfg, 'split_a', support_z)
     b, _ = _measure_tracks(tracks, cfg, 'split_b', support_z)
@@ -291,6 +382,8 @@ def _finish_measurement(path, cfg, start, session, tracks, counts):
                   library_versions={'opencv': cv2.__version__, 'numpy': np.__version__},
                   reference_box=box, compute_seconds=time.monotonic() - start,
                   acquisition_seconds=session.get('acquisition_seconds'),
+                  support_z_source=session.get('support_z_source'),
+                  base_angle=session.get('base_angle'),
                   tracks=tracks)
     return report
 
@@ -303,7 +396,8 @@ def save_diagnostic(path, report, output):
         color = (0, 230, 0) if track['kind'] == 'support' else (0, 150, 255)
         cv2.circle(image, tuple(int(round(x)) for x in track['pixel']), 3, color, -1)
     box = session['reference_box']
-    p = np.rint(np.array(box) * [geom.STREAM_W, geom.STREAM_H] * 2).astype(int)
+    p = np.rint(np.array(box) * [geom.STREAM_W, geom.STREAM_H,
+                                 geom.STREAM_W, geom.STREAM_H]).astype(int)
     cv2.rectangle(image, tuple(p[:2]), tuple(p[2:]), (255, 180, 0), 2)
     cv2.putText(image, 'height %.1f mm | geometric checks only' % (report['object_height_m'] * 1000),
                 (20, 35), cv2.FONT_HERSHEY_SIMPLEX, .8, (0, 255, 255), 2)
