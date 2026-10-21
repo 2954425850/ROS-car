@@ -101,6 +101,9 @@ CFG = {
 
     # —— 机械臂 ——
     'GRIP_MAX': 600,
+    # 夹爪**张开**位（count）。只在"首帧 p1 没读到（0）"时当兜底目标用；
+    # 绝不能拿 0 当目标（0 = 没读到，不是夹爪位置）。
+    'GRIP_OPEN': 240,
     'RATE_STICK': 300.0,          # 摇杆关节速率 raw/s（大臂/底座，满偏约 3.3s 走完）
     'RATE_BTN': 250.0,            # 按键关节速率 raw/s（夹爪/腕/小臂）
     'ARM_TAIL_S': 0.30,           # 停止输入后继续发布 N 秒（走完坡道）
@@ -168,12 +171,15 @@ class Ps2TeleopNode(Node):
             # ★ 首帧可能是"该拍没读到"（协议里 0 = 没读到）。拿 0 当目标 =
             #   把对应关节往 0 推。2026-10-21 真机：抓完恢复服务时首帧 p1=0，
             #   目标被初始化成 0 ⇒ **夹爪张开、刚抓到的椒掉了**。
-            #   先等一帧**完整**的回读再同步（25Hz，等一拍而已）。
-            if any(pos[i] == 0.0 for i in range(5)):
+            # ⚠️ 但**不能无限等**（2026-10-21 用户反馈"第一次开手柄臂不能动"）：
+            #   p1 的读回本来就会偶发 0；若一直等 p1，`targets` 永远 None，
+            #   `tick()` 里整个机械臂分支都不执行 ⇒ **臂完全没反应**（底盘仍能动）。
+            #   所以：p2–p5 必须真读到（没读到才等），p1 没读到就用**张开位**兜底。
+            if any(pos[i] == 0.0 for i in (1, 2, 3, 4)):
                 return
-            # 首次同步：目标 = 当前实际位姿，绝不用硬编码姿态去推臂
-            self.targets = [clamp(pos[i], 0, CFG['GRIP_MAX'] if i == 0 else 1000)
-                            for i in range(5)]
+            p1 = pos[0] if pos[0] > 0.0 else CFG['GRIP_OPEN']
+            self.targets = [clamp(p1, 0, CFG['GRIP_MAX'])] + [
+                clamp(pos[i], 0, 1000) for i in range(1, 5)]
             self.base_t = clamp(pos[5], -1000, 1000)
             self.get_logger().info(f'臂目标已按实际位姿初始化: {self.targets} base={self.base_t:.0f}')
             return

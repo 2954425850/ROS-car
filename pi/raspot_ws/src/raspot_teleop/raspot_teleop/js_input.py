@@ -47,6 +47,11 @@ class JsReader(threading.Thread):
             try:
                 while True:
                     data = os.read(fd, 8)
+                    if not data:
+                        # ★ 0 字节 = EOF/设备已经消失。旧代码 `len<8: continue`
+                        #   会在这条 fd 上空转，永不重开 ⇒ 手柄掉一次就"永远没反应"。
+                        #   退出内层，走 finally 关闭 + 1s 后重开。
+                        break
                     if len(data) < 8:
                         continue
                     _t, value, typ, num = struct.unpack('<ihBB', data)
