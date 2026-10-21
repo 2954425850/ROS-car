@@ -65,6 +65,15 @@ class K230Target:
     def auto(self) -> str:
         return self._run(["auto"])
 
+    def enroll(self, pid: str, timeout: float = 10.0) -> str:
+        """把画面里唯一那张脸录成 `pid`（板子 ASCII 库名）。**会阻塞到出结果**（≤ timeout），
+        调用方放后台线程。失败抛 TargetError（多半是"没看清脸 / 是库里别人"）。"""
+        return self._run(["enroll", str(pid), "--timeout", repr(float(timeout))],
+                         timeout=timeout + 5.0)
+
+    def forget(self, pid: str) -> str:
+        return self._run(["forget", str(pid)])
+
     def point(self, u: float, v: float, size: float | None = None) -> str:
         argv = ["pt", repr(float(u)), repr(float(v))]
         if size is not None:
@@ -72,13 +81,13 @@ class K230Target:
         return self._run(argv)
 
     # ---- 内部 ----
-    def _run(self, argv: list[str]) -> str:
+    def _run(self, argv: list[str], timeout: float | None = None) -> str:
         cmd = [self._cmd] + argv
+        timeout = self._timeout if timeout is None else timeout
         try:
-            r = self._runner(cmd, capture_output=True, text=True,
-                             timeout=self._timeout)
+            r = self._runner(cmd, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            raise TargetError("板子 %.0f 秒没回话（k230ctl %s）" % (self._timeout, argv[0]))
+            raise TargetError("板子 %.0f 秒没回话（k230ctl %s）" % (timeout, argv[0]))
         except OSError as e:
             raise TargetError("跑不起 k230ctl —— %s" % e)
         if r.returncode != 0:

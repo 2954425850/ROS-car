@@ -133,7 +133,20 @@ car:
 follow:
   enabled: true
   cmd: "/home/cy/k230-vision/pi/k230ctl"
-  timeout_sec: 15          # ⚠️ 必须 > 板子的 FOLLOW_TIMEOUT_MS(8s)：follow 是锁上之后才回话
+  timeout_sec: 15          # 板子其实一收到就回 ok；15s 是给 k230ctl 子进程整体的上限
+
+# 身份 v1：认出说话人 → 个性化应答 → 对话中自动建档 / 记偏好 / 留言转告。
+# 数据来自 /k230/result（k230-bridge 服务），档案在 identity.dir/profiles/<id>.json（仓库外）。
+identity:
+  enabled: true
+  dir: "~/.jarvis"
+  people_json: "/home/cy/ROS-car/pi/k230-vision/pi/people.json"   # 老的手工 id→称呼，启动时补成档案
+  accept: 0.85             # 叫名字的相似度门槛（板子尺度；板子自己认人的门限是 0.78）
+  auto_enroll: true        # 看到清楚的陌生单人脸就后台录成 uNNN
+  enroll_cooldown_s: 120   # 两次自动录入的最小间隔
+  remember: true           # 每轮对话后后台提取称呼/偏好写档案
+  owners: []               # 主人的档案 id，如 ["id1"]
+  restrict_to_owner: false # true = 车/跟随工具只听主人（认人有失败率，慎开）
 
 vision:
   enabled: true              # false = 根本不注册 look 工具（不进发给模型的 tools= 数组）

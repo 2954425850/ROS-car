@@ -76,7 +76,7 @@ def _guard(target):
     return _wrap
 
 
-def register_follow_tools(registry: ToolRegistry, target, config=None) -> None:
+def register_follow_tools(registry: ToolRegistry, target, config=None, resolver=None) -> None:
     """把「跟着谁」登记成原生工具。
 
     Args:
@@ -86,6 +86,8 @@ def register_follow_tools(registry: ToolRegistry, target, config=None) -> None:
         config: 有 `get(key, default)` 的形状。`follow.enabled=false` → **不注册**，
             那样模型连"有这么个工具但我不能用"都不知道（照 vision.enabled 的做法）。
             传 None = 不做开关判断、总是注册（单测里只关心工具形状时的用法）。
+        resolver: 可选，`name -> 板子 id 或 None`（身份档案查名字；"我" = 当前说话人）。
+            查到就把 id 交给板子，查不到原样交给 k230ctl（它再查 people.json）。
     """
     if config is not None and not config.get("follow.enabled", True):
         logger.info("跟随：config 里 follow.enabled=false，不注册 follow 工具")
@@ -95,6 +97,13 @@ def register_follow_tools(registry: ToolRegistry, target, config=None) -> None:
         logger.warning("跟随：客户端不可用，仍注册工具（调用时会说明原因）")
 
     wrap = _guard(target)
+    follow_raw = wrap("follow")
+
+    def _follow(name):
+        pid = resolver(name) if resolver is not None else None
+        if pid is None and resolver is not None and str(name).strip() in ("我", "我自己", "自己"):
+            return "我现在认不出你是谁（没看清你的脸），没法跟着你。请正对着摄像头再说一次。"
+        return follow_raw(name=pid or name)
 
     registry.register(
         Tool(
@@ -103,7 +112,7 @@ def register_follow_tools(registry: ToolRegistry, target, config=None) -> None:
             description=(
                 "让摄像头**一直盯着某个人**。用户说「跟着张三」「跟着他」"
                 "「别让他跑了」「盯住那个人」这类**要持续跟随**的话时调用。"
-                "name 填用户说的那个名字（原话最好）。"
+                "name 填用户说的那个名字（原话最好）；用户说「跟着我」就填「我」。"
                 "⚠️ 这个动作**要等对方正对镜头露出脸**才能锁上，可能等几秒；"
                 "人不在画面里、或者一直没露正脸，会失败。"
                 "只是想知道「他在哪」「那是谁」用 look。"
@@ -116,7 +125,7 @@ def register_follow_tools(registry: ToolRegistry, target, config=None) -> None:
                 },
                 "required": ["name"],
             },
-            handler=wrap("follow"),
+            handler=_follow,
         )
     )
 

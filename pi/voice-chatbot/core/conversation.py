@@ -75,6 +75,9 @@ from tools.music import MusicController, register_music_tools
 from tools.car import register_car_tools
 from tools.vision import register_vision_tools
 from tools.follow import register_follow_tools
+from tools.identity import register_identity_tools, restrict_to_owner
+from identity.manager import IdentityManager
+from vision.k230_state import K230State
 from car.controller import CarController
 from vision import K230Vision, K230Target
 from utils.config import Config
@@ -300,7 +303,10 @@ class ConversationManager:
         except Exception as e:  # noqa: BLE001
             logger.error(f"跟随：暂时不可用（构造就失败了）—— {e}")
             self._target = None
-        register_follow_tools(self._registry, self._target, config=config)
+        # K230 实时结果（/k230/result）：身份 v1 认人用。ROS 不在只降级。
+        self._k230_state = K230State() if config.get("identity.enabled", True) else None
+        if self._k230_state is not None:
+            self._k230_state.start()
 
         # 唤醒握手：一次唤醒劈成「快动作」（留在监听线程上急停，随时可用）
         # +「慢流水线」（丢到后台线程，同一时刻最多一条）。位置放在 _car.start()
@@ -322,6 +328,24 @@ class ConversationManager:
         self._llm = LLMClient(
             config, self._llm_context, self._registry, extra_schemas=self._mcp.tool_schemas
         )
+
+        # 身份 v1（认人 → 个性化 → 自动建档/记忆/留言）。要用 LLM 做后台记忆提取，
+        # 所以放在 LLMClient 之后；工具注册表是引用，后注册的工具照样进 tools=。
+        self._identity = None
+        if self._k230_state is not None:
+            try:
+                self._identity = IdentityManager(
+                    config, self._llm, self._k230_state, self._target,
+                    people_json=config.get("identity.people_json",
+                                           "/home/cy/ROS-car/pi/k230-vision/pi/people.json"))
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"身份：起不来，按无身份运行 —— {e}")
+        register_follow_tools(self._registry, self._target, config=config,
+                              resolver=self._identity.resolve_name if self._identity else None)
+        register_identity_tools(self._registry, self._identity)
+        if self._identity is not None and config.get("identity.restrict_to_owner", False):
+            n = restrict_to_owner(self._registry, self._identity, {"car", "follow"})
+            logger.info(f"身份：{n} 个车/跟随工具只听主人 {sorted(self._identity.owners)}")
 
         # Tracking
         self._continue_round = 0
@@ -392,6 +416,8 @@ class ConversationManager:
         self._wakeword.stop()
         self._music.stop()
         self._car.close()
+        if self._k230_state is not None:
+            self._k230_state.close()
         self._mcp.close()  # 关 portal + 终止 MCP server 子进程，防僵尸
         self._tool_executor.shutdown(wait=False)
         self._mic.close()
@@ -463,6 +489,8 @@ class ConversationManager:
         self._last_activity = now
 
         logger.info("→ Wake word detected!")
+        if self._identity is not None:
+            self._identity.on_wake()
         # ★ 中断标志必须在**整轮入口**清，**不能**放到 SPEAKING 入口去清
         #   （设计 §9.4）。理由：用户在 **THINKING 期间**喊的那一声（例如 look
         #   正跑着的 4~10 秒）要**活到 SPEAKING** 才生效 —— 那一段取消不了工具，
@@ -524,11 +552,22 @@ class ConversationManager:
             logger.info(f"→ 用户明说不要音乐（{user_text!r}），直接终止播放")
             self._music.stop()
 
+        # Step 1.8: 认人 → 身份段落拼进 system（不进历史）。换了个人就清掉上一位的对话，
+        # 免得把张三刚说的事当成李四的。
+        if self._identity is not None:
+            self._llm_context.set_dynamic_system(self._identity.begin_turn())
+            if self._identity.speaker_changed():
+                logger.info("→ 说话人换了，清空上一位的对话历史")
+                self._llm_context.reset()
+
         # Step 2: LLM with tool loop
         self._pending_response = ""
         self._should_listen = False
         self._spoke_pre_tool = False
         self._run_agent_loop(user_text)
+
+        if self._identity is not None:
+            self._identity.end_turn(user_text, self._pending_response)
 
         if not self._pending_response.strip():
             # 出过开场白但工具之后模型没再说话 → 走 IDLE 是对的（用户已经听到声了），

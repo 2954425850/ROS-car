@@ -28,6 +28,12 @@ class ConversationContext:
         self._system_prompt = config.get("llm.system_prompt", "").strip()
         self._max_rounds = config.get("conversation.max_history_rounds", 20)
         self._history: list[dict[str, Any]] = []
+        # 每轮现算的 system 补充（身份段落："正在跟你说话的是张三…"）。
+        # **不进历史**：它描述的是"此刻"，下一轮会被新的覆盖。
+        self._dynamic_system = ""
+
+    def set_dynamic_system(self, text: str) -> None:
+        self._dynamic_system = (text or "").strip()
 
     # ---- 写入 ----
 
@@ -72,9 +78,12 @@ class ConversationContext:
 
     def get_messages(self) -> list[dict[str, Any]]:
         """返回可直接发给 LLM 的消息列表：system + 最近 N 轮完整历史。"""
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._system_prompt}
-        ]
+        system = self._system_prompt
+        if self._dynamic_system:
+            system = f"{system}
+
+{self._dynamic_system}" if system else self._dynamic_system
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         for turn in self._turns():
             messages.extend(turn)
         return messages
