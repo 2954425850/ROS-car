@@ -236,48 +236,21 @@ class GraspServer(Node):
         return resp
 
     def _go_home(self):
-        """回到上电复位位姿，**夹爪保持闭合** —— 走固件 re-home（flags bit1）。
-
-        固件 2026-10-21 加了 ROS_ARM_FLAG_KEEP_GRIPPER(0x02)：这一帧夹爪不收到复位指令，
-        其余 4 关节 + 底座照常回位。上位机把驱动的 rehome_keep_gripper 置 true 再调
-        /arm/rehome，完了置回 false（平时 re-home 仍是完整复位、松爪）。
-        """
-        from rcl_interfaces.srv import SetParameters
+        """回到上电复位位姿，**夹爪保持闭合** —— 调驱动专用服务 /arm/rehome_hold（flags 0x03）。"""
         from std_srvs.srv import Trigger
-        name = self.get_parameter('driver_node').value
-        set_cli = self.create_client(SetParameters, f'/{name}/set_parameters')
-        re_cli = self.create_client(Trigger, 'arm/rehome')
+        cli = self.create_client(Trigger, 'arm/rehome_hold')
         try:
-            if not set_cli.wait_for_service(timeout_sec=2.0):
-                raise _Abort('ERROR', f'{name} 参数服务不在，回不了位')
-            self._set_param(set_cli, 'rehome_keep_gripper', True)
-            try:
-                if not re_cli.wait_for_service(timeout_sec=2.0):
-                    raise _Abort('ERROR', 'arm/rehome 服务不在')
-                fut = re_cli.call_async(Trigger.Request())
-                end = time.monotonic() + 3.0
-                while not fut.done() and time.monotonic() < end:
-                    time.sleep(0.02)
-                if not fut.done() or not fut.result().success:
-                    raise _Abort('ERROR', 'arm/rehome 没回成功')
-            finally:
-                self._set_param(set_cli, 'rehome_keep_gripper', False)
-            self._wait_home_done()
+            if not cli.wait_for_service(timeout_sec=3.0):
+                raise _Abort('ERROR', 'arm/rehome_hold 服务不在（驱动没起来？）')
+            fut = cli.call_async(Trigger.Request())
+            end = time.monotonic() + 3.0
+            while not fut.done() and time.monotonic() < end:
+                time.sleep(0.02)
+            if not fut.done() or not fut.result().success:
+                raise _Abort('ERROR', 'arm/rehome_hold 没回成功')
         finally:
-            self.destroy_client(set_cli)
-            self.destroy_client(re_cli)
-
-    def _set_param(self, cli, name, value):
-        # Parameter 是顶部的 rclpy.parameter.Parameter（有 to_parameter_msg()），
-        # 不是 rcl_interfaces.msg.Parameter（那个没有，2026-10-21 踩过）。
-        req = cli.srv_type.Request()
-        req.parameters = [Parameter(name=name, value=bool(value)).to_parameter_msg()]
-        fut = cli.call_async(req)
-        end = time.monotonic() + 2.0
-        while not fut.done() and time.monotonic() < end:
-            time.sleep(0.02)
-        if not fut.done() or not all(r.successful for r in fut.result().results):
-            raise _Abort('ERROR', f'设参数 {name} 失败')
+            self.destroy_client(cli)
+        self._wait_home_done()
 
     def _wait_home_done(self, timeout=20.0):
         """等归位结束：回读稳定在复位位姿。归位期间回读是固件总线计数器（假值），

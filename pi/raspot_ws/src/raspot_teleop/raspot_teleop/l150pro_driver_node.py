@@ -251,6 +251,7 @@ class L150ProDriverNode(Node):
         self.sub_arm = self.create_subscription(JointState, 'arm/command', self.on_arm, 10)
         self.sub_estop = self.create_subscription(Bool, 'estop', self.on_estop, 10)
         self.srv_rehome = self.create_service(Trigger, 'arm/rehome', self.on_rehome)
+        self.srv_rehome_hold = self.create_service(Trigger, 'arm/rehome_hold', self.on_rehome_hold)
 
         self.pub_odom = self.create_publisher(Odometry, 'wheel_odom', 10)
         self.pub_imu = self.create_publisher(Imu, 'imu/data_raw', 10)
@@ -357,6 +358,13 @@ class L150ProDriverNode(Node):
         self.rx.send(build_arm(p1, p2, p3, p4, p5, base, t_ms, 0x00, self.seq_ac))
 
     def on_rehome(self, req, resp):
+        return self._rehome(req, resp, keep_gripper=False)
+
+    def on_rehome_hold(self, req, resp):
+        """复位但**夹爪保持**（flags bit1，固件 2026-10-21）。给抓取服务收尾用。"""
+        return self._rehome(req, resp, keep_gripper=True)
+
+    def _rehome(self, _req, resp, keep_gripper):
         with self.state.lock:
             online = self.state.online
         if not online and self.require_online:
@@ -371,7 +379,7 @@ class L150ProDriverNode(Node):
         # 这一帧的数值会被固件在归位后用自己的影子覆盖，所以这里发当前位姿只是把
         # "五关节原地不动"这个意图写清楚；真正决定结果的是固件那两条影子赋值。
         self.seq_ac = (self.seq_ac + 1) & 0xFF
-        keep = bool(self.get_parameter('rehome_keep_gripper').value)
+        keep = keep_gripper or bool(self.get_parameter('rehome_keep_gripper').value)
         flags = ARM_FLAG_REHOME | (ARM_FLAG_KEEP_GRIPPER if keep else 0)
         self.rx.send(build_arm(*self.last_joints, self.last_base, 0, flags, self.seq_ac))
         resp.success = True
