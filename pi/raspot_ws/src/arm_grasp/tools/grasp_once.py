@@ -650,9 +650,21 @@ def main(argv=None):
             return 0
 
         # ---------------------------------------------------------------- ⑤ 真跑
-        if lvl == 'refuse' and not args.yes:
-            print('⛔ 拒绝执行（S0 refuse）。要硬来加 --yes（不建议）。')
-            return 3
+        # ★ S0 的 `refuse` 有两类，**别混为一谈**（2026-10-21 用户指出）：
+        #   ① `tgt is None` = 这个点在几何上**根本解不出可行姿态** ⇒ 真够不着，别动臂；
+        #   ② `tgt is not None` 但 slack < warn_slack = **解得出、只是余量薄**
+        #      （实测用户手动都能夹到）⇒ 够不着不等于危险，应当**先试**，
+        #      下扎真解不出来时还有 close_reach 的合爪兜底。
+        #   `--yes` 只跳过"臂会动、人让开"的确认，不再兼任"硬来"开关。
+        if lvl == 'refuse' and tgt is None:
+            print('⛔ 目标点没有任何可行姿态（几何上解不出，不是余量小）—— 不动臂。')
+            if not args.yes:
+                return 3
+            print('⚠️ 仍按 --yes 继续；aim 相会在第一拍 refuse。')
+        elif lvl == 'refuse':
+            print('⚠️ S0 余量只剩 %.0f count（< warn_slack %.0f），但**有可行姿态**'
+                  '——按"先试"继续；下扎解不出来会自动走合爪兜底。'
+                  % (tgt.slack, cfg.warn_slack))
 
         # 发指令前把**第一拍要发的那条**打出来（人看的就是这个）
         if tgt is not None:
