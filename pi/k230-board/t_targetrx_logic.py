@@ -185,6 +185,21 @@ k, v = show('{"cmd": "follow", "who": "id_2-x"}', {"cmd": "follow", "who": "id_2
 chk(k == "follow" and v == "id_2-x", "合法字符（字母数字 _ -）应被接受（实得 %s/%s）" % (k, v))
 
 print()
+print("G) 新命令 cmd=enroll / cmd=forget（2026-10-21）")
+k, v = show('{"cmd": "enroll", "id": "u001"}', {"cmd": "enroll", "id": "u001"})
+chk(k == "enroll" and v == "u001", 'enroll id=u001 -> ("enroll","u001")（实得 %s/%s）' % (k, v))
+k, v = show('{"cmd": "enroll"}', {"cmd": "enroll"})
+chk(k == "err", "enroll 不带 id -> 应被拒")
+k, v = show('{"cmd": "enroll", "id": "../x"}', {"cmd": "enroll", "id": "../x"})
+chk(k == "err", "enroll id 含路径字符 -> 应被拒（会变成 facedb/<id>.bin 文件名）")
+k, v = show('{"cmd": "forget", "id": "u001"}', {"cmd": "forget", "id": "u001"})
+chk(k == "forget" and v == "u001", 'forget id=u001 -> ("forget","u001")（实得 %s/%s）' % (k, v))
+k, v = show('{"cmd": "forget", "id": 7}', {"cmd": "forget", "id": 7})
+chk(k == "err", "forget id 是数字 -> 应被拒")
+k, v = show('{"cmd": "follow", "who": 123}', {"cmd": "follow", "who": 123})
+chk(k == "err" and "who" in v, "follow 的报错仍提到 who（重构 _check_id 后）")
+
+print()
 print("=" * 74)
 if FAILS:
     print("结果: %d 项失败" % len(FAILS))

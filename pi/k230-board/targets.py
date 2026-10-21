@@ -194,6 +194,23 @@ def _isnum(x):
         return False
 
 
+def _check_id(v, field):
+    """人脸库名（ASCII）校验 → (id, None) / (None, 错误)。错误 "type" = 不是字符串。
+
+    限死字符集是因为这个值会一路走到身份比对和**文件名**（facedb/<id>.bin）里，
+    别让奇怪的东西进来（"../x" 之类）。"""
+    if not isinstance(v, str):
+        return None, "type"
+    v = v.strip()
+    if not v or len(v) > 32:
+        return None, field + " empty or too long"
+    for ch in v:
+        if not ("a" <= ch <= "z" or "A" <= ch <= "Z"
+                or "0" <= ch <= "9" or ch in "_-"):
+            return None, field + " must be [A-Za-z0-9_-]"
+    return v, None
+
+
 def parse_request(req, W, H, default_size=0.12):
     """把一条请求解析成动作。**不碰 socket，纯函数。**
 
@@ -215,19 +232,26 @@ def parse_request(req, W, H, default_size=0.12):
     # 「跟着某个人」。板子自己拿 faces + objs 做绑定（见 pick_body_for_face），
     # **不走 8557 给框** —— 那样会把 det_auto 永久关掉。
     if cmd == "follow":
-        who = req.get("who")
-        if not isinstance(who, str):
-            return ("err", "follow needs who=<id>")
-        who = who.strip()
-        if not who or len(who) > 32:
-            return ("err", "who empty or too long")
-        for ch in who:
-            # 库名是 ASCII（id1/id2…）。这里限死字符集是因为这个值会一路
-            # 走到身份比对逻辑里，别让奇怪的东西进来。
-            if not ("a" <= ch <= "z" or "A" <= ch <= "Z"
-                    or "0" <= ch <= "9" or ch in "_-"):
-                return ("err", "who must be [A-Za-z0-9_-]")
+        who, err = _check_id(req.get("who"), "who")
+        if err:
+            return ("err", "follow needs who=<id>" if err == "type" else err)
         return ("follow", who)
+
+    # 「把画面里这张脸录成 <id>」（2026-10-21，语音助手对话中自动建档用）。
+    # 只是受理 —— 采样要在主循环里拿同一帧的人脸特征做，几秒后结果从 8556 的
+    # `enroll` 字段报回去（这条连接上回的 ok 只代表"收到了"）。
+    if cmd == "enroll":
+        pid, err = _check_id(req.get("id"), "id")
+        if err:
+            return ("err", "enroll needs id=<id>" if err == "type" else err)
+        return ("enroll", pid)
+
+    # 「删掉 <id> 的人脸库」。同样在主循环里做（要碰 FaceDB）。
+    if cmd == "forget":
+        pid, err = _check_id(req.get("id"), "id")
+        if err:
+            return ("err", "forget needs id=<id>" if err == "type" else err)
+        return ("forget", pid)
 
     if "box" in req:
         box = req["box"]
@@ -269,7 +293,7 @@ def parse_request(req, W, H, default_size=0.12):
             return ("err", "pt " + _crop_err(px[2], px[3], W, H, size=size))
         return ("set", px)
 
-    return ("err", "need one of: box / pt / cmd=stop|auto|follow")
+    return ("err", "need one of: box / pt / cmd=stop|auto|follow|enroll|forget")
 
 
 # ---------------- socket 那层 ----------------
@@ -290,6 +314,8 @@ class TargetRx:
         self.pending_stop = False
         self.pending_follow = None      # 要跟的人（faces 里的 who），如 "id1"
         self.pending_auto = False       # 请求切回检测器驱动
+        self.pending_enroll = None      # 要录入的 id（人脸库名）
+        self.pending_forget = None      # 要删除的 id
         self.recv_ok = 0
         self.recv_bad = 0
 
@@ -338,6 +364,14 @@ class TargetRx:
                 self.pending_stop = False
                 self._reply(conn, {"ok": True})
                 self.recv_ok += 1
+            elif kind == "enroll":
+                self.pending_enroll = payload
+                self._reply(conn, {"ok": True, "accepted": "enroll"})
+                self.recv_ok += 1
+            elif kind == "forget":
+                self.pending_forget = payload
+                self._reply(conn, {"ok": True, "accepted": "forget"})
+                self.recv_ok += 1
             elif kind == "auto":
                 self.pending_auto = True
                 self.pending_follow = None
@@ -368,7 +402,7 @@ class TargetRx:
         """取走待应用的命令。
 
         返回 ("set", box_px) / ("stop", None) / ("follow", who) / ("auto", None)
-        或 (None, None)。
+        / ("enroll", id) / ("forget", id) 或 (None, None)。
 
         ⚠️ follow / auto **不能**由 TargetRx 自己处理 —— 它们要用到**同一帧的**
         faces 和 objs，那只有主循环里才有。这里只负责把它们递上去。
@@ -376,6 +410,14 @@ class TargetRx:
         if self.pending_stop:
             self.pending_stop = False
             return ("stop", None)
+        if self.pending_forget is not None:
+            pid = self.pending_forget
+            self.pending_forget = None
+            return ("forget", pid)
+        if self.pending_enroll is not None:
+            pid = self.pending_enroll
+            self.pending_enroll = None
+            return ("enroll", pid)
         if self.pending_follow is not None:
             who = self.pending_follow
             self.pending_follow = None

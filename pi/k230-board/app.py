@@ -215,6 +215,7 @@ from tracker import Tracker
 from targets import (TargetRx, template_crop_side as tside,
                      pick_body_for_face)
 from faces import FaceRecognizer, FaceDB
+import ulab.numpy as np        # 录入去重用（np.dot 两条已归一化特征 = 余弦）
 from watchdog import Watchdog
 
 INFER_HZ = 10.0                 # 推理 + 上报节拍（计划两块都是 0.1 s）
@@ -308,7 +309,8 @@ def main():
     rx = TargetRx(config.TARGET_PORT, config.AI_WIDTH, config.AI_HEIGHT,
                   default_size=config.TARGET_SIZE)
     print("TARGETRX OK port=%d  ({\"pt\":[u,v]} / {\"box\":[l,t,r,b]} / "
-          "{\"cmd\":\"stop\"|\"auto\"|\"follow\",\"who\":\"id1\"})"
+          "{\"cmd\":\"stop\"|\"auto\"|\"follow\",\"who\":\"id1\"} / "
+          "{\"cmd\":\"enroll\"|\"forget\",\"id\":\"u001\"})"
           % config.TARGET_PORT)
 
     # ---- 人脸：检测/对齐/特征/活体 + 特征库。**建在 Camera 之前**（同 Detector/Tracker）----
@@ -396,6 +398,13 @@ def main():
     face_err = 0            # 人脸环节报错的次数（只打第一条，免得刷屏）
     t_face_save = time.ticks_ms()   # 上次把库落盘的时刻
     face_ctr = 0            # 人脸降频计数器（0 = 这一拍跑人脸）
+    # ---- 按命令录入（8557 enroll/forget，见 config.FACE_ENROLL_*）----
+    enroll_id = None        # 正在采样的 id；None = 没在录
+    enroll_feats = []       # 已采的特征（ulab 512 维，已归一化）
+    enroll_deadline = 0
+    enroll_status = None    # 最近一次 enroll/forget 的结果，随 8556 上报
+    enroll_status_until = 0
+    enroll_seq = 0
     face_period = max(1, int(INFER_HZ / config.FACE_HZ))
     # GC / 耗时统计
     gc_ctr = 0              # 隔几拍 gc.collect()（原来每拍全量）
@@ -497,6 +506,35 @@ def main():
                         det_auto = True
                         follow_who = None
                         print("TARGET auto -> det_auto ON（回到检测器驱动）")
+                    elif kind == "enroll":
+                        enroll_seq += 1
+                        if fdb is None:
+                            enroll_status = {"seq": enroll_seq, "cmd": "enroll", "id": px,
+                                             "state": "fail", "n": 0, "why": "face disabled"}
+                            enroll_status_until = time.ticks_add(now, config.FACE_ENROLL_REPORT_MS)
+                        else:
+                            enroll_id = px
+                            enroll_feats = []
+                            enroll_deadline = time.ticks_add(now, config.FACE_ENROLL_MS)
+                            enroll_status = {"seq": enroll_seq, "cmd": "enroll", "id": px,
+                                             "state": "running", "n": 0, "why": None}
+                            enroll_status_until = enroll_deadline
+                            print("TARGET enroll id=%s 已受理（采样 %d 帧 / %d ms）"
+                                  % (px, config.FACE_ENROLL_FRAMES, config.FACE_ENROLL_MS))
+                    elif kind == "forget":
+                        enroll_seq += 1
+                        ok = False
+                        if fdb is not None:
+                            had = any(nm == px for nm, _a in fdb.names)
+                            fdb.remove(px)
+                            ok = had
+                        if enroll_id == px:
+                            enroll_id = None
+                        enroll_status = {"seq": enroll_seq, "cmd": "forget", "id": px,
+                                         "state": "done" if ok else "fail", "n": 0,
+                                         "why": None if ok else "not in db"}
+                        enroll_status_until = time.ticks_add(now, config.FACE_ENROLL_REPORT_MS)
+                        print("TARGET forget id=%s -> %s" % (px, enroll_status["state"]))
                     elif kind == "set":
                         det_auto = False
                         follow_who = None
@@ -556,7 +594,7 @@ def main():
                     # 但 follow_who 在等正脸时**必须每拍跑**，否则可能错过那张脸。
                     fobjs = []
                     run_face = frec is not None and (
-                        follow_who is not None or face_ctr == 0)
+                        follow_who is not None or enroll_id is not None or face_ctr == 0)
                     if run_face:
                         try:
                             f4 = arr.reshape((1, 3, config.AI_HEIGHT, config.AI_WIDTH))
@@ -591,6 +629,24 @@ def main():
                                             if face_added <= 3 or face_added % 10 == 0:
                                                 print("FACE +1 -> %s (score=%.3f, 库=%d 条)"
                                                       % (who, sc, fdb.total_vecs()))
+                                # ---- 按命令录入：只收单脸 + 质量门 + 活体 ----
+                                if (enroll_id is not None and n_faces == 1
+                                        and f["ok"] and f["is_live"]):
+                                    if who is not None and who != enroll_id:
+                                        # 认出是库里的别人 ⇒ 放弃（一个人不能有两份）
+                                        enroll_status = {"seq": enroll_seq, "cmd": "enroll",
+                                                         "id": enroll_id, "state": "fail",
+                                                         "n": len(enroll_feats),
+                                                         "why": "already known as " + who}
+                                        enroll_status_until = time.ticks_add(
+                                            now, config.FACE_ENROLL_REPORT_MS)
+                                        print("FACE enroll %s 放弃：画面里是已知的 %s"
+                                              % (enroll_id, who))
+                                        enroll_id = None
+                                    elif not enroll_feats or float(
+                                            np.dot(enroll_feats[-1], f["feat"])) < 0.99:
+                                        enroll_feats.append(f["feat"])
+                                        enroll_status["n"] = len(enroll_feats)
                                 fobjs.append({
                                     "cls": "face",
                                     "score": f["score"] if "score" in f else None,
@@ -615,6 +671,35 @@ def main():
                                 print("FACE ERR (之后不再逐条打)")
                             face_err += 1
                     face_ctr = (face_ctr + 1) % face_period
+
+                    # 录入收尾：凑够帧数，或到时限（够 FACE_ENROLL_MIN 帧也算成）
+                    if enroll_id is not None and (
+                            len(enroll_feats) >= config.FACE_ENROLL_FRAMES
+                            or time.ticks_diff(now, enroll_deadline) >= 0):
+                        n_got = len(enroll_feats)
+                        why = None
+                        if n_got >= config.FACE_ENROLL_MIN:
+                            try:
+                                if any(nm == enroll_id for nm, _a in fdb.names):
+                                    for ft in enroll_feats:
+                                        fdb.append(enroll_id, ft)
+                                    fdb.flush()
+                                else:
+                                    fdb.add(enroll_id, enroll_feats)
+                            except BaseException as e:
+                                why = "db write: %s" % e
+                        else:
+                            why = "only %d good frames (need %d)" % (n_got, config.FACE_ENROLL_MIN)
+                        enroll_status = {"seq": enroll_seq, "cmd": "enroll", "id": enroll_id,
+                                         "state": "fail" if why else "done", "n": n_got,
+                                         "why": why}
+                        enroll_status_until = time.ticks_add(now, config.FACE_ENROLL_REPORT_MS)
+                        print("FACE enroll %s -> %s (%d 帧) %s"
+                              % (enroll_id, enroll_status["state"], n_got, why or ""))
+                        enroll_id = None
+                        enroll_feats = []
+                    if enroll_status is not None and time.ticks_diff(now, enroll_status_until) >= 0                             and enroll_id is None:
+                        enroll_status = None
 
                     # 增量入库后**隔一段时间**落盘 —— 别每帧写 SD（写坏卡、也拖慢循环）
                     if fdb is not None and time.ticks_diff(now, t_face_save) >= config.FACE_SAVE_EVERY_MS:
@@ -682,7 +767,7 @@ def main():
                     tick_ms = time.ticks_ms()         # 单调毫秒，供 Pi 对齐 ToF/雷达
                     payload = encode(objs + t_objs, config.WIDTH, config.HEIGHT,
                                      frame_no, ts_ms, faces=fobjs, tick_ms=tick_ms,
-                                     cap_tick_ms=cap_tick_ms)
+                                     cap_tick_ms=cap_tick_ms, enroll=enroll_status)
                     if not r_pi.ok:
                         r_pi.connect()
                     r_pi.send(payload)

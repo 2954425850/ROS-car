@@ -17,7 +17,7 @@ import ujson
 
 
 def encode(objs, width, height, frame_no, ts_ms, faces=None, tick_ms=None,
-           cap_tick_ms=None):
+           cap_tick_ms=None, enroll=None):
     """打包成 JSON bytes，直接可以往 socket 里写。
 
     `faces` 可选，**单独一个数组，不混进 `objs`** ——
@@ -53,6 +53,10 @@ def encode(objs, width, height, frame_no, ts_ms, faces=None, tick_ms=None,
         d["tick"] = tick_ms
     if cap_tick_ms is not None:
         d["cap_tick"] = cap_tick_ms
+    if enroll is not None:
+        # {"seq": n, "cmd": "enroll"|"forget", "id": .., "state": "running"|"done"|"fail",
+        #  "n": 已采帧数, "why": 失败原因}  —— 见 app.py 的「按命令录入」
+        d["enroll"] = enroll
     if faces is not None:
         d["faces"] = faces
     return ujson.dumps(d).encode()
