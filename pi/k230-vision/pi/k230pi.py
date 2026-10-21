@@ -161,6 +161,7 @@ def framed():
         conn.settimeout(5.0)
         ex = IdrExtractor()
         n_bytes, t_rep, t_idle = 0, time.time(), time.time()
+        t_conn, tot = time.time(), 0
         while True:
             try:
                 d = conn.recv(65536)
@@ -176,6 +177,7 @@ def framed():
                 break
             t_idle = time.time()
             n_bytes += len(d)
+            tot += len(d)
             for au in ex.feed(d):
                 with open(tmp, "wb") as f:
                     f.write(au)
@@ -184,7 +186,9 @@ def framed():
                 print("60s: %.0f kB/s, %d 张关键帧" % (n_bytes / 60.0 / 1024, ex.frames), flush=True)
                 n_bytes, t_rep = 0, time.time()
         conn.close()
-        print("disconnect from %s:%d" % peer, flush=True)
+        dur = max(0.001, time.time() - t_conn)
+        print("disconnect from %s:%d  %.1fs  %d 字节（%.0f kB/s）  关键帧 %d"
+              % (peer[0], peer[1], dur, tot, tot / dur / 1024, ex.frames), flush=True)
 
 
 def snap_idr(out=None, max_age=IDR_MAX_AGE, timeout=5.0):
