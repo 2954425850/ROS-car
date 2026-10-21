@@ -12,6 +12,14 @@
 发布:
   /battery_voltage  std_msgs/Float32    V（1Hz）
   /chassis_faults   std_msgs/Int32      固件 fault 位（变化即发并打日志）
+  /wheel_odom       nav_msgs/Odometry   odom→base_footprint，~50Hz（每帧 0x55 一条）；航向默认用陀螺积分
+  /imu/data_raw     sensor_msgs/Imu     只有 angular_velocity.z 可信（同老驱动：不发 orientation）
+  /driver_fault     std_msgs/Int16MultiArray [fault, 0, 0, dropped] —— 与老驱动同格式（语音/云端读 data[0]）
+  /yaw_loop         std_msgs/Float32MultiArray [wz_ref, wz_meas, wz_out, I]（偏航闭环诊断）
+  TF odom→base_footprint（publish_odom_tf，默认开；以后上 EKF 时关掉、由 EKF 发）
+  ★ 2026-10-21：以上四个话题 + TF + 偏航闭环原来在 l150pro_ws 的老驱动里，
+    老驱动不会说机械臂协议、和本节点抢串口，一直关着 ⇒ 语音的 car_move/car_turn
+    一直拿不到反馈。现在并进本节点，老驱动退役。
   /arm/feedback     sensor_msgs/JointState  0x56 实测回读（**25Hz**；0=该拍没读到）
      ⚠️ 2026-10-01 之前这里写的是 10Hz —— 那是**发布定时器**的限制，不是固件的：
      固件 `ARM_RATE_HZ=50`、0x56 每 2 拍发一次 = ~25Hz，被 10Hz 的定时器砍掉了 3/5 的帧。
@@ -27,13 +35,20 @@ import time
 import rclpy
 import serial
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Float32, Int32
+from geometry_msgs.msg import TransformStamped, Twist
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu, JointState
+from std_msgs.msg import Bool, Float32, Float32MultiArray, Int16MultiArray, Int32
 from std_srvs.srv import Trigger
+from tf2_ros import TransformBroadcaster
 
+from .odometry import OdomIntegrator
 from .protocol import (ARM_BASE_MAX, ARM_GRIP_MAX, ARM_JOINT_MAX, ARM_JOINT_NAMES,
                        UplinkParser, build_arm, build_chassis, fault_names)
+from .yaw_loop import YawLoopConfig, YawRateLoop
+
+FAULT_UNDERVOLT = 0x01
+FAULT_IMU = 0x08
 
 CTRL_WAIT_MAX_S = 25.0       # 等固件报 control-live 的兜底上限（回位最长约 17s）
 CMD_STALE_S = 0.5            # /cmd_vel 超时视为上游死亡 → 零速
@@ -71,6 +86,7 @@ class RxWorker(threading.Thread):
         self.ser = None
         self.wlock = threading.Lock()
         self._last_open_err = 0.0
+        self.on_t55 = None       # 回调 (dict, rx_monotonic)；在本线程、不持 state.lock 时调
 
     def _try_open(self):
         try:
@@ -106,6 +122,8 @@ class RxWorker(threading.Thread):
             buf.extend(data)
             try:
                 for kind, d in UplinkParser.feed(buf):
+                    if kind == 't55' and self.on_t55 is not None:
+                        self.on_t55(d, time.monotonic())
                     st = self.state
                     with st.lock:
                         if kind == 't55':
@@ -187,6 +205,30 @@ class L150ProDriverNode(Node):
         self.declare_parameter('max_vx', 0.5)
         self.declare_parameter('max_wz', 1.5)
 
+        # —— 里程计（2026-10-21 从 l150pro_ws 老驱动并过来，参数名照旧）——
+        self.declare_parameter('frame_id_odom', 'odom')
+        self.declare_parameter('frame_id_base', 'base_footprint')
+        self.declare_parameter('frame_id_imu', 'imu_link')
+        self.declare_parameter('publish_odom_tf', True)
+        self.declare_parameter('odom_yaw_source', 'gyro')    # gyro | wheel，见 odometry.py
+        self.declare_parameter('track_eff', 1.0)             # 仅 odom_yaw_source=wheel 用；未标定
+        self.declare_parameter('wheel_scale', 1.0)
+        self.declare_parameter('odom_vx_variance', 1.0e-2)
+        self.declare_parameter('odom_wz_variance', 1.0e-2)
+
+        # —— 陀螺偏航速率闭环（yaw_loop.py；参数与老驱动同名同值）——
+        # ★ 默认**关**（老驱动默认开）：老驱动的符号验证是在旧固件上做的，V2.0 机械臂版
+        #   固件的 gz 符号还没在本车上验过 —— 判反就是正反馈（见 yaw_loop.py【安全】）。
+        #   另外它会改变 PS2 手感（转向从"只转到 ~50%"变成"按指令转"）。
+        #   验证：yaw_loop_enable=false 时发 wz=+0.2，看 /yaw_loop 的 wz_meas 是否同号。
+        self.declare_parameter('yaw_loop_enable', False)
+        self.declare_parameter('yaw_loop_kp', 0.2)
+        self.declare_parameter('yaw_loop_ki', 0.2)
+        self.declare_parameter('yaw_loop_max_wz_out', 2.0)
+        self.declare_parameter('yaw_loop_i_clamp_frac', 1.5)
+        self.declare_parameter('yaw_loop_out_rate_limit', 6.0)
+        self.declare_parameter('yaw_loop_min_voltage', 10.5)
+
         self.pub_voltage = self.create_publisher(Float32, 'battery_voltage', 10)
         self.pub_faults = self.create_publisher(Int32, 'chassis_faults', 10)
         self.pub_fb = self.create_publisher(JointState, 'arm/feedback', 10)
@@ -203,8 +245,26 @@ class L150ProDriverNode(Node):
         self.sub_estop = self.create_subscription(Bool, 'estop', self.on_estop, 10)
         self.srv_rehome = self.create_service(Trigger, 'arm/rehome', self.on_rehome)
 
+        self.pub_odom = self.create_publisher(Odometry, 'wheel_odom', 10)
+        self.pub_imu = self.create_publisher(Imu, 'imu/data_raw', 10)
+        self.pub_driver_fault = self.create_publisher(Int16MultiArray, 'driver_fault', 10)
+        self.pub_yaw_loop = self.create_publisher(Float32MultiArray, 'yaw_loop', 10)
+        self.tf_bc = TransformBroadcaster(self)
+
+        # 串口线程（喂陀螺/积分里程计）与 chassis_tick（闭环 step）共用
+        self.ctl_lock = threading.Lock()
+        self.odom = OdomIntegrator()
+        self.yaw_loop = YawRateLoop(self._yaw_loop_config())
+        self.latest55 = None
+        self.last55_tick = None
+        self.dropped55 = 0
+        self.yaw_trip_logged = None
+        self.t55_err_at = 0.0
+        self.t_start = time.monotonic()   # 串口线程一起来就会用到（odom 协方差），必须在 rx.start() 前
+
         self.state = SerialState()
         self.rx = RxWorker(path, baud, self.state)
+        self.rx.on_t55 = self.on_t55
         self.rx.start()
         self.create_timer(1.0 / 25.0, self.chassis_tick)
         # ★ 2026-10-01：**0.1 → 1/25**。
@@ -234,7 +294,6 @@ class L150ProDriverNode(Node):
         self.low_volt_warned = False
         self.no55_warned = False
         self.arm_offline_warned = False
-        self.t_start = time.monotonic()
         self._last_volt_pub = 0.0
 
         self.get_logger().info(f'l150pro_driver_node 启动：串口 {path} @{baud}, arm_t_ms={self.arm_t_ms}')
@@ -307,17 +366,143 @@ class L150ProDriverNode(Node):
         self.get_logger().info('re-home 已下发（五关节回出厂姿态 + 底座重锚回中）')
         return resp
 
+    # —— 0x55：里程计 / IMU / 陀螺喂闭环（串口线程里调）——
+    def on_t55(self, d, rx_time):
+        try:
+            self._handle_t55(d, rx_time)
+        except Exception as e:      # 发布出错不能把串口解析一起带崩
+            if rx_time - self.t55_err_at > 5.0:
+                self.t55_err_at = rx_time
+                self.get_logger().error(f'0x55 处理异常: {e}')
+
+    def _handle_t55(self, d, rx_time):
+        tick = d['tick_ms']
+        if self.last55_tick is not None:
+            delta = (tick - self.last55_tick) & 0xFFFFFFFF
+            if delta > 30:                       # 标称 20ms 一帧
+                self.dropped55 += max(0, delta // 20 - 1)
+        self.last55_tick = tick
+
+        with self.ctl_lock:
+            self.latest55 = d
+            self.yaw_loop.update_gyro(d['gz'], rx_time)
+            vx, wz = self.odom.update(
+                d['wheels'], d['gz'], rx_time,
+                track_eff=float(self.get_parameter('track_eff').value),
+                wheel_scale=float(self.get_parameter('wheel_scale').value),
+                yaw_source=str(self.get_parameter('odom_yaw_source').value))
+            x, y = self.odom.x, self.odom.y
+            qz, qw = self.odom.quaternion_z_w()
+
+        # 用【接收时刻】做时间戳：固件 tick 与 Pi 时钟不同源（同老驱动）
+        stamp = self.get_clock().now().to_msg()
+        f_odom = self.get_parameter('frame_id_odom').value
+        f_base = self.get_parameter('frame_id_base').value
+
+        od = Odometry()
+        od.header.stamp = stamp
+        od.header.frame_id = f_odom
+        od.child_frame_id = f_base
+        od.pose.pose.position.x = x
+        od.pose.pose.position.y = y
+        od.pose.pose.orientation.z = qz
+        od.pose.pose.orientation.w = qw
+        od.twist.twist.linear.x = vx
+        od.twist.twist.angular.z = wz
+        od.twist.covariance[0] = float(self.get_parameter('odom_vx_variance').value)
+        od.twist.covariance[7] = 1.0e3            # 差速车无横移
+        od.twist.covariance[35] = float(self.get_parameter('odom_wz_variance').value)
+        drift = max(1e-4, (rx_time - self.t_start) * 1e-5)
+        od.pose.covariance[0] = drift
+        od.pose.covariance[7] = drift
+        od.pose.covariance[35] = max(drift, 1.0e-2)
+        self.pub_odom.publish(od)
+
+        if self.get_parameter('publish_odom_tf').value:
+            tf = TransformStamped()
+            tf.header.stamp = stamp
+            tf.header.frame_id = f_odom
+            tf.child_frame_id = f_base
+            tf.transform.translation.x = x
+            tf.transform.translation.y = y
+            tf.transform.rotation.z = qz
+            tf.transform.rotation.w = qw
+            self.tf_bc.sendTransform(tf)
+
+        im = Imu()
+        im.header.stamp = stamp
+        im.header.frame_id = self.get_parameter('frame_id_imu').value
+        im.angular_velocity.z = d['gz']
+        im.angular_velocity_covariance[0] = -1.0   # 协议只有 gz
+        im.angular_velocity_covariance[4] = -1.0
+        im.angular_velocity_covariance[8] = 1.0e-3
+        im.linear_acceleration_covariance[0] = -1.0
+        im.orientation_covariance[0] = -1.0        # yaw 纯陀螺积分会漂，不发姿态
+        self.pub_imu.publish(im)
+
+        df = Int16MultiArray()
+        df.data = [int(d['faults']), 0, 0, min(int(self.dropped55), 32767)]
+        self.pub_driver_fault.publish(df)
+
+    # —— 偏航闭环 ——
+    def _yaw_loop_config(self):
+        return YawLoopConfig(
+            kp=float(self.get_parameter('yaw_loop_kp').value),
+            ki=float(self.get_parameter('yaw_loop_ki').value),
+            max_wz_out=float(self.get_parameter('yaw_loop_max_wz_out').value),
+            i_clamp_frac=float(self.get_parameter('yaw_loop_i_clamp_frac').value),
+            out_rate_limit=float(self.get_parameter('yaw_loop_out_rate_limit').value),
+            dt_nominal=1.0 / 25.0,
+        )
+
+    def _yaw_loop_allowed(self):
+        """**调用时必须持有 ctl_lock**。门控条件同老驱动 `_yaw_loop_allowed`。"""
+        if self.estop or not self.get_parameter('yaw_loop_enable').value:
+            return False
+        d = self.latest55
+        if d is None or d['faults'] & (FAULT_IMU | FAULT_UNDERVOLT):
+            return False
+        return d['voltage_mv'] / 1000.0 >= float(
+            self.get_parameter('yaw_loop_min_voltage').value)
+
+    def _log_yaw_trip(self, reason):
+        if not reason:
+            self.yaw_trip_logged = None
+            return
+        if reason == self.yaw_trip_logged:
+            return
+        self.yaw_trip_logged = reason
+        if reason == 'stall':
+            self.get_logger().error('偏航闭环：检测到【陀螺卡死】，已退回直通 wz_ref；松杆回中解除')
+        elif reason == 'wrong_sign':
+            self.get_logger().error('偏航闭环：检测到【陀螺符号与指令相反】（正反馈），'
+                                    '已退回直通；先确认符号再用闭环！')
+
     # —— 定时器 ——
     def chassis_tick(self):
         now = time.monotonic()
         if self.estop or (now - self.tw_time) > CMD_STALE_S:
-            vx = wz = 0.0
+            vx = wz_ref = 0.0
         else:
             # 限幅值每拍现读一次 ⇒ `ros2 param set` 立刻生效（默认仍是冻结版的 0.5/1.5）
             lim_vx = float(self.get_parameter('max_vx').value)
             lim_wz = float(self.get_parameter('max_wz').value)
             vx = min(max(self.tw.linear.x, -lim_vx), lim_vx)
-            wz = min(max(self.tw.angular.z, -lim_wz), lim_wz)
+            wz_ref = min(max(self.tw.angular.z, -lim_wz), lim_wz)
+        # 闭环在零速分支里也要 step（allowed=False ⇒ 直通并清状态），
+        # 否则急停/超时期间它还攥着旧积分，解除时冲出去。
+        with self.ctl_lock:
+            self.yaw_loop.cfg = self._yaw_loop_config()
+            wz = self.yaw_loop.step(wz_ref, now, allowed=self._yaw_loop_allowed())
+            diag = (wz_ref, self.yaw_loop.wz_meas, wz, self.yaw_loop.integral)
+            trip = self.yaw_loop.trip_reason
+        if self.estop:
+            wz = 0.0
+        self._log_yaw_trip(trip)
+        ym = Float32MultiArray()
+        ym.data = [float(diag[0]), float('nan') if diag[1] is None else float(diag[1]),
+                   float(diag[2]), float(diag[3])]
+        self.pub_yaw_loop.publish(ym)
         self.seq_aa = (self.seq_aa + 1) & 0xFF
         self.rx.send(build_chassis(int(round(vx * 1000)), 0, int(round(wz * 1000)),
                                    0x03 if self.estop else 0x01, self.seq_aa))

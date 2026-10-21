@@ -11,7 +11,7 @@
        p6(int16 -1000..+1000 底座连续角度 field=deg*1000/360, 跨圈不 mod)
        t_ms(uint16) flags(bit0=re-home 边沿触发) seq
 上行:
-  0x55 28B 底盘遥测(电压 mV @22, fault @24)
+  0x55 28B 底盘遥测 ~50Hz(tick@2, 四轮速@6, roll/pitch/yaw@14, gz@20, 电压 mV @22, fault @24)
   0x56 22B 机械臂反馈(a1..a5@2, a6@12, pot@14, status@16[bit0 ONLINE bit7 ESTOP],
             base_st@17, ctrl_live@19[1=固件在 INIT_READY，0=归位/上电中不消费 0xAC])
   0x57 变长 透传回包（本节点不使用，仅跳过）
@@ -56,10 +56,22 @@ def build_arm(p1, p2, p3, p4, p5, base, t_ms: int, flags: int, seq: int) -> byte
 
 
 def _parse_t55(f: bytes) -> dict:
+    """0x55 与老固件（l150pro_ws/protocol.py `parse_uplink_frame`）同一布局：
+    tick(u32) vA vB vC vD(mm/s) roll pitch yaw(rad×1e4) gz(mrad/s) 电压(mV) fault seq。
+    yaw 是纯陀螺积分、回绕到 ±π，**会漂**；gz 是陀螺原始量，可信。
+    A/B 是左侧轮、C/D 是右侧轮（已极性校正为物理前进速度）。"""
+    (tick, va, vb, vc, vd, roll, pitch, yaw, gz,
+     voltage, fault, seq) = struct.unpack_from('<IhhhhhhhhHBB', f, 2)
     return {
-        'tick_ms': struct.unpack_from('<I', f, 2)[0],
-        'voltage_mv': struct.unpack_from('<H', f, 22)[0],
-        'faults': f[24],
+        'tick_ms': tick,
+        'wheels': (va / 1000.0, vb / 1000.0, vc / 1000.0, vd / 1000.0),
+        'roll': roll / 10000.0,
+        'pitch': pitch / 10000.0,
+        'yaw': yaw / 10000.0,
+        'gz': gz / 1000.0,
+        'voltage_mv': voltage,
+        'faults': fault,
+        'seq': seq,
     }
 
 
