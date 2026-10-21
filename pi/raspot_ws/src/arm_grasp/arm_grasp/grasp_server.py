@@ -46,10 +46,7 @@ REC_MAX_AGE_S = 1.5       # 结果记录超过这么老就不用（同 observe.f
 
 # 上电复位位姿：p2(腕旋) p3(腕俯) p4(小臂) p5(大臂) base。夹爪 p1 保持当前闭合值不回。
 # 值来自开机时 ps2_teleop 按实际位姿初始化的 targets=[214,496,180,129,415,3]。
-HOME_JOINTS = (496.0, 180.0, 129.0, 415.0, 0.0)
-HOME_STEP = 20.0          # 回位时限速：每拍每关节最多多少 counts（@10Hz）
-HOME_TOL = 3.0            # 到位判据
-HOME_MAX_S = 12.0
+HOME_JOINTS = (496.0, 180.0, 129.0, 415.0, 0.0)   # 复位位姿 p2..p5, base（判到位用）
 
 
 class _Abort(Exception):
@@ -239,34 +236,69 @@ class GraspServer(Node):
         return resp
 
     def _go_home(self):
-        """回到上电复位位姿，**夹爪保持闭合**（用户 2026-10-21）。流式限速，超时兜底。"""
-        grip = self._grip_last if self._grip_last and self._grip_last > 0 else 500.0
-        tgt = [grip] + list(HOME_JOINTS)
-        end = time.monotonic() + HOME_MAX_S
-        self.get_logger().info(f'go_home：目标 [grip={grip:.0f}, '
-                               f'{", ".join("%.0f" % v for v in HOME_JOINTS)}]')
+        """回到上电复位位姿，**夹爪保持闭合** —— 走固件 re-home（flags bit1）。
+
+        固件 2026-10-21 加了 ROS_ARM_FLAG_KEEP_GRIPPER(0x02)：这一帧夹爪不收到复位指令，
+        其余 4 关节 + 底座照常回位。上位机把驱动的 rehome_keep_gripper 置 true 再调
+        /arm/rehome，完了置回 false（平时 re-home 仍是完整复位、松爪）。
+        """
+        from rcl_interfaces.srv import SetParameters
+        from std_srvs.srv import Trigger
+        name = self.get_parameter('driver_node').value
+        set_cli = self.create_client(SetParameters, f'/{name}/set_parameters')
+        re_cli = self.create_client(Trigger, 'arm/rehome')
+        try:
+            if not set_cli.wait_for_service(timeout_sec=2.0):
+                raise _Abort('ERROR', f'{name} 参数服务不在，回不了位')
+            self._set_param(set_cli, 'rehome_keep_gripper', True)
+            try:
+                if not re_cli.wait_for_service(timeout_sec=2.0):
+                    raise _Abort('ERROR', 'arm/rehome 服务不在')
+                fut = re_cli.call_async(Trigger.Request())
+                end = time.monotonic() + 3.0
+                while not fut.done() and time.monotonic() < end:
+                    time.sleep(0.02)
+                if not fut.done() or not fut.result().success:
+                    raise _Abort('ERROR', 'arm/rehome 没回成功')
+            finally:
+                self._set_param(set_cli, 'rehome_keep_gripper', False)
+            self._wait_home_done()
+        finally:
+            self.destroy_client(set_cli)
+            self.destroy_client(re_cli)
+
+    def _set_param(self, cli, name, value):
+        from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+        req = cli.srv_type.Request()
+        pv = ParameterValue()
+        pv.type = ParameterType.PARAMETER_BOOL
+        pv.bool_value = bool(value)
+        req.parameters = [Parameter(name=name, value=pv).to_parameter_msg()]
+        fut = cli.call_async(req)
+        end = time.monotonic() + 2.0
+        while not fut.done() and time.monotonic() < end:
+            time.sleep(0.02)
+        if not fut.done() or not all(r.successful for r in fut.result().results):
+            raise _Abort('ERROR', f'设参数 {name} 失败')
+
+    def _wait_home_done(self, timeout=20.0):
+        """等归位结束：回读稳定在复位位姿。归位期间回读是固件总线计数器（假值），
+        稳定下来 = 交棒回 READY。"""
+        import math as _m
+        good = 0
+        end = time.monotonic() + timeout
         while time.monotonic() < end:
             self.check_abort()
             fb = self.fb
-            if not _stable(fb):
-                time.sleep(0.05)
-                continue
-            f = [float(v) for v in fb]
-            grip = self._grip_last if (self._grip_last and self._grip_last > 0) else grip
-            out = [grip]
-            done = True
-            for i in range(1, 6):
-                d = tgt[i] - f[i]
-                if abs(d) <= HOME_TOL:
-                    out.append(tgt[i])
-                else:
-                    out.append(f[i] + (HOME_STEP if d > 0 else -HOME_STEP))
-                    done = False
-            self.publish_arm(out)
-            if done:
-                return
-            time.sleep(0.1)
-        self.get_logger().warn('go_home 超时（%.0fs），臂停在半路' % HOME_MAX_S)
+            if _stable(fb):
+                ok = (abs(fb[1] - HOME_JOINTS[0]) <= 25 and abs(fb[4] - HOME_JOINTS[3]) <= 25
+                      and abs(fb[5]) <= 30)
+                good = good + 1 if ok else 0
+                if good >= 5:
+                    self.get_logger().info('go_home 到位：%s' % [round(v, 1) for v in fb])
+                    return
+            time.sleep(0.2)
+        self.get_logger().warn('go_home 等归位超时（%.0fs），夹爪已保持，臂位姿未确认' % timeout)
 
     def _feedback(self, gh, phase, detail):
         fb = Grasp.Feedback()

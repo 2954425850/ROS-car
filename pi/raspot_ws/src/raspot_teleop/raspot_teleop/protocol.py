@@ -27,6 +27,10 @@ ARM_GRIP_MAX = 600
 ARM_JOINT_MAX = 1000
 ARM_BASE_MAX = 1000          # ±360°, 0.36°/count
 
+# re-home 的 flags（0xAC 第 9 字节）
+ARM_FLAG_REHOME = 0x01         # 边沿触发复位（五关节回 ARM_RESET_POSE + 底座回中）
+ARM_FLAG_KEEP_GRIPPER = 0x02   # bit1：这次复位**夹爪(ID1)不动**，其余关节照常回位（固件 2026-10-21 加）
+
 
 def crc16(data: bytes) -> int:
     crc = 0xFFFF

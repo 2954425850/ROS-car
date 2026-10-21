@@ -44,7 +44,8 @@ from std_srvs.srv import Trigger
 from tf2_ros import TransformBroadcaster
 
 from .odometry import OdomIntegrator
-from .protocol import (ARM_BASE_MAX, ARM_GRIP_MAX, ARM_JOINT_MAX, ARM_JOINT_NAMES,
+from .protocol import (ARM_BASE_MAX, ARM_FLAG_KEEP_GRIPPER, ARM_FLAG_REHOME,
+                       ARM_GRIP_MAX, ARM_JOINT_MAX, ARM_JOINT_NAMES,
                        UplinkParser, build_arm, build_chassis, fault_names)
 from .yaw_loop import YawLoopConfig, YawRateLoop
 
@@ -193,6 +194,7 @@ class L150ProDriverNode(Node):
         self.declare_parameter('baud', 115200)
         self.declare_parameter('arm_t_ms', 40)
         self.declare_parameter('require_online', True)   # 烧录版固件不置 ONLINE 位时设 false
+        self.declare_parameter('rehome_keep_gripper', False)  # true = re-home 时夹爪保持（flags 0x03）
         path = self.get_parameter('serial_path').value
         baud = int(self.get_parameter('baud').value)
         self.arm_t_ms = int(self.get_parameter('arm_t_ms').value)
@@ -369,10 +371,13 @@ class L150ProDriverNode(Node):
         # 这一帧的数值会被固件在归位后用自己的影子覆盖，所以这里发当前位姿只是把
         # "五关节原地不动"这个意图写清楚；真正决定结果的是固件那两条影子赋值。
         self.seq_ac = (self.seq_ac + 1) & 0xFF
-        self.rx.send(build_arm(*self.last_joints, self.last_base, 0, 0x01, self.seq_ac))
+        keep = bool(self.get_parameter('rehome_keep_gripper').value)
+        flags = ARM_FLAG_REHOME | (ARM_FLAG_KEEP_GRIPPER if keep else 0)
+        self.rx.send(build_arm(*self.last_joints, self.last_base, 0, flags, self.seq_ac))
         resp.success = True
-        resp.message = 're-home 已下发（与上电同流程，约 5-15 秒）'
-        self.get_logger().info('re-home 已下发（五关节回出厂姿态 + 底座重锚回中）')
+        resp.message = ('re-home 已下发（%s夹爪，约 5-15 秒）' % ('保持' if keep else '也回出厂位'))
+        self.get_logger().info('re-home 已下发 flags=0x%02x（%s）'
+                               % (flags, '保持夹爪' if keep else '五关节回出厂 + 底座回中'))
         return resp
 
     # —— 0x55：里程计 / IMU / 陀螺喂闭环（串口线程里调）——
