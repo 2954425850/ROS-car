@@ -1,0 +1,19 @@
+[Unit]
+Description=K230 结果流 → ROS 话题（/k230/result, /k230/detections）
+# 数据来自 k230-resultd 的本机 UDP 转发；resultd 没起本节点也只是空转
+After=k230-resultd.service network-online.target
+Wants=k230-resultd.service
+
+[Service]
+Type=simple
+User=cy
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/cy/ROS-car/pi/raspot_ws/install/setup.bash && exec ros2 run k230_ros bridge_node'
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/cy
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

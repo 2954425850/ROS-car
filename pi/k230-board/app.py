@@ -463,6 +463,7 @@ def main():
             if time.ticks_diff(now, nxt) >= 0:
                 nxt = now + period
                 img = cam.sensor.snapshot(chn=CAM_CHN_ID_2)
+                cap_tick_ms = time.ticks_ms()     # 拍摄时刻（见 results.encode 的 cap_tick）
                 if img is not None:
                     arr = img.to_numpy_ref()
                     objs = det.detect(arr)
@@ -680,7 +681,8 @@ def main():
                     ts_ms = int(time.time() * 1000)   # 平台限制：只有秒级精度（见文件头第 3 条）
                     tick_ms = time.ticks_ms()         # 单调毫秒，供 Pi 对齐 ToF/雷达
                     payload = encode(objs + t_objs, config.WIDTH, config.HEIGHT,
-                                     frame_no, ts_ms, faces=fobjs, tick_ms=tick_ms)
+                                     frame_no, ts_ms, faces=fobjs, tick_ms=tick_ms,
+                                     cap_tick_ms=cap_tick_ms)
                     if not r_pi.ok:
                         r_pi.connect()
                     r_pi.send(payload)

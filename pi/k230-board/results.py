@@ -16,7 +16,8 @@
 import ujson
 
 
-def encode(objs, width, height, frame_no, ts_ms, faces=None, tick_ms=None):
+def encode(objs, width, height, frame_no, ts_ms, faces=None, tick_ms=None,
+           cap_tick_ms=None):
     """打包成 JSON bytes，直接可以往 socket 里写。
 
     `faces` 可选，**单独一个数组，不混进 `objs`** ——
@@ -35,6 +36,11 @@ def encode(objs, width, height, frame_no, ts_ms, faces=None, tick_ms=None):
     `time.time()` 只有秒级精度（见 app.py 文件头第 3 条），所以 `ts` 是秒级。
     `tick_ms` 是 `time.ticks_ms()` 的**单调**毫秒，用来在 Pi 侧对齐 ToF/雷达等
     其他传感器的相对时间；`tick_ms` 传给 Pi 后别再换算成墙钟时间。
+
+    **`cap_tick`（2026-10-21 加）：** `tick` 是**发送前**才取的，和抓图之间隔着整段
+    推理（检测 + 跟踪 + 5Hz 的人脸，几十到上百 ms）。要和 ToF/手臂姿态对齐的是
+    "这帧图是什么时候拍的"，所以另发 `cap_tick` = `snapshot()` 刚返回时的 ticks_ms。
+    Pi 侧（k230_bridge）用 `tick` 估板/Pi 时钟偏差，用 `cap_tick` 换算拍摄时刻。
     """
     d = {
         "ts": ts_ms,
@@ -45,6 +51,8 @@ def encode(objs, width, height, frame_no, ts_ms, faces=None, tick_ms=None):
     }
     if tick_ms is not None:
         d["tick"] = tick_ms
+    if cap_tick_ms is not None:
+        d["cap_tick"] = cap_tick_ms
     if faces is not None:
         d["faces"] = faces
     return ujson.dumps(d).encode()

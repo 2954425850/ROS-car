@@ -37,6 +37,9 @@ DECODER = "avdec_h264"
 OUT_DIR = "/tmp/k230"
 LATEST_JPEG = os.path.join(OUT_DIR, "latest.jpg")
 LATEST_RESULT = os.path.join(OUT_DIR, "latest-result.json")
+# 每条结果原样（加 _rx_mono）再用 UDP 丢给本机的 k230_bridge（ROS 话题桥）。
+# fire-and-forget：桥没起、包丢了都不影响 resultd 和 /tmp 文件这条老链路。
+BRIDGE_UDP = ("127.0.0.1", 18556)
 STATUS_FILE = os.path.join(OUT_DIR, "resultd-status.json")
 
 JPEG_QUALITY = 90
@@ -290,8 +293,10 @@ def resultd():
           "connected": False, "peer": None,
           "last_frame": None, "last_objs": None, "last_msg": None}
     _flush_status(st)
-    print("k230-resultd listening on %d (out=%s)" % (RESULT_PORT, OUT_DIR),
-          flush=True)
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.setblocking(False)
+    print("k230-resultd listening on %d (out=%s, bridge udp %s:%d)"
+          % (RESULT_PORT, OUT_DIR, BRIDGE_UDP[0], BRIDGE_UDP[1]), flush=True)
 
     while True:
         try:
@@ -334,6 +339,7 @@ def resultd():
                 break                      # 对端关闭 —— 正常事件，回去 accept
             buf += d
             t_idle = time.time()
+            t_idle_mono = time.monotonic()
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 line = line.strip()
@@ -344,15 +350,22 @@ def resultd():
                 except Exception:
                     st["bad_lines"] += 1
                     continue
+                # 收到这一行的 Pi 单调时刻：k230_bridge 拿它和板子的 tick 估时钟偏差。
+                # 尽量靠近 recv 取（同一 recv 里切出的多行会共用一个时刻 —— 偏晚，
+                # 偏差估计取窗口最小值，晚的样本自然被排除）。
+                obj["_rx_mono"] = t_idle_mono
                 st["msgs"] += 1
                 st["last_frame"] = obj.get("frame")
                 st["last_objs"] = len(obj.get("objs") or [])
                 st["last_msg"] = time.strftime("%H:%M:%S")
                 obj["_received_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 obj["_peer"] = st["peer"]
-                _atomic_write_fast(
-                    LATEST_RESULT,
-                    json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+                payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                _atomic_write_fast(LATEST_RESULT, payload)
+                try:
+                    udp.sendto(payload, BRIDGE_UDP)
+                except OSError:
+                    pass
                 if time.time() - t_status >= 1.0:
                     _flush_status(st)
                     t_status = time.time()
