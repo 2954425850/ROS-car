@@ -80,9 +80,7 @@ class ConversationContext:
         """返回可直接发给 LLM 的消息列表：system + 最近 N 轮完整历史。"""
         system = self._system_prompt
         if self._dynamic_system:
-            system = f"{system}
-
-{self._dynamic_system}" if system else self._dynamic_system
+            system = "\n\n".join(p for p in (system, self._dynamic_system) if p)
         messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         for turn in self._turns():
             messages.extend(turn)

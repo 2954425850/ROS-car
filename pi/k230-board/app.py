@@ -698,7 +698,8 @@ def main():
                               % (enroll_id, enroll_status["state"], n_got, why or ""))
                         enroll_id = None
                         enroll_feats = []
-                    if enroll_status is not None and time.ticks_diff(now, enroll_status_until) >= 0                             and enroll_id is None:
+                    if (enroll_status is not None and enroll_id is None
+                            and time.ticks_diff(now, enroll_status_until) >= 0):
                         enroll_status = None
 
                     # 增量入库后**隔一段时间**落盘 —— 别每帧写 SD（写坏卡、也拖慢循环）
