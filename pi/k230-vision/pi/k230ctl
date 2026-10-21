@@ -43,6 +43,11 @@ def cmd_snap(args):
     return 0
 
 
+def cmd_framed(args):
+    k230pi.framed()
+    return 0
+
+
 def cmd_resultd(args):
     k230pi.resultd()
     return 0
@@ -189,6 +194,9 @@ def main(argv=None):
 
     d = sub.add_parser("resultd", help="前台常驻收 K230 结果（给 systemd 用）")
     d.set_defaults(func=cmd_resultd)
+
+    fr = sub.add_parser("framed", help="常驻：收板子推来的 H.264(8555)，留最新关键帧给 snap")
+    fr.set_defaults(func=cmd_framed)
 
     q = sub.add_parser("result", help="打印最近一条视觉结果")
     q.add_argument("--json", action="store_true")

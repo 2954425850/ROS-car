@@ -1,0 +1,18 @@
+[Unit]
+Description=K230 H.264 推流接收（8555，留最新关键帧给 snap）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cy
+WorkingDirectory=/home/cy/ROS-car/pi/k230-vision/pi
+ExecStart=/usr/bin/python3 /home/cy/ROS-car/pi/k230-vision/pi/k230ctl framed
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

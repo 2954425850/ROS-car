@@ -42,6 +42,15 @@ LATEST_RESULT = os.path.join(OUT_DIR, "latest-result.json")
 # 每条结果原样（加 _rx_mono）再用 UDP 丢给本机的 k230_bridge（ROS 话题桥）。
 # fire-and-forget：桥没起、包丢了都不影响 resultd 和 /tmp 文件这条老链路。
 BRIDGE_UDP = ("127.0.0.1", 18556)
+
+# ---- framed：接住板子推到 Pi 的裸 H.264（8555），只留最新关键帧（2026-10-21）----
+# 板子 config_local 的 PUSH_HOST 本来就是 Pi，但一直没人接 ⇒ 板子每 10s 重连一次，
+# 结果流因此从 10Hz 掉到 ~6Hz。framed 接住它：**不解码**，只扫出每个 GOP 的 IDR
+# 写进内存盘（不写 SD 卡）。snap 优先解这一张（~0.2s），不再现拉 RTSP（~12s/次、常失败）。
+FRAME_PORT = 8555
+SHM_DIR = "/dev/shm/k230"
+LATEST_IDR = os.path.join(SHM_DIR, "latest-idr.h264")
+IDR_MAX_AGE = 3.0           # 关键帧超过这么久就不用（GOP=25@30fps ⇒ 正常 <1s 一张）
 STATUS_FILE = os.path.join(OUT_DIR, "resultd-status.json")
 
 JPEG_QUALITY = 90
@@ -136,6 +145,87 @@ def _count_frames_so_far(path, state):
     return state[1]
 
 
+def framed():
+    """常驻监听 FRAME_PORT，收板子的裸 H.264，把最新关键帧写到 LATEST_IDR。前台运行。"""
+    from h264_idr import IdrExtractor
+    os.makedirs(SHM_DIR, exist_ok=True)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", FRAME_PORT))
+    srv.listen(2)
+    print("k230-framed listening on %d (idr -> %s)" % (FRAME_PORT, LATEST_IDR), flush=True)
+    tmp = LATEST_IDR + ".tmp"
+    while True:
+        conn, peer = srv.accept()
+        print("connect from %s:%d" % peer, flush=True)
+        conn.settimeout(5.0)
+        ex = IdrExtractor()
+        n_bytes, t_rep, t_idle = 0, time.time(), time.time()
+        while True:
+            try:
+                d = conn.recv(65536)
+            except socket.timeout:
+                if time.time() - t_idle > 12.0:      # 板子软复位不发 FIN（同 resultd）
+                    print("idle - dropping stale conn", flush=True)
+                    break
+                continue
+            except OSError as e:
+                print("recv error: %r" % (e,), flush=True)
+                break
+            if not d:
+                break
+            t_idle = time.time()
+            n_bytes += len(d)
+            for au in ex.feed(d):
+                with open(tmp, "wb") as f:
+                    f.write(au)
+                os.replace(tmp, LATEST_IDR)
+            if time.time() - t_rep >= 60.0:
+                print("60s: %.0f kB/s, %d 张关键帧" % (n_bytes / 60.0 / 1024, ex.frames), flush=True)
+                n_bytes, t_rep = 0, time.time()
+        conn.close()
+        print("disconnect from %s:%d" % peer, flush=True)
+
+
+def snap_idr(out=None, max_age=IDR_MAX_AGE, timeout=5.0):
+    """把 framed 存下的最新关键帧解成 JPEG。没有/太旧/解码失败返回 None（调用方退回 RTSP）。"""
+    try:
+        age = time.time() - os.path.getmtime(LATEST_IDR)
+    except OSError:
+        return None
+    if age > max_age:
+        return None
+    ensure_out_dir()
+    src = os.path.join(SHM_DIR, "_snap_src.h264")
+    try:
+        with open(LATEST_IDR, "rb") as f:
+            data = f.read()
+        with open(src, "wb") as f:      # 拷一份，免得解码中途被 framed 替换
+            f.write(data)
+    except OSError:
+        return None
+    path = out or os.path.join(OUT_DIR, "snap-%s.jpg" % time.strftime("%Y%m%d-%H%M%S"))
+    tmp = path + ".part"
+    t0 = time.time()
+    cmd = ["gst-launch-1.0", "-q", "filesrc", "location=%s" % src, "!", "h264parse",
+           "!", "avdec_h264", "!", "videoconvert", "!", "jpegenc", "quality=90",
+           "!", "filesink", "location=%s" % tmp]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) < 1000:
+        return None
+    os.replace(tmp, path)
+    try:
+        import shutil
+        shutil.copyfile(path, LATEST_JPEG)
+    except OSError:
+        pass
+    return {"path": path, "frames": 1, "suspect": False, "seconds": round(time.time() - t0, 2),
+            "attempts_used": 0, "src": "idr", "idr_age_s": round(age, 2)}
+
+
 def snap(out=None, min_frames=MIN_FRAMES, timeout=DEFAULT_TIMEOUT, proto="tcp",
          attempts=DEFAULT_ATTEMPTS):
     """抓一张 JPEG。成功返回 dict；全部尝试都失败才抛 SnapError。
@@ -151,6 +241,9 @@ def snap(out=None, min_frames=MIN_FRAMES, timeout=DEFAULT_TIMEOUT, proto="tcp",
       suspect=True 表示攒到的帧数没到 min_frames（可能没跨过 IDR，画面可能不可靠）。
       **这时仍然返回文件**（总比什么都没有强），但调用方应该把它当「可能不可靠」对待。
     """
+    r = snap_idr(out=out)              # 快路：framed 的最新关键帧
+    if r is not None:
+        return r
     last = None
     for i in range(max(1, attempts)):
         try:
