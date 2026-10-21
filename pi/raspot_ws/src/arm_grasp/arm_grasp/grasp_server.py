@@ -105,7 +105,7 @@ class GraspServer(Node):
 
     def __init__(self):
         super().__init__('arm_grasp_server')
-        self.declare_parameter('alpha0_default', -58.0)
+        self.declare_parameter('alpha0_default', -75.0)      # 桌面高度的目标要 -75（-58 窗口够不着）
         self.declare_parameter('lift_m_default', 0.055)      # 用户流程：抬 5~6cm
         self.declare_parameter('grasp_arm_t_ms', 100)        # 同 grasp_once 的 --t-ms
         self.declare_parameter('normal_arm_t_ms', 40)        # 抓完还原成这个（= 驱动默认）
@@ -308,8 +308,8 @@ class GraspServer(Node):
             res.target_xyz = [float(v) for v in O]
             lvl, tgt, msg = grasp.plan_verdict(O, cfg)
             self.get_logger().info(f'O={tuple(round(v, 4) for v in O)}  S0={lvl}：{msg}')
-            if lvl == 'refuse' and tgt is None:
-                raise _Abort('OUT_OF_REACH', f'目标点够不着：{msg}')
+            # S0 只做参考、不拦（用户 2026-10-21：防御判据导致的失败没必要）。
+            # 真够不着时 aim 相会铺满 α 包络再试，还不行才以 OUT_OF_REACH 收场。
             if g.dry_run:
                 res.ok, res.code, res.reason = True, 'OK', f'dry-run：可行（{lvl}：{msg}）'
                 gh.succeed()
@@ -323,6 +323,9 @@ class GraspServer(Node):
                             log=lambda *a: self._log_run(gh, ' '.join(str(x) for x in a)))
             res.ok = bool(rep.get('ok'))
             res.code = code_for(rep.get('stopped'), res.ok)
+            done = [ph for ph, _r, _n in rep.get('phases') or []]
+            if res.code == 'REFUSED' and 'aim' not in done:
+                res.code = 'OUT_OF_REACH'      # 对准都没完成 ⇒ 这个点臂够不着（车臂联动看这个）
             res.reason = rep.get('stopped') or '超过最大拍数'
             try:
                 res.err_m = float(rep.get('err_m'))

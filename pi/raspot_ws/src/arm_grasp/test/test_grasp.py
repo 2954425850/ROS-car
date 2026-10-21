@@ -921,27 +921,29 @@ def test_descend_closes_when_s_stop_unreachable_but_gripper_is_on_target(monkeyp
     assert [p[0] for p in rep['phases']] == ['aim', 'descend', 'close', 'lift'], rep['phases']
     assert rep['ok'], rep['stopped']
     assert '机械极限' in rep['phases'][1][1], rep['phases'][1]
-    assert '合爪窗口' in rep['phases'][1][1]
+    assert '就地合爪' in rep['phases'][1][1]
 
 
-def test_descend_close_fallback_can_be_disabled(monkeypatch):
-    """`close_reach_m=0` = 关掉兜底：同样的"只在 s_stop 无解"必须原样 refuse。"""
+def test_descend_closes_in_place_when_refused_midway(monkeypatch):
+    """★ 2026-10-21 用户：位置合适就直接夹，别因防御判据整轮失败。
+    真机 s=16mm 处无解（还没到 s_stop、也不看离目标多远）⇒ 也必须就地合爪、抬起，ok。"""
     start = _start_joints(s_m=0.08)
-    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900,
-                          close_reach_m=0.0)
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900)
     real = grasp.pick_target
 
     def fake(O, c, s, prefer, vis=None, span=None, balance=False):
-        if span is not None and s <= c.s_stop_m + 1e-9:
-            raise Refused('模拟：s_stop 处无可行姿态')
+        if span is not None and s <= 0.03:
+            raise Refused('模拟：s=30mm 以下无可行姿态')
         return real(O, c, s, prefer, vis, span, balance)
 
     monkeypatch.setattr(grasp, 'pick_target', fake)
-    rep = grasp.run(cfg, BoxLink(Plant(start), CAP), phase='all',
-                    initial_point=CAP, log=lambda *_: None)
-    assert rep['ok'] is False
-    assert (rep['stopped'] or '').startswith('refuse'), rep['stopped']
+    plant = Plant(start)
+    link = BoxLink(plant, CAP, grip_block=400.0)
+    rep = grasp.run(cfg, link, phase='all', initial_point=CAP, log=lambda *_: None)
 
+    assert [p[0] for p in rep['phases']] == ['aim', 'descend', 'close', 'lift'], rep['phases']
+    assert rep['ok'], rep['stopped']
+    assert '就地合爪' in rep['phases'][1][1]
 
 
 # ---- 2026-10-21: 接近相贴住后冻结 O（治"上方原地抖"）------------------------------

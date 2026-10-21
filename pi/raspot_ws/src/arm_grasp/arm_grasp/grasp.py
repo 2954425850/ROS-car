@@ -490,6 +490,7 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
     j_prev_cmd = None     # 上一拍的**未补偿**关节指令（限速的起点，见 ④）
     phase_ticks = 0       # 本相已走几拍
     aim_hold = False      # 'aim' 相：已贴到目标 ⇒ 冻结 O 与 α（见 cfg.aim_hold_m）
+    wide_tried = False    # 'aim' 相：α0 窗口无解时铺满包络重试过没有（只试一次）
 
     def advance_or_stop(reason):
         """本相结束：有下一相就切过去（返回 True 继续），最后一相就定稿（返回 False）。
@@ -679,23 +680,32 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
             #   2026-10-21 真机：s=25mm 处 α=−79° 无解（shoulder 要 872/875），
             #   但臂实际停在 40.6mm、爪尖离目标点 16.2mm，爪已套在黄椒上。
             #   旧行为是整轮 refuse、臂已经到位却不合爪 —— 用户明确说这是 bug。
-            if cur == 'descend' and s_cmd <= cfg.s_stop_m + 1e-9:
-                # ★ 判据是"爪尖离 **s_stop 目标点** 多远"，不是离 O —— 离 O 的距离里
-                #   还含着整段沿轴留量（真机 s_ach≈50mm），拿它比 30mm 永远不会触发
-                #   （2026-10-21 第一次上机就是栽在这：err_act=26.3mm 已经能夹，
-                #   但 dist(tip,O)≈51mm > 30mm ⇒ 兜底没进，仍然整轮 refuse）。
+            # ★★★ 2026-10-21 用户：「位置刚好，直接夹就行，防御措施导致失败没必要」。
+            #   之前只在下扎到 s_stop 地板、且爪尖离目标 ≤ close_reach 时才兜底合爪；
+            #   真机 s=16mm 处无解（臂已对准、爪尖离目标 13.7mm）却整轮 refuse。
+            #   现在：**下扎途中任何一处解不出更深的姿态 ⇒ 就地合爪**，不再看距离。
+            if cur == 'descend':
                 T_stop = axis_point(O_u, cfg.s_stop_m, prev_alpha)
                 err_now = math.dist(tip_open_m(j_cur_m), T_stop)
-                if err_now <= cfg.close_reach_m:
-                    if not advance_or_stop(
-                            '下扎到机械极限：s=%.1fmm 处无可行姿态（%s）；'
-                            '爪尖离 s_stop 目标点 %.1fmm ≤ 合爪窗口 %.0fmm ⇒ 直接合爪'
-                            % (s_cmd * 1000.0, e, err_now * 1000.0,
-                               cfg.close_reach_m * 1000.0)):
-                        break
-                    continue
-            rep['stopped'] = 'refuse：%s' % e
-            break
+                if not advance_or_stop(
+                        '下扎到机械极限：s=%.1fmm 处无可行姿态（%s）；爪尖离 s_stop 目标点 %.1fmm ⇒ 就地合爪'
+                        % (s_cmd * 1000.0, e, err_now * 1000.0)):
+                    break
+                continue
+            # 对准阶段在 α0±alpha_span 窗口里解不出 ⇒ 先把窗口铺满整个包络再试一次，
+            # 别因为种子 α0 选得不好就整轮放弃（2026-10-21：α0=-58 窗口无解，-75 就行）。
+            if cur == 'aim' and not aim_hold and not wide_tried:
+                wide_tried = True
+                try:
+                    tgt = pick_target(O_u, cfg, s_cmd, prev_alpha,
+                                      span=cfg.alpha_hi - cfg.alpha_lo, balance=True)
+                    log('  [aim] α0 窗口无解，铺满包络后找到 α=%.1f°' % tgt.alpha)
+                except Refused as e2:
+                    rep['stopped'] = 'refuse：%s' % e2
+                    break
+            else:
+                rep['stopped'] = 'refuse：%s' % e
+                break
         if cur != 'close':
             prev_alpha = tgt.alpha
         # 合爪/抬起期间**夹爪保持闭合**（抬起时张开 = 把东西放回去 ✗）
