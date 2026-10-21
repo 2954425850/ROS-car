@@ -268,12 +268,10 @@ class GraspServer(Node):
             self.destroy_client(re_cli)
 
     def _set_param(self, cli, name, value):
-        from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+        # Parameter 是顶部的 rclpy.parameter.Parameter（有 to_parameter_msg()），
+        # 不是 rcl_interfaces.msg.Parameter（那个没有，2026-10-21 踩过）。
         req = cli.srv_type.Request()
-        pv = ParameterValue()
-        pv.type = ParameterType.PARAMETER_BOOL
-        pv.bool_value = bool(value)
-        req.parameters = [Parameter(name=name, value=pv).to_parameter_msg()]
+        req.parameters = [Parameter(name=name, value=bool(value)).to_parameter_msg()]
         fut = cli.call_async(req)
         end = time.monotonic() + 2.0
         while not fut.done() and time.monotonic() < end:
