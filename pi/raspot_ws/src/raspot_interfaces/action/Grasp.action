@@ -1,0 +1,21 @@
+# 视觉抓取（arm_grasp/grasp_server）。一次 = 锁框 → 对准 → 下扎 → 合爪 → 抬起，抓完臂停在抬起位。
+# ---- Goal ----
+float32[] box             # 目标框，归一化 l,t,r,b（1280x720 推流系）；必填
+float32 alpha0            # 接近轴初始角（度）；0 = 用服务端参数 alpha0_default
+float32 lift_m            # 抬起高度（米）；0 = 用服务端参数 lift_m_default
+bool dry_run              # true = 只锁框/算目标点/判可行性，不动臂
+---
+# ---- Result ----
+bool ok
+string code               # OK | BAD_GOAL | BUSY | LOCK_FAILED | NO_FEEDBACK | NO_TARGET | NO_DEPTH
+                          # | OUT_OF_REACH | REFUSED | TIMEOUT | CLOSE_TIMEOUT | STUCK | OBS_LOST
+                          # | CANCELED | ABORTED_BY_OPERATOR | ESTOP | ERROR
+string reason             # 人话原因（中文）
+bool target_valid         # 下面的目标点有没有算出来
+float64[3] target_xyz     # 目标点 O（米），坐标系见 frame_id —— 车臂联动按它决定车往哪挪
+string frame_id           # "arm_base"（机械臂安装面坐标系；到 base_link 的静态 TF 以后补）
+float32 err_m             # 结束时爪尖到目标的误差
+---
+# ---- Feedback ----
+string phase              # preflight | aim | descend | close | lift
+string detail

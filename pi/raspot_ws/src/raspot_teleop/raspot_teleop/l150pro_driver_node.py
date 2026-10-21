@@ -349,7 +349,10 @@ class L150ProDriverNode(Node):
         p5 = int(round(min(max(pos[4], 0.0), ARM_JOINT_MAX)))
         base = int(round(min(max(pos[5], -ARM_BASE_MAX), ARM_BASE_MAX)))
         self.seq_ac = (self.seq_ac + 1) & 0xFF
-        self.rx.send(build_arm(p1, p2, p3, p4, p5, base, self.arm_t_ms, 0x00, self.seq_ac))
+        # arm_t_ms 每帧现读：抓取服务（arm_grasp/grasp_server）跑的时候临时 set 成 100，
+        # 结束再 set 回来 —— 原来它得停掉整个服务另起一个驱动才能换这个值。
+        t_ms = int(self.get_parameter('arm_t_ms').value)
+        self.rx.send(build_arm(p1, p2, p3, p4, p5, base, t_ms, 0x00, self.seq_ac))
 
     def on_rehome(self, req, resp):
         with self.state.lock:

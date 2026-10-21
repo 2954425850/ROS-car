@@ -1,0 +1,18 @@
+[Unit]
+Description=MaixSense A010 ToF → /tof/depth
+After=network-online.target ps2-teleop.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cy
+Environment=HOME=/home/cy
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/cy/ROS-car/pi/raspot_ws/install/setup.bash && exec ros2 run tof_a010 tof_node'
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

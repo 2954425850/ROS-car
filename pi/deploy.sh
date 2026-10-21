@@ -34,8 +34,8 @@ echo "== 3/3 重启服务 =="
 echo "  ⚠️ 重启 ps2-teleop：2026-10-21 实测不挪臂（ps2_teleop 按实际位姿初始化目标），"
 echo "     但抓取脚本收尾那次 restart 会走 INIT_HOME —— 臂附近别放东西"
 echo "  ⚠️ l150pro-driver.service 已退役（2026-10-21 里程计/IMU/偏航闭环并进了 ps2-teleop 的驱动），别启"
-sudo systemctl restart k230-resultd k230-framed k230-bridge rosbridge ps2-teleop
+sudo systemctl restart k230-resultd k230-framed k230-bridge rosbridge ps2-teleop tof-a010 arm-grasp
 systemctl --user restart voice-chatbot
 echo
 echo "== 完成 =="
-systemctl --no-pager --lines=0 status k230-resultd k230-framed k230-bridge rosbridge ps2-teleop || true
+systemctl --no-pager --lines=0 status k230-resultd k230-framed k230-bridge rosbridge ps2-teleop tof-a010 arm-grasp || true

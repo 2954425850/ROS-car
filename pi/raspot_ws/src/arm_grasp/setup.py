@@ -19,6 +19,7 @@ setup(
         'console_scripts': [
             'collect = arm_grasp.collect:main',
             'calib_report = arm_grasp.calib_report:main',
+            'grasp_server = arm_grasp.grasp_server:main',
         ],
     },
 )

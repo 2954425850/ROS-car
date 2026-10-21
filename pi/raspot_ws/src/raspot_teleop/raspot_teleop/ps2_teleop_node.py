@@ -335,6 +335,8 @@ class Ps2TeleopNode(Node):
             if active or (now - self.last_arm_input) < c['ARM_TAIL_S']:
                 js = JointState()
                 js.header.stamp = self.get_clock().now().to_msg()
+                # 来源标记：抓取服务看到 'teleop' 的臂指令 ⇒ 人接管，立刻中止抓取
+                js.header.frame_id = 'teleop'
                 js.name = list(ARM_JOINT_NAMES)
                 js.position = [float(t) for t in self.targets] + [float(self.base_t)]
                 self.pub_arm.publish(js)

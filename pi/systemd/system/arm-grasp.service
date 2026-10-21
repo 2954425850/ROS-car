@@ -1,0 +1,18 @@
+[Unit]
+Description=视觉抓取 action 服务 /arm/grasp（跑在常驻驱动上，不停 ps2-teleop）
+After=network-online.target ps2-teleop.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cy
+Environment=HOME=/home/cy
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/cy/ROS-car/pi/raspot_ws/install/setup.bash && exec ros2 run arm_grasp grasp_server'
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
