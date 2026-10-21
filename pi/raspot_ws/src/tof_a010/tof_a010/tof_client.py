@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 
 from . import a010, config as tof_config
 
@@ -49,6 +50,8 @@ class TofClient(object):
         self._mm = None            # 最新一帧的毫米数组（一维，0 = 无效）
         self._rows = self._cols = 0
         self._t = None
+        # 最近 ~1.5s 的帧 (t_mono, mm, rows, cols)：按**拍摄时刻**对齐用（depth_for_box 的 at_mono）
+        self._ring = deque(maxlen=int(self.cfg.get("ring_frames", 30)))
 
     # -- 生命周期 -----------------------------------------------------------
 
@@ -124,9 +127,20 @@ class TofClient(object):
         arr = np.frombuffer(msg.data, dtype=np.uint16)
         if arr.size < msg.height * msg.width:
             return
+        now = time.monotonic()
+        t = now
+        # header.stamp（tof_node 发布时的 ROS 时钟）→ Pi 单调时刻。同一台 Pi 上 ROS 时钟
+        # 就是系统墙钟，和 monotonic 只差常数；按"现在"两边各取一次做差换算。
+        st = msg.header.stamp
+        if self.node is not None and (st.sec or st.nanosec):
+            now_ros_ns = self.node.get_clock().now().nanoseconds
+            lag = (now_ros_ns - (st.sec * 1_000_000_000 + st.nanosec)) / 1e9
+            if 0.0 <= lag < 1.0:
+                t = now - lag
         self._mm = arr[:msg.height * msg.width]
         self._rows, self._cols = msg.height, msg.width
-        self._t = time.monotonic()
+        self._t = t
+        self._ring.append((t, self._mm, self._rows, self._cols))
         self.n_msgs += 1
 
     # -- 取数 ---------------------------------------------------------------
@@ -149,8 +163,22 @@ class TofClient(object):
     def age(self):
         return None if self._t is None else time.monotonic() - self._t
 
-    def depth_for_box(self, box_norm):
+    def _frame_near(self, at_mono):
+        """环形缓冲里离 `at_mono` 最近的一帧 → (t, mm, rows, cols)；缓冲空返回 None。"""
+        best = None
+        for fr in self._ring:
+            if best is None or abs(fr[0] - at_mono) < abs(best[0] - at_mono):
+                best = fr
+        return best
+
+    def depth_for_box(self, box_norm, at_mono=None):
         """`box_norm`（归一化 l,t,r,b，1280x720 推流系）→ `（毫米, 说明）`。
+
+        `at_mono`（可选）：K230 那帧的**拍摄时刻**（Pi `time.monotonic()` 秒，
+        即 `/k230/result` 的 `stamp_mono`）。给了就从环形缓冲里取**同一时刻**的 ToF 帧，
+        两者相差超过 `max_dt_s`（默认 0.15s）当没拿到；不给 = 老行为，取最新一帧。
+        手臂在动的时候（视觉追踪）必须给 —— 框是 ~100ms 前拍的，最新一帧 ToF
+        对应的是臂现在的位置，乘错射线。
 
         ★ **超龄当没拿到**（`max_age_s`，默认 250ms）：深度必须对应这一拍的手臂姿态，
           拿个 1 秒前的深度去乘射线的意义不大 —— 那时臂还在别处。
@@ -158,13 +186,29 @@ class TofClient(object):
         if self._mm is None:
             self.n_null += 1
             return None, {"why": "还没有任何深度帧", "src": "tof"}
+        mm, rows, cols = self._mm, self._rows, self._cols
+        dt = None
+        if at_mono is not None:
+            fr = self._frame_near(at_mono)
+            if fr is None:
+                fr = (self._t, mm, rows, cols)
+            max_dt = float(self.cfg.get("max_dt_s", 0.15))
+            if fr[0] is None:
+                self.n_null += 1
+                return None, {"why": "帧没有时间戳，无法按拍摄时刻对齐", "src": "tof"}
+            dt = fr[0] - at_mono
+            if abs(dt) > max_dt:
+                self.n_null += 1
+                return None, {"why": "和拍摄时刻差 %.0fms > %.0fms" % (dt * 1000, max_dt * 1000),
+                              "src": "tof", "dt_s": dt}
+            _t, mm, rows, cols = fr
         age = self.age()
         max_age = float(self.cfg.get("max_age_s", 0.25))
-        if age is not None and age > max_age:
+        if at_mono is None and age is not None and age > max_age:
             self.n_null += 1
             return None, {"why": "帧太旧 %.0fms > %.0fms" % (age * 1000, max_age * 1000),
                           "src": "tof", "age_s": age}
-        d = a010.box_depth_mm(self._mm, self._rows, self._cols, list(box_norm),
+        d = a010.box_depth_mm(mm, rows, cols, list(box_norm),
                               unit_mm=float(self.cfg["unit_mm_per_count"]),
                               map_cfg=self.cfg.get("map"),
                               pad=float(self.cfg["pad"]),
@@ -183,7 +227,7 @@ class TofClient(object):
         #   "相机光心轴向深度"这个 `geom` 要的基准上。
         raw = int(d)
         off = float(self.cfg.get("offset_mm", 0.0))
-        return int(round(raw + off)), {"src": "tof", "age_s": age,
+        return int(round(raw + off)), {"src": "tof", "age_s": age, "dt_s": dt,
                                        "n_msgs": self.n_msgs,
                                        "raw_mm": raw, "offset_mm": off}
 

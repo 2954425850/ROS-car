@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """clock_sync.TickClock 测试（不需要 ROS）：
-    cd pi/raspot_ws/src && python -m pytest k230_ros/test -q
+    cd pi/raspot_ws/src/k230_ros && python -m pytest test -q
 """
 import random
 
