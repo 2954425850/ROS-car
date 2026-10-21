@@ -145,9 +145,41 @@ def put_file(s, local, remote_dir, ts, timeout_s):
     return True
 
 
+K230_USB_ID = (0x1209, 0xABD1)     # 庐山派 CanMV
+
+
+def _check_is_k230(port):
+    """开口前核对 USB VID:PID 是 K230。不是就拒绝 —— 别把 Ctrl-C/Ctrl-A 灌进别的板子。
+
+    ★ 2026-10-21：ttyACM 编号随枚举顺序变，那次开机 K230 和底盘板对调了，
+      对着 /dev/ttyACM1（那天是底盘）跑了两次本工具。查不到 USB 信息（Windows COM
+      口、非 USB 设备）时只警告不拦，免得 PC 侧没法用。
+    """
+    try:
+        from serial.tools import list_ports
+        real = os.path.realpath(port)
+        for p in list_ports.comports():
+            if os.path.realpath(p.device) == real or p.device == port:
+                if p.vid is None:
+                    break
+                if (p.vid, p.pid) != K230_USB_ID:
+                    raise SystemExit("拒绝：%s 是 %04x:%04x（%s），不是 K230 %04x:%04x。"
+                                     "Pi 上请用 /dev/k230（systemd/99-k230.rules）"
+                                     % (port, p.vid, p.pid, p.description or "?",
+                                        K230_USB_ID[0], K230_USB_ID[1]))
+                return
+    except SystemExit:
+        raise
+    except Exception as e:
+        print("WARN  查不到 %s 的 USB 信息（%s），未核对是不是 K230" % (port, e), file=sys.stderr)
+        return
+    print("WARN  %s 不在串口列表里或无 USB 信息，未核对是不是 K230" % port, file=sys.stderr)
+
+
 def run(port, code_path=None, modules=None, boot_wait_s=40.0, exec_timeout_s=150.0,
         baud=115200, puts=None, remote_dir=DEFAULT_DIR):
     puts = list(puts or [])
+    _check_is_k230(port)
     s = serial.Serial(port, baud, timeout=0.2)
     s.reset_input_buffer()
 

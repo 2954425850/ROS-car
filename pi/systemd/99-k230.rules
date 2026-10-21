@@ -1,0 +1,15 @@
+# K230（庐山派 CanMV）USB 串口（MicroPython REPL）—— USB ID 1209:abd1
+#
+# 装卸：
+#     sudo cp systemd/99-k230.rules /etc/udev/rules.d/
+#     sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=tty
+#     ls -l /dev/k230
+#
+# ⚠️ 为什么要它：K230 和底盘板（CH9102 1a86:55d4，/dev/l150pro）都是 ttyACM，
+#    **编号随上电枚举顺序变**。2026-10-21 这一次开机两者对调了（K230=ACM0、底盘=ACM1），
+#    照着旧记忆对 /dev/ttyACM1 跑 board_exec ⇒ 把 Ctrl-C/Ctrl-A 和脚本文本灌进了底盘口
+#    （驱动断连 10 秒自愈、臂没动，但纯属运气）。以后一律用 /dev/k230。
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="abd1", MODE="0666", GROUP="dialout", SYMLINK+="k230"
+
+# 排除 ModemManager（同 99-l150pro / 99-tof-a010）
+ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="abd1"
