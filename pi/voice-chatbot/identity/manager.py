@@ -66,6 +66,12 @@ def reply_conveys(reply: str, text: str, min_bigram_hit: float = 0.6) -> bool:
     return hits / len(grams) >= min_bigram_hit
 
 
+def _known_id_from_error(e: Exception) -> str | None:
+    """板子 enroll 失败信息里的 "already known as u001" → u001。"""
+    m = re.search(r"already known as ([A-Za-z0-9_]+)", str(e))
+    return m.group(1) if m else None
+
+
 class MessageBox:
     """留言：{to_pid: [{"from": 名字或空, "text": .., "t": ..}, ...]}，原子写 JSON。"""
 
@@ -144,6 +150,9 @@ class IdentityManager:
         self._changed = False
         self._delivered_to: str | None = None    # 本轮身份段落里塞了谁的留言
         self._delivered_notes: list[dict] = []   # 塞进去的具体留言（转告后逐条删）
+        # 上一次自动/显式建档为什么没成 —— 要告诉模型，否则它会以为已经记住了
+        self._last_enroll_failure: str | None = None
+        self._last_enroll_failure_at = -1e9
 
     # ---- 入口 ----
 
@@ -209,6 +218,141 @@ class IdentityManager:
         logger.info(f"身份：已忘记 {pid}（{name}）{board}")
         return f"已经把 {name} 的档案和人脸都删了{board}"
 
+    # ---- 显式「记住我」/ 档案查询（给对话模型用）----
+
+    def remember(self, name: str | None = None) -> str:
+        """用户明确要求「记住我」：当场录当前这张脸，并**如实报告**成没成。
+
+        为什么必须有这条显式通路：自动建档是后台的，模型看不见，用户说
+        「记住我」时它会以为「只能记住本次对话」。而且自动建档只在特定条件下
+        触发（单张清楚活体脸）；不成功时用户也无从得知。这里阻塞到板子出结果，
+        失败就把原因说清楚，而不是假装记住了。
+        """
+        name = (name or "").strip()[:16]
+        if name in ("我", "我自己", "自己", "本人"):
+            name = ""
+        name = name or None
+        if self._target is None:
+            return "现在连不上摄像头那块板子，记不了。"
+
+        # 自动建档可能正在后台跑（begin_turn 触发的）；等它收尾，避免两张脸抢板子
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            with self._lock:
+                busy = self._enrolling
+            if not busy:
+                break
+            time.sleep(0.1)
+
+        with self._lock:
+            pid, busy = self.current_pid, self._enrolling
+        if pid:
+            return self._already_known(pid, name)
+        if busy:
+            return "我正在记另一张脸，稍等一下再说一次。"
+
+        g = self.last_guess
+        if g is not None and g.status == "crowd":
+            return "画面里有好几个人，我分不清是谁。请一个人站到镜头前再说一次「记住我」。"
+        if g is not None and g.status == "none" and g.frames == 0:
+            return ("我现在没看清你的脸（画面里没检测到人脸）。"
+                    "请正对摄像头、靠近一点，再说一次「记住我」。")
+
+        with self._lock:
+            if self._enrolling:
+                return "我正在记另一张脸，稍等一下再说一次。"
+            self._enrolling = True
+            self._last_enroll_try_t = time.monotonic()
+        pid = self.profiles.next_auto_id()
+        try:
+            out = self._target.enroll(pid)
+        except Exception as e:  # noqa: BLE001
+            other = _known_id_from_error(e)
+            if other:
+                # 板子说「画面里这张脸已经是库里的 X」—— 其实已经记住了
+                self.profiles.ensure(other)
+                self._last_enroll_failure = None
+                with self._lock:
+                    self.current_pid = other
+                    self._prev_known = other
+                return self._already_known(other, name)
+            why = self._humanize_enroll_error(e)
+            self._last_enroll_failure = why
+            self._last_enroll_failure_at = time.monotonic()
+            logger.info(f"身份：显式录入 {pid} 没成 —— {e}（{why}）")
+            return (f"没记住：{why}。请正对摄像头、光线亮一点，"
+                    "再说一次「记住我」。")
+        else:
+            self.profiles.ensure(pid, auto=True)
+            with self._lock:
+                self._last_enroll_ok_t = time.monotonic()
+                self._last_enroll_failure = None
+                self.current_pid = pid
+                self._prev_known = pid
+            nm = self._apply_name(pid, name)
+            logger.info(f"身份：显式录入 {pid} 成功 —— {out}")
+            return (f"记住了，档案 {pid}" +
+                    (f"，称呼 {nm}" if nm else "（还不知道怎么称呼你）") +
+                    "。下次你正对镜头我就能认出来。")
+        finally:
+            with self._lock:
+                self._enrolling = False
+
+    def people_summary(self, current_pid: str | None = None) -> str:
+        """档案列表（给模型回答「你都记得谁」）。"""
+        rows = self.profiles.all()
+        if not rows:
+            return "档案还是空的，我还没记住任何人。"
+        rows.sort(key=lambda d: (d.get("name") or "~", d["id"]))
+        cur = self.current_pid if current_pid is None else current_pid
+        lines = []
+        for d in rows:
+            nm = d.get("name") or "（还没起称呼）"
+            summ = profile_summary(d)
+            line = f"- {nm}（档案 {d['id']}）" + (f"：{summ}" if summ else "")
+            if d["id"] == cur:
+                line += " ← 就是现在跟你说话的人"
+            lines.append(line)
+        return "我记得这些人：\n" + "\n".join(lines)
+
+    def _already_known(self, pid: str, name: str | None) -> str:
+        self._apply_name(pid, name)
+        prof = self.profiles.get(pid) or {}
+        label = f"，称呼 {prof['name']}" if prof.get("name") else "（还不知道怎么称呼你）"
+        return (f"已经记住你了（档案 {pid}{label}）。"
+                "下次你正对镜头我就能认出来。")
+
+    def _apply_name(self, pid: str, name: str | None) -> str | None:
+        """把称呼写进档案；重名不合并，返回最终称呼（可能为空）。"""
+        if name:
+            other = self.profiles.find_by_name(name)
+            if other and other != pid:
+                logger.warning(f"身份：称呼「{name}」已属于 {other}，不给 {pid} 改名")
+            else:
+                self.profiles.set_name(pid, name)
+        return (self.profiles.get(pid) or {}).get("name") or None
+
+    def _recent_enroll_failure(self, max_age: float = 300.0) -> str | None:
+        if not self._last_enroll_failure:
+            return None
+        if time.monotonic() - self._last_enroll_failure_at > max_age:
+            return None
+        return self._last_enroll_failure
+
+    @staticmethod
+    def _humanize_enroll_error(e: Exception) -> str:
+        msg = str(e)
+        low = msg.lower()
+        if "already known as" in msg:
+            return "这张脸已经在库里了"
+        if "超时" in msg or "没回话" in msg or "timeout" in low:
+            return "没在时限内看到清楚的正脸"
+        if "only" in msg and "good frames" in msg:
+            return "只采到太少合格的脸（脸要完整、别太小）"
+        if "连不上" in msg or "跑不起" in msg:
+            return "联系不上摄像头那块板子"
+        return msg.strip()[:80] or "未知原因"
+
     # ---- 内部 ----
 
     def _begin_turn(self) -> str:
@@ -260,7 +404,24 @@ class IdentityManager:
         if g.status == "crowd":
             return "【在场的人】面前有好几个人，不确定是谁在说话；不要称呼名字。"
         if g.status in ("stranger", "unsure"):
-            return "【在场的人】面前的人还认不出来；不要猜名字。"
+            lines = ["【在场的人】面前的人还认不出来；不要猜名字。"]
+            if self._auto_enroll and self._target is not None:
+                lines.append("本地有人脸档案；系统会在看清脸时给陌生人自动建档 —— "
+                             "不要说「我没有档案」或「只能记住这次对话」。")
+            fail = self._recent_enroll_failure()
+            if fail:
+                lines.append(f"上一次建档没成功：{fail}。如果用户问起，要如实说没记住，"
+                             "并请他正对摄像头再来一次。")
+            return "\n".join(lines)
+        if g.status == "none":
+            if g.frames == 0:
+                return ("【在场的人】摄像头没检测到人脸。如果用户让你记住他，"
+                        "请请他正对摄像头、靠近一点再说一次。")
+            fail = self._recent_enroll_failure()
+            lines = ["【在场的人】看到了脸，但不够清楚（质量门/活体没过）；不要猜名字。"]
+            if fail:
+                lines.append(f"上一次建档没成功：{fail}。如果用户问起，要如实说没记住。")
+            return "\n".join(lines)
         return ""
 
     def _enroll_allowed(self, now: float) -> bool:
@@ -293,10 +454,14 @@ class IdentityManager:
             logger.info(f"身份：新面孔已录入 {pid} —— {out}")
             with self._lock:
                 self._last_enroll_ok_t = time.monotonic()
+                self._last_enroll_failure = None
                 self.current_pid = pid
                 self._prev_known = pid
         except Exception as e:  # noqa: BLE001
-            logger.info(f"身份：自动录入 {pid} 没成 —— {e}（%.0fs 后可再试）"
+            why = self._humanize_enroll_error(e)
+            self._last_enroll_failure = why
+            self._last_enroll_failure_at = time.monotonic()
+            logger.info(f"身份：自动录入 {pid} 没成 —— {e}（{why}；%.0fs 后可再试）"
                         % self._retry)
         finally:
             with self._lock:

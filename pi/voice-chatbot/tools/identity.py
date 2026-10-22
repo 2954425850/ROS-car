@@ -1,7 +1,8 @@
-"""身份相关工具：留言、忘掉某人。
+"""身份相关工具：记住我、查档案、留言、忘掉某人。
 
 「何时用」照例只写在 description 里，不往 system_prompt 里点名能力。
-认人/建档/记偏好**不是工具** —— 那些是 IdentityManager 在后台自动做的。
+自动认人/记偏好仍然是 IdentityManager 在后台做的；`remember_person` 是
+**用户明确要求时**的显式入口 —— 它会当场录脸并如实报告成功/失败。
 """
 
 from __future__ import annotations
@@ -26,6 +27,13 @@ def register_identity_tools(registry: ToolRegistry, identity) -> None:
         logger.info(f"身份：给 {pid}（{to}）留言，来自 {sender or '未知'}")
         return f"记下了，下次 {to} 来找我说话时转告。"
 
+    def remember_person(name: str = "") -> str:
+        logger.info(f"身份：用户要求记住当前的人（称呼={name!r}）")
+        return identity.remember(name)
+
+    def list_known_people() -> str:
+        return identity.people_summary()
+
     def forget_person(name: str) -> str:
         pid = identity.resolve_name(name)
         if pid is None:
@@ -33,6 +41,37 @@ def register_identity_tools(registry: ToolRegistry, identity) -> None:
         if pid != identity.current_pid and not identity.is_owner():
             return "只能删除你自己的档案；要删别人的需要主人来说。"
         return identity.forget(pid)
+
+    registry.register(Tool(
+        name="remember_person",
+        group="identity",
+        description=(
+            "把**现在正对着摄像头说话的人**记下来（人脸 + 称呼），以后就能认出来。"
+            "用户说「记住我」「记住我，我叫高岩」「以后你要认得我」「把我存进档案」时调用。"
+            "name 填用户自报的称呼（如「高岩」）；用户没说名字就留空。"
+            "⚠️ 会让对方对着镜头采集几秒，成功/失败都会如实返回。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string",
+                         "description": "用户自报的称呼；没说就留空。"},
+            },
+            "required": [],
+        },
+        handler=remember_person,
+    ))
+
+    registry.register(Tool(
+        name="list_known_people",
+        group="identity",
+        description=(
+            "查看本机保存了哪些人的档案（称呼、见过几次、记下的事）。"
+            "用户问「你都记得谁」「都有谁的档案」「你记得我什么」「有没有我的档案」时调用。"
+        ),
+        parameters={"type": "object", "properties": {}, "required": []},
+        handler=list_known_people,
+    ))
 
     registry.register(Tool(
         name="leave_message",

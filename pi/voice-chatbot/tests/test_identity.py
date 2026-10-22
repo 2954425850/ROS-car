@@ -236,7 +236,12 @@ def test_enroll_cooldown_distinguishes_success_from_failure(tmp_path):
 
 class _FailTarget(_Target):
     def enroll(self, pid, timeout=10.0):
-        raise RuntimeError("board busy")
+        raise RuntimeError("k230ctl enroll 失败：enroll %s: 等结果超时（10s）" % pid)
+
+
+class _AlreadyTarget(_Target):
+    def enroll(self, pid, timeout=10.0):
+        raise RuntimeError("k230ctl enroll 失败：enroll %s: fail n=8 already known as id1" % pid)
 
 
 def test_failed_enroll_does_not_burn_long_cooldown(tmp_path):
@@ -353,3 +358,100 @@ def test_seed_placeholder_name_is_not_a_name(tmp_path):
     people.write_text(json.dumps({"id1": "id1"}), encoding="utf-8")
     st = ProfileStore(tmp_path / "p", seed_people_json=str(people))
     assert st.get("id1")["name"] == ""
+
+
+# ---------------------------------------------------------------- 显式「记住我」
+
+def test_remember_person_when_known_updates_name(tmp_path):
+    m, _, tg = _mgr(tmp_path)
+    m.profiles.ensure("u001")
+    m.current_pid = "u001"
+    out = m.remember("高岩")
+    assert "已经记住" in out and "高岩" in out
+    assert m.profiles.get("u001")["name"] == "高岩"
+    assert tg.enrolled == []
+
+
+def test_remember_person_enrolls_and_reports_success(tmp_path):
+    m, st, tg = _mgr(tmp_path, **{"identity.auto_enroll": False})
+    m.on_wake()
+    _show(st, None, None)
+    m.begin_turn()
+    out = m.remember("高岩")
+    assert tg.enrolled == ["u001"]
+    assert "记住了" in out and "高岩" in out
+    assert m.current_pid == "u001"
+    assert m.profiles.get("u001")["name"] == "高岩"
+    assert m._last_enroll_ok_t > 0
+
+
+def test_remember_failure_is_reported_not_pretended(tmp_path):
+    m, st, _ = _mgr(tmp_path, **{"identity.auto_enroll": False})
+    m._target = _FailTarget()
+    m.on_wake()
+    _show(st, None, None)
+    m.begin_turn()
+    out = m.remember("高岩")
+    assert "没记住" in out and "没在时限内" in out
+    assert m.profiles.get("u001") is None
+    assert m.current_pid is None
+    # 下一轮的身份段落要带上失败原因，模型才能如实回答
+    m.on_wake()
+    _show(st, None, None)
+    text = m.begin_turn()
+    assert "上一次建档没成功" in text
+
+
+def test_remember_without_face_refuses(tmp_path):
+    m, st, tg = _mgr(tmp_path, **{"identity.auto_enroll": False})
+    m.on_wake()
+    now = time.monotonic()
+    st.window.feed({"stamp_mono": now, "faces": []}, now)
+    m.begin_turn()
+    out = m.remember("高岩")
+    assert "没看清" in out and tg.enrolled == []
+
+
+def test_remember_resolves_when_board_already_knows(tmp_path):
+    m, st, _ = _mgr(tmp_path, **{"identity.auto_enroll": False})
+    m._target = _AlreadyTarget()
+    m.on_wake()
+    _show(st, None, None)
+    m.begin_turn()
+    out = m.remember("高岩")
+    assert "已经记住" in out
+    assert m.current_pid == "id1"
+    assert m.profiles.get("id1")["name"] == "高岩"
+
+
+def test_remember_pronoun_is_not_stored_as_name(tmp_path):
+    m, _, _ = _mgr(tmp_path)
+    m.profiles.ensure("u001")
+    m.current_pid = "u001"
+    m.remember("我")
+    assert m.profiles.get("u001")["name"] == ""
+
+
+def test_people_summary_lists_profiles(tmp_path):
+    m, _, _ = _mgr(tmp_path)
+    assert "空的" in m.people_summary()
+    m.profiles.ensure("u001", name="张三")
+    m.profiles.add_facts("u001", {"职业": "学生"})
+    m.current_pid = "u001"
+    out = m.people_summary()
+    assert "张三" in out and "档案 u001" in out and "跟你说话的人" in out
+
+
+def test_stranger_context_tells_model_archive_exists(tmp_path):
+    m, st, _ = _mgr(tmp_path)
+    m.on_wake()
+    _show(st, None, None)
+    text = m.begin_turn()
+    assert "人脸档案" in text and "只能记住这次对话" in text
+
+
+def test_identity_tools_include_remember_and_list(tmp_path):
+    m, _, _ = _mgr(tmp_path)
+    reg = ToolRegistry()
+    register_identity_tools(reg, m)
+    assert "remember_person" in reg and "list_known_people" in reg
