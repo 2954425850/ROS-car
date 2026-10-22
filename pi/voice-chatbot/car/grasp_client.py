@@ -108,7 +108,7 @@ class GraspClient:
                 pass
 
     def _send_and_wait(self, goal, timeout: float):
-        if not self._client.wait_for_server(timeout=2.0):
+        if not self._client.wait_for_server(timeout_sec=2.0):
             return 'ERROR', '抓取服务 /arm/grasp 不在（arm-grasp 服务没跑？）'
         send_fut = self._client.send_goal_async(goal)
         end = time.monotonic() + 10.0
