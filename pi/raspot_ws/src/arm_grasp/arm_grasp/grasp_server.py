@@ -112,6 +112,7 @@ class GraspServer(Node):
         super().__init__('arm_grasp_server')
         self.declare_parameter('alpha0_default', -75.0)      # 桌面高度的目标要 -75（-58 窗口够不着）
         self.declare_parameter('lift_m_default', 0.055)      # 用户流程：抬 5~6cm
+        self.declare_parameter('bias_y_m', 0.01)          # 目标点 y 方向静态偏置（米）。2026-10-22 用户：抓取稳定偏车一侧，往 y 正方向补 1cm
         self.declare_parameter('grasp_arm_t_ms', 100)        # 同 grasp_once 的 --t-ms
         self.declare_parameter('normal_arm_t_ms', 40)        # 抓完还原成这个（= 驱动默认）
         self.declare_parameter('driver_node', 'l150pro_driver')
@@ -314,8 +315,10 @@ class GraspServer(Node):
                 raise _Abort('BAD_GOAL', f'框不合法：{want}')
             alpha0 = g.alpha0 if g.alpha0 != 0.0 else self.get_parameter('alpha0_default').value
             lift = g.lift_m if g.lift_m > 0.0 else self.get_parameter('lift_m_default').value
+            bias_y = float(self.get_parameter('bias_y_m').value)
             cfg = grasp.GraspConfig(z_plane_m=0.016, require_depth=True,
-                                    alpha0=float(alpha0), lift_m=float(lift))
+                                    alpha0=float(alpha0), lift_m=float(lift),
+                                    bias_m=(0.0, bias_y, 0.0))
 
             # ① 锁框（臂还没动，失败可重试）
             self._feedback(gh, 'preflight', '锁框')
