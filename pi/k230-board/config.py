@@ -98,7 +98,7 @@ FPS = 25                 # 目标帧率，走 VENC 的 dst_frame_rate
 # 另注：dst_frame_rate 本 build **不丢帧**（试过 25 和 15，输出都还是 ~27~30fps），
 # 所以实际输出帧率就等于 sensor 档位，25fps 拿不到。
 SENSOR_FPS = 30
-BITRATE_KBPS = 2048      # 每帧预算，非硬上限；总码率 ≈ bit_rate × 实际fps / SENSOR_FPS
+BITRATE_KBPS = 512       # ★ 2026-10-22 2048→512：新网络板子上行实测 113 kB/s（旧网 37、更早 12Mbps），2M 码率发不动⇒推流断⇒framed 存不下关键帧⇒拍照失败。512k 关键帧~20kB 在 113kB/s 下 0.2s 发完，能跟上。
 GOP = 25                 # 1 秒，任何损伤 1 秒内自愈。**逐通道可覆盖**：cam.add_channel(gop=)
 # 单个 VENC 通道，**同时**喂给 RTSP 和主动推流（一次 GetStream，两条消费路）。
 # 2026-10-14 合并：原来 PUSH_CHN=0 / RTSP_CHN=1 是两个编码器在编**一模一样**的

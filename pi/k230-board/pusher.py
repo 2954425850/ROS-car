@@ -70,11 +70,17 @@ from media.vencoder import StreamData
 
 
 class Pusher:
-    def __init__(self, host, port, enc, chn, frame_timeout_s=0.5):
+    def __init__(self, host, port, enc, chn, frame_timeout_s=5.0):
         self.host = host
         self.port = port
         self.enc = enc
         self.chn = chn
+        # ★ 2026-10-22：0.5 → 5.0。板子 WiFi 速率自适应要十几秒才爬升（见 k230-vision/NOTES.md），
+        #   而关键帧（2Mbps 下几十 kB）在爬升前那 0.3 Mbps 的低位里 0.5s 根本发不完 ⇒ 每帧超时断线
+        #   ⇒ 重连后速率又从零爬 ⇒ 再断，死循环，吞吐永远卡在低位（实测 25~36 kB/s）。
+        #   把超时放到 5s：关键帧发得完、连接稳住，速率爬升后吞吐回到 3.9 Mbps 量级。
+        #   5s 只是"保险"，爬升后单帧发送 <50ms，不会真触发。真正的网络死了由 feed 的
+        #   断线路径兜（socket 错误/对端关闭）。
         self.frame_timeout_s = frame_timeout_s
         self.sock = None
         self.frames_sent = 0
