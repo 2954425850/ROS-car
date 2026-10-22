@@ -46,12 +46,43 @@ class SpeakerConfig:
     crowd_frac: float = 0.3           # 多脸帧超过这个比例 ⇒ crowd
 
 
+def _best_match(sightings: list[FaceSighting]) -> FaceSighting | None:
+    """窗口里相似度最高的那张脸（板子对未知脸也会给 match，只是 who=None）。"""
+    scored = [s for s in sightings if s.match is not None]
+    return max(scored, key=lambda s: s.match) if scored else None
+
+
+def _none_detail(sightings: list[FaceSighting], cfg: SpeakerConfig) -> str:
+    """`none` 的病因必须能分开 —— 没脸、质量门、活体、分数不够是四种排查方向。
+
+    以前这里一律写「N 张脸都不可用（质量/活体）」，连「一张脸都没检测到」
+    也写成「0 张脸都不可用」，等于把四个病因压成一句话，没法据此调站位/门限。
+    """
+    if not sightings:
+        return "窗口内没有检测到人脸（板子在线，但没有报脸）"
+    q_bad = sum(1 for s in sightings if not s.ok)
+    live_bad = sum(1 for s in sightings
+                   if s.ok and s.live is not None and s.live < cfg.live_min)
+    bits = []
+    if q_bad:
+        bits.append(f"质量门未过 {q_bad} 张")
+    if live_bad:
+        bits.append(f"活体分低 {live_bad} 张")
+    best = _best_match(sightings)
+    extra = ""
+    if best is not None:
+        extra = f"，最高相似度 {best.match:.2f}" + (
+            f"（{best.who}）" if best.who else "（库里没有）")
+    return f"{len(sightings)} 张脸都不可用：" + ("、".join(bits) or "原因未知") + extra
+
+
 def guess_speaker(sightings: list[FaceSighting], cfg: SpeakerConfig | None = None) -> SpeakerGuess:
     cfg = cfg or SpeakerConfig()
     good = [s for s in sightings
             if s.ok and (s.live is None or s.live >= cfg.live_min)]
     if not good:
-        return SpeakerGuess("none", detail=f"{len(sightings)} 张脸都不可用（质量/活体）")
+        return SpeakerGuess("none", frames=len(sightings),
+                            detail=_none_detail(sightings, cfg), sightings=sightings)
 
     # 每帧（同一拍摄时刻）只留最大的那张
     by_frame: dict[float, FaceSighting] = {}
@@ -82,6 +113,10 @@ def guess_speaker(sightings: list[FaceSighting], cfg: SpeakerConfig | None = Non
                             sightings=frames)
 
     if n >= cfg.min_frames_stranger:
-        return SpeakerGuess("stranger", frames=n, detail=f"{n} 帧清楚的单人脸、库里没有",
+        best = _best_match(frames)
+        extra = (f"，最高相似度 {best.match:.2f}（低于板子门限）"
+                 if best is not None else "")
+        return SpeakerGuess("stranger", frames=n,
+                            detail=f"{n} 帧清楚的单人脸、库里没有{extra}",
                             sightings=frames)
     return SpeakerGuess("none", frames=n, detail=f"只看清 {n} 帧，不够判断")

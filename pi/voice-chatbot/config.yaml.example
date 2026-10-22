@@ -148,7 +148,8 @@ identity:
   people_json: "/home/cy/ROS-car/pi/k230-vision/pi/people.json"   # 老的手工 id→称呼，启动时补成档案
   accept: 0.85             # 叫名字的相似度门槛（板子尺度；板子自己认人的门限是 0.78）
   auto_enroll: true        # 看到清楚的陌生单人脸就后台录成 uNNN
-  enroll_cooldown_s: 120   # 两次自动录入的最小间隔
+  enroll_cooldown_s: 120   # 两次**成功**自动录入的最小间隔
+  enroll_retry_s: 20       # 录入失败后多久允许再试（别让一次失败卡满 120s）
   remember: true           # 每轮对话后后台提取称呼/偏好写档案
   owners: []               # 主人的档案 id，如 ["id1"]
   restrict_to_owner: false # true = 车/跟随工具只听主人（认人有失败率，慎开）

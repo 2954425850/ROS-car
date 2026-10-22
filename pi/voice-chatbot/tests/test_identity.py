@@ -46,6 +46,20 @@ def test_stranger_requires_clear_live_faces():
     assert guess_speaker([_f(1.0), _f(1.2)]).status == "none"       # 只看清两帧
 
 
+def test_none_detail_separates_no_face_quality_and_liveness():
+    """「不认人」的四个病因必须能分开，否则没法判断该调站位还是调门限。"""
+    assert "没有检测到人脸" in guess_speaker([]).detail
+    d = guess_speaker([_f(1.0, ok=False), _f(1.2, ok=False)]).detail
+    assert "质量" in d and "2 张" in d and "没有检测到人脸" not in d
+    d = guess_speaker([_f(1.0, live=0.1), _f(1.2, live=0.2)]).detail
+    assert "活体" in d and "2 张" in d
+
+
+def test_stranger_detail_reports_best_score():
+    g = guess_speaker([_f(t, match=0.61) for t in (1.0, 1.2, 1.4)])
+    assert g.status == "stranger" and "0.61" in g.detail
+
+
 def test_crowd_refuses_to_guess():
     s = []
     for t in (1.0, 1.2, 1.4):
@@ -203,6 +217,40 @@ def test_fuzzy_face_is_never_enrolled(tmp_path):
     assert tg.enrolled == [] and m.current_pid is None
 
 
+def test_enroll_cooldown_distinguishes_success_from_failure(tmp_path):
+    """成功后才进入长冷却；失败只等短重试间隔。"""
+    m, _, _ = _mgr(tmp_path, **{"identity.enroll_cooldown_s": 120.0,
+                                "identity.enroll_retry_s": 20.0})
+    now = 1000.0
+    m._last_enroll_ok_t = -1e9
+    m._last_enroll_try_t = now - 21
+    assert m._enroll_allowed(now) is True          # 失败 21s 后可重试
+    m._last_enroll_try_t = now - 5
+    assert m._enroll_allowed(now) is False         # 刚失败，5s 内不重试
+    m._last_enroll_ok_t = now - 60
+    m._last_enroll_try_t = now - 1000
+    assert m._enroll_allowed(now) is False         # 成功冷却仍按 120s 算
+    m._last_enroll_ok_t = now - 121
+    assert m._enroll_allowed(now) is True
+
+
+class _FailTarget(_Target):
+    def enroll(self, pid, timeout=10.0):
+        raise RuntimeError("board busy")
+
+
+def test_failed_enroll_does_not_burn_long_cooldown(tmp_path):
+    m, st, _ = _mgr(tmp_path, **{"identity.enroll_cooldown_s": 120.0,
+                                 "identity.enroll_retry_s": 20.0})
+    m._target = _FailTarget()
+    m.on_wake()
+    _show(st, None, None)
+    m.begin_turn()
+    assert _wait(lambda: m._last_enroll_try_t > 0)
+    assert _wait(lambda: not m._enrolling)         # 等后台线程收尾
+    assert m._last_enroll_ok_t < 0                 # 失败不写成功时间
+
+
 def test_message_relay_delivered_once(tmp_path):
     m, st, _ = _mgr(tmp_path)
     m.profiles.ensure("u001", name="张三")
@@ -218,6 +266,61 @@ def test_message_relay_delivered_once(tmp_path):
     assert "晚上七点开会" in text and "张三" in text
     m.end_turn("在吗", "李四，张三让我转告你晚上七点开会")
     assert m.messages.peek("u002") == []
+
+
+def _leave_message(m, to, text, sender_pid="u001"):
+    m.profiles.ensure("u001", name="张三")
+    m.profiles.ensure("u002", name="李四")
+    reg = ToolRegistry()
+    register_identity_tools(reg, m)
+    prev = m.current_pid
+    m.current_pid = sender_pid
+    try:
+        return reg.dispatch("leave_message", {"to": to, "text": text}).result
+    finally:
+        m.current_pid = prev
+
+
+def test_message_kept_when_reply_ignores_it(tmp_path):
+    """只说了「张三给你留了话」不算转告 —— 不能把内容删掉。"""
+    m, st, _ = _mgr(tmp_path)
+    _leave_message(m, "李四", "晚上七点开会")
+    m.on_wake()
+    _show(st, "u002", 0.93)
+    m.begin_turn()
+    m.end_turn("在吗", "你好呀，今天想做什么？")
+    assert len(m.messages.peek("u002")) == 1
+    # 下一轮仍然能拿到这条留言
+    assert "晚上七点开会" in m.begin_turn()
+
+
+def test_message_paraphrase_counts_as_delivered(tmp_path):
+    m, st, _ = _mgr(tmp_path)
+    _leave_message(m, "李四", "晚上七点开会")
+    m.on_wake()
+    _show(st, "u002", 0.93)
+    m.begin_turn()
+    m.end_turn("在吗", "李四，张三说晚上七点要开会")
+    assert m.messages.peek("u002") == []
+
+
+def test_only_conveyed_message_is_removed(tmp_path):
+    m, st, _ = _mgr(tmp_path)
+    _leave_message(m, "李四", "晚上七点开会")
+    _leave_message(m, "李四", "记得带充电器")
+    assert len(m.messages.peek("u002")) == 2
+    m.on_wake()
+    _show(st, "u002", 0.93)
+    m.begin_turn()
+    m.end_turn("在吗", "李四，张三说晚上七点要开会")
+    left = [x["text"] for x in m.messages.peek("u002")]
+    assert left == ["记得带充电器"]
+
+
+def test_reply_conveys_ignores_punctuation():
+    from identity.manager import reply_conveys
+    assert reply_conveys("好的，晚上 7 点开会。", "晚上7点开会")
+    assert not reply_conveys("张三给你留了话", "晚上七点开会")
 
 
 def test_forget_self_removes_profile_and_board(tmp_path):
