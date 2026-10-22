@@ -210,9 +210,11 @@ class GraspServer(Node):
         if not isinstance(t_cap, (int, float)):
             t_cap = time.monotonic() - 0.1
         d = None
+        self._last_depth = ('k230', b.get('depth_mm'), {})
         if tof is not None:
             try:
-                d, _info = tof.depth_for_box(b['box'], at_mono=t_cap)
+                d, info = tof.depth_for_box(b['box'], at_mono=t_cap)
+                self._last_depth = ('tof', d, info or {})
             except Exception:          # noqa: BLE001 —— ToF 出错降级成没深度
                 d = None
         if d is None:
@@ -366,7 +368,11 @@ class GraspServer(Node):
             res.target_valid = True
             res.target_xyz = [float(v) for v in O]
             lvl, tgt, msg = grasp.plan_verdict(O, cfg)
-            self.get_logger().info(f'O={tuple(round(v, 4) for v in O)}  S0={lvl}：{msg}')
+            _dsrc, _dval, _dinfo = getattr(self, '_last_depth', ('?', None, {}))
+            self.get_logger().info(
+                f'O={tuple(round(v, 4) for v in O)}  S0={lvl}：{msg}  '
+                f'深度={_dval}mm 源={_dsrc} raw={_dinfo.get("raw_mm")} '
+                f'offset={_dinfo.get("offset_mm")} dt={_dinfo.get("dt_s")}')
             # S0 只做参考、不拦（用户 2026-10-21：防御判据导致的失败没必要）。
             # 真够不着时 aim 相会铺满 α 包络再试，还不行才以 OUT_OF_REACH 收场。
             if g.dry_run:
