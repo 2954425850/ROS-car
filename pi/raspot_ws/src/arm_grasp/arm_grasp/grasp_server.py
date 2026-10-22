@@ -112,6 +112,9 @@ class GraspServer(Node):
         super().__init__('arm_grasp_server')
         self.declare_parameter('alpha0_default', -75.0)      # 桌面高度的目标要 -75（-58 窗口够不着）
         self.declare_parameter('lift_m_default', 0.055)      # 用户流程：抬 5~6cm
+        # 关节下垂补偿增益（GraspConfig.joint_comp）。0 = 关掉。A/B 用（2026-10-22 查扎深）：
+        # ros2 param set /arm_grasp_server joint_comp 0.0 后抓一次，对比是否还压进桌面。
+        self.declare_parameter('joint_comp', 1.0)
         self.declare_parameter('grasp_arm_t_ms', 100)        # 同 grasp_once 的 --t-ms
         self.declare_parameter('normal_arm_t_ms', 40)        # 抓完还原成这个（= 驱动默认）
         self.declare_parameter('driver_node', 'l150pro_driver')
@@ -214,7 +217,15 @@ class GraspServer(Node):
         if tof is not None:
             try:
                 d, info = tof.depth_for_box(b['box'], at_mono=t_cap)
-                self._last_depth = ('tof', d, info or {})
+                info = dict(info or {})
+                try:      # 记下框映射到的 ToF 区域 (r0,r1,c0,c1)，排查"量到桌面"
+                    from tof_a010 import a010 as _a010
+                    info['region'] = _a010.region_bounds(
+                        b['box'], map_cfg=tof.cfg.get('map'),
+                        pad=float(tof.cfg['pad']), rows=tof._rows, cols=tof._cols)
+                except Exception:      # noqa: BLE001
+                    pass
+                self._last_depth = ('tof', d, info)
             except Exception:          # noqa: BLE001 —— ToF 出错降级成没深度
                 d = None
         if d is None:
@@ -317,7 +328,8 @@ class GraspServer(Node):
             alpha0 = g.alpha0 if g.alpha0 != 0.0 else self.get_parameter('alpha0_default').value
             lift = g.lift_m if g.lift_m > 0.0 else self.get_parameter('lift_m_default').value
             cfg = grasp.GraspConfig(z_plane_m=0.016, require_depth=True,
-                                    alpha0=float(alpha0), lift_m=float(lift))
+                                    alpha0=float(alpha0), lift_m=float(lift),
+                                    joint_comp=float(self.get_parameter('joint_comp').value))
 
             # ① 锁框（臂还没动，失败可重试）
             self._feedback(gh, 'preflight', '锁框')
@@ -372,7 +384,8 @@ class GraspServer(Node):
             self.get_logger().info(
                 f'O={tuple(round(v, 4) for v in O)}  S0={lvl}：{msg}  '
                 f'深度={_dval}mm 源={_dsrc} raw={_dinfo.get("raw_mm")} '
-                f'offset={_dinfo.get("offset_mm")} dt={_dinfo.get("dt_s")}')
+                f'offset={_dinfo.get("offset_mm")} dt={_dinfo.get("dt_s")} '
+                f'区域={_dinfo.get("region")}')
             # S0 只做参考、不拦（用户 2026-10-21：防御判据导致的失败没必要）。
             # 真够不着时 aim 相会铺满 α 包络再试，还不行才以 OUT_OF_REACH 收场。
             if g.dry_run:
