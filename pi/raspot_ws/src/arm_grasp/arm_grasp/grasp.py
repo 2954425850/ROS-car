@@ -769,7 +769,11 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         #   让自己发出去的值与后续回读一致（否则白挨一次"目标 field 出界"）。
         # （`pick_target` 已保证候选 field 在界内 ⇒ 下面这条正常**永不触发**，留着当不变式断言）
         f_tgt = to_fields(tgt.joints, grip_cmd, cfg.wrist_roll)
-        if not all(FIELD_LO <= v <= FIELD_HI for v in f_tgt[2:5]):
+        # ★ 合爪相的"目标"四个关节取自**回读**（hold_j = j_cur_m），而臂可能歇在
+        #   机械限位上（实测 p4=121~122，低于固件下限 125，见上面 2026-09-30 那条）。
+        #   2026-10-22 真机：aim 无解 → 兜底直接进 close → 这里拿 122 当"目标出界"整轮拒绝，
+        #   可指令本来就会在下面被夹进 [125,875] ⇒ 对 close 相跳过这条断言。
+        if cur != 'close' and not all(FIELD_LO <= v <= FIELD_HI for v in f_tgt[2:5]):
             rep['stopped'] = 'refuse：目标 field 出界 %s' % ['%.0f' % v for v in f_tgt[2:5]]
             break
         fields = to_fields(j_cmd, grip_cmd, cfg.wrist_roll)
