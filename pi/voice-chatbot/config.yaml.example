@@ -32,9 +32,12 @@ wakeword:
   reconnect_max_sec: 5.0     # 退避上限。别调太小 —— 那是热循环，不是恢复快
 
 # ---- ASR (阿里云 DashScope) ----
+# 当前用 Qwen-Audio-3.1 的整段识别变体（和原来的 paraformer 一样走
+# Recognition.call()，不是流式）。
+# 回滚：model 改回 "paraformer-realtime-v2" 即可，代码不用动。
 asr:
   api_key: "REPLACE_ME"
-  model: "paraformer-realtime-v2"
+  model: "qwen-audio-3.1-asr-flash-message"
   sample_rate: 16000
 
 # ---- TTS (阿里云 DashScope) ----
@@ -42,8 +45,10 @@ asr:
 # 音频通过回调 on_data() 到达，格式为 PCM 16kHz mono int16
 tts:
   api_key: "REPLACE_ME"
-  model: "cosyvoice-v3-flash"
-  voice: "longze_v3"             # 龙泽 · 温暖元气男(流畅) 
+  model: "qwen-audio-3.1-tts-flash"
+  # Qwen-Audio TTS 的音色都是 *_v3.1；longze_v3 是 CosyVoice 的，不能混用。
+  # 回滚：model 改回 "cosyvoice-v3-flash"、voice 改回 "longze_v3"，代码不用动。
+  voice: "longanyuanfei_v3.1"
   format: "pcm"             # pcm / mp3 / wav
   sample_rate: 16000
 
@@ -150,7 +155,14 @@ identity:
 
 vision:
   enabled: true              # false = 根本不注册 look 工具（不进发给模型的 tools= 数组）
-  model: "deepseek-flash"    # deepseek-v4-flash-vision-exp 是它的别名，两个 ID 真身相同
+  model: "qwen3-vl-plus"     # 百炼；qwen3-vl-flash 在部分账号里未开通（404）
+  # 不显式给 base_url 时：qwen* 自动走百炼兼容端点，其余模型仍用 llm.base_url。
+  # 不显式给 api_key 时：百炼端点复用 asr.api_key，DeepSeek 回退用 llm.api_key。
+  # base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  # api_key: "REPLACE_ME"
+  # Qwen3-VL 支持思考模式；语音场景关掉，省 token 也省延迟。
+  # 回滚到 deepseek-flash 时把这一行删掉（DeepSeek 不认 extra_body）。
+  enable_thinking: false
   # ★ --attempts 1 是**刻意的，不是笔误**：重试策略已收到客户端那一层统一负责
   #   （vision/k230_look.py）。k230ctl 自己再重试就变成内外两层各算各的，
   #   最坏等待时间没法算。

@@ -21,6 +21,7 @@ import pytest
 from loguru import logger
 from openai import APIConnectionError, APITimeoutError
 
+import vision.k230_look as look_mod
 from vision.k230_look import K230Vision, LookError
 
 _JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"fake-jpeg-body" * 4
@@ -446,6 +447,8 @@ def test_describe_payload_carries_the_configured_knobs(tmp_path):
     assert payload["model"] == "deepseek-flash"
     assert payload["max_tokens"] == 1500
     assert payload["stream"] is False
+    # 没配 enable_thinking 时不能带 extra_body —— DeepSeek 不认这个字段。
+    assert "extra_body" not in payload
 
     content = payload["messages"][0]["content"]
     assert content[0]["type"] == "text"
@@ -455,6 +458,78 @@ def test_describe_payload_carries_the_configured_knobs(tmp_path):
     assert image_url["url"].startswith("data:image/jpeg;base64,")
     # 不只是前缀对 —— 解出来必须就是那个文件的字节
     assert base64.b64decode(image_url["url"].split(",", 1)[1]) == _JPEG_BYTES
+
+
+def test_describe_payload_disables_thinking_for_qwen(tmp_path):
+    """Qwen3-VL 默认可能先吐思考；语音场景显式关掉，省 token 也省延迟。"""
+    client = _FakeClient()
+    vision = K230Vision(
+        _FakeConfig(
+            **{
+                "vision.model": "qwen3-vl-plus",
+                "vision.enable_thinking": False,
+            }
+        ),
+        client=client,
+    )
+
+    vision.describe("这是什么", str(_shot(tmp_path)))
+
+    payload = client.calls[0]
+    assert payload["model"] == "qwen3-vl-plus"
+    assert payload["extra_body"] == {"enable_thinking": False}
+
+
+def test_qwen_model_uses_dashscope_endpoint_and_asr_key(monkeypatch):
+    """换 qwen 后不该再去读 llm.base_url（那是 DeepSeek），也不该抄一份新密钥。"""
+    seen = {}
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(look_mod, "OpenAI", _FakeOpenAI)
+    vision = K230Vision(
+        _FakeConfig(
+            **{
+                "vision.model": "qwen3-vl-plus",
+                "asr.api_key": "asr-key",
+                "llm.api_key": "llm-key",
+                "llm.base_url": "https://api.deepseek.com",
+            }
+        )
+    )
+
+    vision._ensure_client()
+
+    assert seen["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert seen["api_key"] == "asr-key"
+
+
+def test_deepseek_model_still_uses_llm_endpoint_and_key(monkeypatch):
+    """回滚路径：model 改回 deepseek-flash 时，端点/密钥仍走 llm.*。"""
+    seen = {}
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(look_mod, "OpenAI", _FakeOpenAI)
+    vision = K230Vision(
+        _FakeConfig(
+            **{
+                "vision.model": "deepseek-flash",
+                "asr.api_key": "asr-key",
+                "llm.api_key": "llm-key",
+                "llm.base_url": "https://api.deepseek.com",
+            }
+        )
+    )
+
+    vision._ensure_client()
+
+    assert seen["base_url"] == "https://api.deepseek.com"
+    assert seen["api_key"] == "llm-key"
 
 
 def test_describe_rejects_a_zero_byte_file(tmp_path):

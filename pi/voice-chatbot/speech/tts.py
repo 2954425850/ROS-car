@@ -1,4 +1,4 @@
-"""TTS client — Alibaba Cloud DashScope cosyvoice-v3-flash (streaming).
+"""TTS client — Alibaba Cloud DashScope (CosyVoice / Qwen-Audio, streaming).
 
 官方文档: https://help.aliyun.com/zh/model-studio/cosyvoice-tts-python-sdk
 

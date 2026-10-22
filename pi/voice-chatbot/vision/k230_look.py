@@ -14,6 +14,8 @@
 正文直接是空的 —— 表现是「工具返回空字符串」，看着像工具坏了，
 其实是预算被思考过程吃光。所以「正文为空」在本模块里是**单独一条失败路径**，
 绝不返回空字符串。详见设计文档 §4.3。
+（2026-10-22 起 `config.yaml` 的 `vision.model` 配 `qwen3-vl-plus`，非推理；
+DeepSeek 仍可改配置回退。Qwen3-VL 用 `vision.enable_thinking: false` 显式关掉思考。）
 
 ★ 隐藏坑二（T4b）：`k230ctl snap` **成功时也会往 stderr 写 `WARN 只攒到 N 帧`**。
 那意味着画面可能没跨过 IDR、图像可能是坏的，而坏画面喂给视觉模型，
@@ -43,6 +45,8 @@ DEFAULT_SNAP_CMD = "/home/cy/k230-vision/pi/k230ctl snap"
 DEFAULT_SNAP_TIMEOUT_SEC = 25
 DEFAULT_REQUEST_TIMEOUT_SEC = 30
 DEFAULT_MODEL = "deepseek-flash"
+# 百炼 OpenAI 兼容端点。`vision.model` 是 qwen* 且没显式给 base_url 时用它。
+DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 # 推理模型，给小了正文为空（§4.3 实测 200 就空）。别往下调。
 DEFAULT_MAX_TOKENS = 1500
 DEFAULT_DETAIL = "low"
@@ -108,6 +112,12 @@ class K230Vision:
         self._max_tokens = config.get("vision.max_tokens", DEFAULT_MAX_TOKENS)
         self._detail = config.get("vision.detail", DEFAULT_DETAIL)
         self._instruction = config.get("vision.instruction", DEFAULT_INSTRUCTION)
+        # 视觉模型可以单独配 key / 端点：默认仍回退到 llm.*（DeepSeek），
+        # 换成 qwen* 时由 _ensure_client 自动改走百炼兼容端点 + asr.api_key。
+        self._api_key = config.get("vision.api_key")
+        self._base_url = config.get("vision.base_url")
+        # None = 不传 extra_body（DeepSeek 不认这个字段，回滚时不能带上）。
+        self._enable_thinking = config.get("vision.enable_thinking")
 
         # 最近一次 snap() 拿到的照片是否「可疑」。describe() 靠它决定要不要加保留。
         # 只在 describe() **自己**拍了照的那条路径上被读（见 describe）。
@@ -286,6 +296,9 @@ class K230Vision:
             # 超时逐次传（而不是构造 OpenAI 时写死）：改了 config 不用重启就生效
             "timeout": self._request_timeout,
         }
+        # 只有显式配了才传 —— DeepSeek 不接受这个字段，回滚时要能干净地不带它。
+        if self._enable_thinking is not None:
+            payload["extra_body"] = {"enable_thinking": bool(self._enable_thinking)}
 
         try:
             response = self._ensure_client().chat.completions.create(**payload)
@@ -302,9 +315,9 @@ class K230Vision:
             # ★ 这里**绝不能**返回空字符串。空串的表现是「工具坏了」，
             # 而真因是预算被 reasoning 吃光（deepseek-flash 先吐 reasoning_content）。
             logger.error(
-                f"视觉：正文是空的（max_tokens={self._max_tokens}）—— "
-                f"{self._model} 是推理模型，reasoning 会先吃预算；"
-                f"把 vision.max_tokens 调大（≥1000）"
+                f"视觉：正文是空的（max_tokens={self._max_tokens}，模型 {self._model}）—— "
+                f"推理模型会先吃 reasoning 预算；要么把 vision.max_tokens 调大，"
+                f"要么换非推理模型并配 vision.enable_thinking: false"
             )
             raise LookError(
                 f"视觉模型只回了思考过程、正文是空的"
@@ -343,8 +356,22 @@ class K230Vision:
         没有 `llm.api_key` 而在构造对象时就炸掉。
         """
         if self._client is None:
-            self._client = OpenAI(
-                api_key=self._config.get("llm.api_key"),
-                base_url=self._config.get("llm.base_url", "https://api.deepseek.com"),
-            )
+            base_url = self._base_url
+            if not base_url:
+                # qwen* 默认走百炼；其他模型（含回滚用的 deepseek-flash）继续用 llm.*。
+                if self._model.startswith("qwen"):
+                    base_url = DEFAULT_QWEN_BASE_URL
+                else:
+                    base_url = self._config.get("llm.base_url", "https://api.deepseek.com")
+
+            api_key = self._api_key
+            if not api_key:
+                # 百炼的视觉模型和 ASR 是同一个账号，直接复用 asr.api_key，
+                # 不用在 config 里再抄一份密钥。
+                if "dashscope" in base_url:
+                    api_key = self._config.get("asr.api_key")
+                else:
+                    api_key = self._config.get("llm.api_key")
+
+            self._client = OpenAI(api_key=api_key, base_url=base_url)
         return self._client

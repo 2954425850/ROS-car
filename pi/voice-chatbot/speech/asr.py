@@ -1,4 +1,4 @@
-"""ASR client — Alibaba Cloud DashScope paraformer-realtime-v2.
+"""ASR client — Alibaba Cloud DashScope (Paraformer / Qwen-Audio).
 
 官方文档: https://help.aliyun.com/zh/model-studio/paraformer-real-time-speech-recognition-python-sdk
 
