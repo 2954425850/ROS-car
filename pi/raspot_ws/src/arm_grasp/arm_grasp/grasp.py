@@ -701,19 +701,8 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                                       span=cfg.alpha_hi - cfg.alpha_lo, balance=True)
                     log('  [aim] α0 窗口无解，铺满包络后找到 α=%.1f°' % tgt.alpha)
                 except Refused as e2:
-                    # 预抓位（留量 s_pre 处）解不出姿态 ⇒ 别报"够不着"整轮放弃。
-                    # 目标在机械极限内时，臂能下扎到极限 + 合爪兜底套住它
-                    # （2026-10-22 用户：瓶盖 25cm 实测够得着，aim 留量处解不出却报"够不着"）。
-                    log('  [aim] 预抓位解不出（%s）⇒ 直接下扎兜底' % e2)
-                    if not advance_or_stop('refuse：接近相解不出预抓位（直接下扎兜底）'):
-                        break
-                    continue
-            elif cur == 'aim':
-                # 贴住后（aim_hold）窄窗口内解不出 ⇒ 同样下扎兜底，别整轮放弃
-                log('  [aim] 预抓位解不出（%s）⇒ 直接下扎兜底' % e)
-                if not advance_or_stop('refuse：接近相解不出预抓位（直接下扎兜底）'):
+                    rep['stopped'] = 'refuse：%s' % e2
                     break
-                continue
             else:
                 rep['stopped'] = 'refuse：%s' % e
                 break
