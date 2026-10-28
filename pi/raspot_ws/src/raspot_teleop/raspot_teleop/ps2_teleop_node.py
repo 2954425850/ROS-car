@@ -7,6 +7,10 @@
   /arm/command  sensor_msgs/JointState  position=[p1..p5 raw 0..1000, base field ±1000]，
                                         有臂输入及其尾随期按 loop_hz 发布
   /estop        std_msgs/Bool           急停锁存状态（边沿发布）
+订阅:
+  /arm/feedback    sensor_msgs/JointState  驱动回读：空闲时镜像进目标、1s 操作守卫
+  /arm/cmd_gate   std_msgs/Bool           现在能不能给臂下指令（复位/回中期间为 false，
+                                           此时不积分、不发布，见 arm_gate.py）
 服务客户端:
   /arm/rehome   std_srvs/Trigger        START 键触发机械臂回中（锚定+回中）
 
@@ -32,6 +36,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 
+from .arm_gate import CmdGate
 from .chassis import clamp, ps2_drive
 from .js_input import JsReader, JsState, run_probe
 from .protocol import ARM_JOINT_NAMES
@@ -116,6 +121,10 @@ CFG = {
     'ARM_ACC': 2500.0,            # 臂通道加速度 raw/s²（250 raw/s 约 0.1s 起停）
     'ARM_SYNC_TOL': 30.0,        # 空闲时回读与目标偏差超过它才同步（count / 底座 field）
     'ARM_DEBOUNCE_TICKS': 2,      # 臂通道去抖：连续 N 拍有效才生效（滤鬼影事件）
+    # 复位/回中结束（arm/cmd_gate 上升沿）后等这么久，再拿回读重设目标：
+    # 复位期间回读是固件总线调试计数器（假值），晚 5 拍（25Hz）等它切回真关节角，
+    # 也躲开两个话题之间的投递顺序。
+    'REINIT_SETTLE_S': 0.2,
 }
 
 
@@ -149,6 +158,9 @@ class Ps2TeleopNode(Node):
         self.cli_rehome = self.create_client(Trigger, 'arm/rehome')
         # 跟随实际回读：用户未操作臂时，目标同步到当前位姿，避免接管瞬间大幅跳变
         self.sub_fb = self.create_subscription(JointState, 'arm/feedback', self.on_fb, 10)
+        # 臂指令门：回中/上电复位期间为 false（判定在驱动，见 arm_gate.py）
+        self.gate = CmdGate()
+        self.sub_live = self.create_subscription(Bool, 'arm/cmd_gate', self.on_cmd_gate, 10)
 
         self.js = JsState()
         JsReader(js_dev, self.js).start()
@@ -169,13 +181,34 @@ class Ps2TeleopNode(Node):
         self.last_drive_input = None  # 最近一次底盘非零输入的时刻（None = 从没动过）
         self.arm_hold_cnt = {}        # 臂通道去抖计数
         self.arm_vel = [0.0] * 6      # 各臂通道当前速度 raw/s（加速度限幅后的）
+        self.reinit_pending = False   # 控制权刚恢复：等真实回读重设 targets/base
+        self.reinit_t0 = 0.0
 
         self.get_logger().info(
             f'ps2_teleop_node 启动：手柄 {js_dev} @ {hz:.0f}Hz，默认档 {self.gear:.2f} m/s')
 
+    def on_cmd_gate(self, msg):
+        self.gate.on_msg(bool(msg.data), time.monotonic())
+
     def on_fb(self, msg):
         pos = list(msg.position)
         if len(pos) < 6:
+            return
+        # ★ 2026-10-28：复位/回中刚结束（arm/cmd_gate 上升沿）时不能直接拿回读当目标 ——
+        #   复位期间这条话题是固件总线调试计数器（假值），照抄 = 复位一结束就把臂甩过去。
+        #   等 REINIT_SETTLE_S 让固件切回真关节角，再用它重设目标。
+        if self.reinit_pending:
+            if time.monotonic() - self.reinit_t0 < CFG['REINIT_SETTLE_S']:
+                return
+            if any(pos[i] == 0.0 for i in (1, 2, 3, 4)):
+                return                              # 还没读到，继续等
+            p1 = pos[0] if pos[0] > 0.0 else CFG['GRIP_OPEN']
+            self.targets = [clamp(p1, 0, CFG['GRIP_MAX'])] + [
+                clamp(pos[i], 0, 1000) for i in range(1, 5)]
+            self.base_t = clamp(pos[5], -1000, 1000)
+            self.reinit_pending = False
+            self.get_logger().info(
+                f'复位结束，臂目标按实际位姿重设: {self.targets} base={self.base_t:.0f}')
             return
         if self.targets is None:
             # ★ 首帧可能是"该拍没读到"（协议里 0 = 没读到）。拿 0 当目标 =
@@ -268,9 +301,23 @@ class Ps2TeleopNode(Node):
             msg.angular.z = clamp(wz, -c['WZ_MAX'], c['WZ_MAX'])
             self.pub_cmd.publish(msg)
 
+        # ★ 2026-10-28：臂指令门（驱动发的 /arm/cmd_gate）。回中/上电复位期间固件
+        #   不消费 0xAC、回读还是假值 —— 这段时间**不积分、不发布**，否则复位一结束
+        #   第一帧就带着旧目标发出去，臂会突然甩一下（现场："START 之后臂动不了，然后自己甩一下"）。
+        #   重新放行的那一拍清掉 targets，等 on_fb 按真实回读重设。
+        arm_ok, arm_resumed = self.gate.step(now)
+        if arm_resumed:
+            self.targets = None
+            self.base_t = None
+            self.reinit_pending = True
+            self.reinit_t0 = now
+            self.arm_vel = [0.0] * 6
+            self.sm_sh = self.sm_bs = 0.0
+            self.get_logger().info('机械臂控制权恢复：等真实回读后重设目标')
+
         # 机械臂：增量目标积分
         active = False
-        if not self.estop and not stale and self.targets is not None:
+        if not self.estop and not stale and arm_ok and self.targets is not None:
             a = c['SMOOTHING']
             raw_sh = c['DIR_SHOULDER'] * (-norm(axes.get(c['AX_SHOULDER'], 0)))
             raw_bs = c['DIR_BASE'] * norm(axes.get(c['AX_BASE'], 0))

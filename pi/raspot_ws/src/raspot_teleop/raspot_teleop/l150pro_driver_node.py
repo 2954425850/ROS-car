@@ -25,6 +25,13 @@
      ⚠️ 2026-10-01 之前这里写的是 10Hz —— 那是**发布定时器**的限制，不是固件的：
      固件 `ARM_RATE_HZ=50`、0x56 每 2 拍发一次 = ~25Hz，被 10Hz 的定时器砍掉了 3/5 的帧。
   /arm/online       std_msgs/Bool       机械臂 READY（25Hz，同上）
+  /arm/cmd_gate     std_msgs/Bool       1 = 现在可以给臂下 0xAC（25Hz，只在收到过 0x56 后发）。
+                                        固件在 INIT_* 期间不消费 0xAC（发了只会堆在信箱里、
+                                        进 READY 时被当成最新一帧套用 ⇒ 归位被冲掉），
+                                        所以复位窗口内一律 0。ps2_teleop 靠它把回中期间的
+                                        臂输入和发布掐掉（见 arm_gate.py）。
+                                        判定 = 复位窗口外 且（固件 control-live 位为 1，
+                                        或固件不报这一位）。
 
 0xAA 由本节点 25Hz 恒频发送（=链路保活，固件 200ms 看门狗兜底）。
 注意: 串口独占——旧 l150pro-driver / 云端驱动节点与本节点不可同时运行。
@@ -53,6 +60,10 @@ FAULT_UNDERVOLT = 0x01
 FAULT_IMU = 0x08
 
 CTRL_WAIT_MAX_S = 25.0       # 等固件报 control-live 的兜底上限（回位最长约 17s）
+# 复位窗口兜底。固件报 control-live 时窗口精确在 READY 那一刻结束，这只是上限。
+# ★ 2026-10-28 现场：动作走完到固件重新消费 0xAC 之间还有几秒（用户："复位完了还是
+#   摇不动，过几秒突然冲出去"）。取 25s = 回位最长 17s + 这段延迟 + 余量。
+RESET_GUARD_S = 25.0
 CMD_STALE_S = 0.5            # /cmd_vel 超时视为上游死亡 → 零速
 VOLT_WARN_MV = 10500
 
@@ -238,6 +249,8 @@ class L150ProDriverNode(Node):
         self.pub_online = self.create_publisher(Bool, 'arm/online', 10)
         self.pub_pot = self.create_publisher(Int32, 'arm/pot_raw', 10)
         self.pub_status = self.create_publisher(Int32, 'arm/status', 10)
+        # 现在能不能给臂下 0xAC：ps2_teleop 靠它在回中/复位期间停发臂指令
+        self.pub_cmd_gate = self.create_publisher(Bool, 'arm/cmd_gate', 10)
         # Firmware 0x56 ``base`` is already the unwrapped cumulative angle
         # estimate (0.36 degree per field count).  Publish the decoded value
         # so other Pi nodes do not mistake it for a modulo potentiometer.
@@ -300,6 +313,8 @@ class L150ProDriverNode(Node):
         self.prev_base_st = None
         self.last_joints = None      # 最近有效五关节回读（re-home 帧的目标用它，绝不推臂）
         self.last_base = 0
+        self.reset_t0 = None         # 复位窗口起点（None = 没有进行中的复位）
+        self.reset_saw_dead = False  # 窗口内见过 control-live=0 吗（决定何时提前结束）
         self.low_volt_warned = False
         self.no55_warned = False
         self.arm_offline_warned = False
@@ -325,6 +340,10 @@ class L150ProDriverNode(Node):
         with self.state.lock:
             online    = self.state.online
             ctrl_live = self.state.ctrl_live
+        # ★ 2026-10-28：复位窗口（本节点刚下发过 re-home）内一律不发。固件不报
+        #   control-live 位的烧录版靠这一条兜底，否则帧会堆在信箱里、READY 时被套用。
+        if self.reset_t0 is not None:
+            return
         # 固件在 INIT_POSE / INIT_HOME 期间【不消费】0xAC：发过去只会堆在信箱里，
         # 等它进 READY 时被当成"最新一帧"套用 —— 归位就是这么被冲掉的。用固件
         # 自报的 control-live 位（0x56 byte19）按住，而不是猜一个固定秒数。
@@ -381,8 +400,16 @@ class L150ProDriverNode(Node):
         self.seq_ac = (self.seq_ac + 1) & 0xFF
         keep = keep_gripper or bool(self.get_parameter('rehome_keep_gripper').value)
         flags = ARM_FLAG_REHOME | (ARM_FLAG_KEEP_GRIPPER if keep else 0)
-        self.rx.send(build_arm(*self.last_joints, self.last_base, 0, flags, self.seq_ac))
-        resp.success = True
+        sent = self.rx.send(build_arm(*self.last_joints, self.last_base, 0, flags, self.seq_ac))
+        resp.success = sent
+        if not sent:
+            resp.message = '串口没开，re-home 没发出去'
+            self.get_logger().error('re-home 发送失败（串口没开）')
+            return resp
+        # ★ 2026-10-28：开复位窗口 —— 期间不发任何 0xAC（这条路径自己的帧也算），
+        #   等固件 control-live 回到 1；固件不报这一位时 RESET_GUARD_S 兜底。
+        self.reset_t0 = time.monotonic()
+        self.reset_saw_dead = False
         resp.message = ('re-home 已下发（%s夹爪，约 5-15 秒）' % ('保持' if keep else '也回出厂位'))
         self.get_logger().info('re-home 已下发 flags=0x%02x（%s）'
                                % (flags, '保持夹爪' if keep else '五关节回出厂 + 底座回中'))
@@ -563,6 +590,25 @@ class L150ProDriverNode(Node):
         m = Bool()
         m.data = online
         self.pub_online.publish(m)
+        # ★ 2026-10-28：复位窗口 —— 结束条件是"固件自报 control-live 回来了"（权威），
+        #   固件不报这一位（ctrl_ever=False）时到 RESET_GUARD_S 兜底放行。
+        if self.reset_t0 is not None:
+            if self.ctrl_ever and not ctrl_live:
+                self.reset_saw_dead = True
+            if (self.reset_saw_dead and ctrl_live) or \
+                    (now - self.reset_t0) > RESET_GUARD_S:
+                self.get_logger().info(
+                    f'复位窗口结束（{now - self.reset_t0:.1f}s）：恢复臂指令')
+                self.reset_t0 = None
+        # 现在能不能给臂下 0xAC。只在收到过 0x56 之后发：没数据 ≠ 固件在复位
+        # （否则 driver 刚起那一秒 ps2_teleop 会把臂门住）。
+        gate = (self.reset_t0 is None
+                and not (self.ctrl_ever and not ctrl_live
+                         and (now - self.ctrl_ok_at) <= CTRL_WAIT_MAX_S))
+        if seen56:
+            m = Bool()
+            m.data = gate
+            self.pub_cmd_gate.publish(m)
 
         if self.prev_faults is not None and faults != self.prev_faults:
             names = fault_names(faults)
