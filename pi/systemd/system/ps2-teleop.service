@@ -1,6 +1,7 @@
 [Unit]
 Description=raspot PS2 teleop + l150pro driver (ROS 2 Jazzy)
-After=multi-user.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple

@@ -10,13 +10,15 @@
 服务客户端:
   /arm/rehome   std_srvs/Trigger        START 键触发机械臂回中（锚定+回中）
 
-运动模型 = **云平台前端 `Gv`/轮盘的逐行移植**（实现在 `chassis.py`，别在这儿重写）:
-  vx∈±0.5 m/s, wz∈±1.5 rad/s, 最小转弯半径 0.6m（不能原地转）,
-  有转向输入时最低 0.12 m/s, 轮盘**径向**死区 0.12, **没有低通**, 档位 0.15~0.50 步进 0.05。
-  ⚠️ 照抄的两个后果，都是**故意的**，别当 bug 顺手改：
-    · 只推左右（前后居中）⇒ 会以 0.12 m/s 前蠕画弧 —— 云端就是这样。
-    · 云端缺原厂 `balance.c` 的 `if(Move_X<0) Move_Z=-Move_Z`，所以**后退时左右是反的**
-      （见记忆 `l150pro-turn-decisions` ②）。本次要求是"完全照抄"，故没有补这一条。
+运动模型（2026-10-22 起 PS2 **不再照抄云端**，实现在 `chassis.py` 的 `ps2_drive`）:
+  · 前进速度默认 = 当前档位；有转向输入而不推前后时**默认向前**，
+    前推不改变速度；后拉按比例减速/倒车（行程中点 = 0，拉满 = -gear）；
+    摇杆完全回中 → 停车。
+  · 左推量 a=|x| 直接决定半径 `R = 1.0 / a`：满左推 R=1 m（最小半径），
+    半推 R=2 m，连续无极；`wz = vx·a / 1.0`，**转弯不加速**（不乘 √(1+a²)）。
+  · 右推 → wz<0（右转），左推 → wz>0（左转）；前进/倒车方向一致。
+  · 档位 0.15~0.50 步进 0.05；vx∈±0.5, wz∈±1.5（驱动侧限幅）。
+  · 云端 `Gv`/轮盘移植仍留在 `chassis.py` 做对拍，PS2 不再调用。
 键位在下方 CFG，--probe 实测编号后按需修改。
 """
 import argparse
@@ -30,7 +32,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 
-from .chassis import clamp, stick_to_drive
+from .chassis import clamp, ps2_drive
 from .js_input import JsReader, JsState, run_probe
 from .protocol import ARM_JOINT_NAMES
 
@@ -78,17 +80,20 @@ CFG = {
     'BTN_REHOME': 9,              # START 回中（用户实测编号）
     'BTN_ESTOP': 8,               # SELECT 急停（实测编号 8；按一下锁存，再按一下解除）
 
-    # —— 底盘（云平台前端同款参数，见 chassis.py）——
+    # —— 底盘（PS2 专用律，见 chassis.py 的 ps2_drive）——
     'JS_DEVICE': '/dev/input/js0',
     'LOOP_HZ': 25,
     'GEAR_DEFAULT': 0.15, 'GEAR_MIN': 0.15, 'GEAR_MAX': 0.50, 'GEAR_STEP': 0.05,
     'VX_MAX': 0.50,
     'WZ_MAX': 1.50,
-    'R_MIN': 0.6,
+    # ★ 2026-10-22 用户要求：最小转弯半径 1.0 m（原云端的 0.6 不再用）。
+    #   左推满 = 1 m，半推 = 2 m，连续无极；R = R_MIN / |左推量|。
+    'R_MIN': 1.0,
+    # 下面两项只给 `chassis.py` 里留作对拍的云端移植版用，PS2 现行律不读。
     'V_MIN': 0.12,
     'LAT_EPS': 0.02,
     'CHASSIS_TAIL_S': 0.30,       # 松杆后继续发零速 N 秒（明确刹车），之后不发、让出 cmd_mux
-    'STICK_DEADZONE': 0.12,       # 底盘轮盘的**径向**死区（云端 joystickDeadzone）
+    'STICK_DEADZONE': 0.12,       # 左推量/后拉的逐轴死区（不再是云端的径向死区）
     'DEADZONE': 0.15,             # 臂摇杆的**逐轴**死区（和上面那条不是一回事）
     'SMOOTHING': 0.35,            # 臂摇杆低通系数（底盘已照抄云端：没有低通）
     # ★ 2026-10-12（用户要求，**临时值**）：3.0 → 30.0。
@@ -247,12 +252,12 @@ class Ps2TeleopNode(Node):
         self.prev_hat_up = hat_up
         self.prev_hat_dn = hat_dn
 
-        # 底盘：云平台"轮盘 + Gv"的逐行移植（实现在 chassis.py，这里只做轴→轮盘坐标）
+        # 底盘：PS2 专用律（实现在 chassis.py 的 ps2_drive）
         vx = wz = 0.0
         if not self.estop and not stale:
             x = c['PAD_X_DIR'] * norm(axes.get(c['AX_PAD_X'], 0))
             y = c['PAD_Y_DIR'] * norm(axes.get(c['AX_PAD_Y'], 0))
-            vx, wz = stick_to_drive(x, y, self.gear, c)
+            vx, wz = ps2_drive(x, y, self.gear, c)
 
         if vx != 0.0 or wz != 0.0:
             self.last_drive_input = now

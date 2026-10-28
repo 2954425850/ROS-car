@@ -54,6 +54,41 @@ def gv(fwd, turn, gear, c):
     return i, (0.0 if a == 0.0 else a)
 
 
+def ps2_drive(x, y, gear, c):
+    """PS2 专用底盘律（2026-10-22 用户要求，**不再照抄云端**）。
+
+    云端前端跑的是它自己的 JS，这里只服务 PS2 手柄；上面的 `gv` / `stick_to_drive`
+    仍是云端移植版，留着对拍，本函数不调用它们。
+
+    模型（用户原话：前进向量 v1 + 向左推幅度 a·v1，合成方向决定转向）：
+      · 有转向输入、不推前后时，**默认以当前档位向前**（不是 0.12 蠕行）
+      · 摇杆完全回中 → **停车**（否则一开节点车就自己一直往前跑）
+      · 前推不改变速度（档位已是上限）；只有后拉才减速/倒车：
+        行程中点 = 0，拉满 = -gear（线性）
+      · 左推量 `a = |x|` 直接决定半径 `R = R_MIN / a`：
+          a=1   → R = 1.0 m（满左推，最小半径）
+          a=0.5 → R = 2.0 m
+          a→0   → 直行
+      · `wz = vx / R = vx·a / R_MIN`，**不乘 √(1+a²)**（转弯不加速）
+      · x 右为正 ⇒ wz<0（右转）；左推 ⇒ wz>0（左转）。前进/倒车同一套方向。
+
+    `c` 需要 `STICK_DEADZONE`、`R_MIN`。
+    """
+    dz = c['STICK_DEADZONE']
+    a = clamp(abs(x), 0.0, 1.0)
+    if a < dz:
+        a = 0.0
+    back = clamp((y - dz) / (1.0 - dz), 0.0, 1.0)    # y 下为正：后拉
+    fwd = clamp((-y - dz) / (1.0 - dz), 0.0, 1.0)    # 前推：只用于"有没有输入"
+    if a == 0.0 and back == 0.0 and fwd == 0.0:
+        return 0.0, 0.0                              # 摇杆完全回中 → 停
+    vx = gear * (1.0 - 2.0 * back)
+    if a == 0.0 or vx == 0.0:
+        return vx, 0.0
+    wz = (-1.0 if x > 0.0 else 1.0) * abs(vx) * a / c['R_MIN']
+    return vx, wz
+
+
 def stick_to_drive(x, y, gear, c):
     """轮盘坐标 → `(vx, wz)`。x **右**为正、y **下**为正（前端 `clientY` 的方向）。
 

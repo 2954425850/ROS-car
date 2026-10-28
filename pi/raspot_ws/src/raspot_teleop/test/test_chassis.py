@@ -185,6 +185,77 @@ def test_anchor_pad_inside_circle_is_untouched():
 
 
 # --------------------------------------------------------------------------
+# PS2 专用律（2026-10-22）：R_MIN=1.0，默认前进，左推量决定半径
+# --------------------------------------------------------------------------
+
+CFG_PS2 = dict(CFG, R_MIN=1.0)
+
+
+@pytest.mark.parametrize('gear', GEARS)
+def test_ps2_centered_is_stop(gear):
+    """摇杆完全回中 → 停。不能因为"默认向前"就让车一直自己跑。"""
+    assert chassis.ps2_drive(0.0, 0.0, gear, CFG_PS2) == (0.0, 0.0)
+
+
+@pytest.mark.parametrize('gear', GEARS)
+def test_ps2_forward_push_defaults_to_gear_without_scaling(gear):
+    """前推不改变速度（档位已是上限）；只推左/不推前后时也默认档位速度。"""
+    assert chassis.ps2_drive(0.0, -1.0, gear, CFG_PS2) == pytest.approx((gear, 0.0))
+    vx, wz = chassis.ps2_drive(-1.0, 0.0, gear, CFG_PS2)
+    assert vx == pytest.approx(gear)
+
+
+@pytest.mark.parametrize('gear', GEARS)
+def test_ps2_full_left_is_one_metre_radius(gear):
+    """满左推 + 不推前后：vx=gear, wz=gear ⇒ R=vx/wz=1.0 m。"""
+    vx, wz = chassis.ps2_drive(-1.0, 0.0, gear, CFG_PS2)
+    assert (vx, wz) == pytest.approx((gear, gear))
+    assert abs(vx / wz) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize('a', [0.25, 0.5, 0.75, 1.0])
+def test_ps2_radius_is_stepless_and_inverse(a):
+    """R = R_MIN / a：左推多少，半径就连续地变成 1/a；速度不随转向放大。"""
+    vx, wz = chassis.ps2_drive(-a, 0.0, 0.40, CFG_PS2)
+    assert vx == pytest.approx(0.40)
+    assert abs(vx / wz) == pytest.approx(1.0 / a)
+    assert abs(wz) == pytest.approx(0.40 * a)
+
+
+def test_ps2_left_right_sign():
+    """左推 → wz>0（左转/逆时针）；右推 → wz<0（右转）。"""
+    assert chassis.ps2_drive(-1.0, 0.0, 0.15, CFG_PS2) == pytest.approx((0.15, 0.15))
+    assert chassis.ps2_drive(1.0, 0.0, 0.15, CFG_PS2) == pytest.approx((0.15, -0.15))
+
+
+def test_ps2_lateral_deadzone():
+    """左推量逐轴死区：小于 0.12 视为没有转向输入（回中 = 停）；正好 0.12 生效。"""
+    assert chassis.ps2_drive(0.1199, 0.0, 0.5, CFG_PS2) == (0.0, 0.0)
+    assert chassis.ps2_drive(-0.1199, 0.0, 0.5, CFG_PS2) == (0.0, 0.0)
+    # 0.12 刚过死区：按档位前进，右推 → wz<0
+    assert chassis.ps2_drive(0.12, 0.0, 0.5, CFG_PS2) == pytest.approx((0.5, -0.06))
+
+
+def test_ps2_reverse_is_proportional_after_deadzone():
+    """后拉：行程中点（y≈0.56）为 0，拉满为 -gear；倒车时转向方向与前进一致。"""
+    dz = CFG_PS2['STICK_DEADZONE']
+    mid = dz + 0.5 * (1.0 - dz)
+    assert chassis.ps2_drive(0.0, mid, 0.50, CFG_PS2) == pytest.approx((0.0, 0.0))
+    assert chassis.ps2_drive(0.0, 1.0, 0.50, CFG_PS2) == pytest.approx((-0.50, 0.0))
+    # 满左推 + 满倒车：wz 仍 >0（左转），不因倒车翻向
+    assert chassis.ps2_drive(-1.0, 1.0, 0.50, CFG_PS2) == pytest.approx((-0.50, 0.50))
+
+
+@pytest.mark.parametrize('gear', GEARS)
+def test_ps2_wheel_speeds_at_min_radius(gear):
+    """固件按 ±(W+A)/2=±0.5 m 拆左右；R=1 m、wz=vx ⇒ 左=0.5vx，右=1.5vx。"""
+    vx, wz = chassis.ps2_drive(-1.0, 0.0, gear, CFG_PS2)
+    v_left = vx - 0.5 * wz
+    v_right = vx + 0.5 * wz
+    assert (v_left, v_right) == pytest.approx((0.5 * gear, 1.5 * gear))
+
+
+# --------------------------------------------------------------------------
 # 接线：节点那几行常量真的接到了 chassis 上
 # --------------------------------------------------------------------------
 
@@ -227,21 +298,24 @@ def _self_attrs(node):
 
 def test_node_cfg_is_wired_to_chassis():
     """钉住"哪两根轴、什么方向、用哪个死区、档位范围"—— 数学对了但接线错了
-    一样是错的车。数值全部来自云端 `we`。"""
+    一样是错的车。"""
     c = _node_cfg()
     assert (c['AX_PAD_X'], c['PAD_X_DIR']) == (0, 1)     # 左摇杆X；轴正方向=右推
     assert (c['AX_PAD_Y'], c['PAD_Y_DIR']) == (1, 1)     # 左摇杆Y；轴负方向=上推
-    assert c['STICK_DEADZONE'] == 0.12                   # 云端 joystickDeadzone
+    assert c['STICK_DEADZONE'] == 0.12                   # 左推量/后拉逐轴死区
     assert c['DEADZONE'] == 0.15                         # 臂的逐轴死区，别被上面那条覆盖
-    assert (c['R_MIN'], c['V_MIN'], c['LAT_EPS']) == (0.6, 0.12, 0.02)
+    # ★ 2026-10-22：PS2 改用自有律，最小半径 1.0 m（云端是 0.6，已不用于 PS2）。
+    #   V_MIN / LAT_EPS 只留给 chassis.py 里的云端移植版做对拍。
+    assert (c['R_MIN'], c['V_MIN'], c['LAT_EPS']) == (1.0, 0.12, 0.02)
     assert (c['VX_MAX'], c['WZ_MAX']) == (0.50, 1.50)
     assert (c['GEAR_MIN'], c['GEAR_MAX'], c['GEAR_STEP'],
             c['GEAR_DEFAULT']) == (0.15, 0.50, 0.05, 0.15)
     # 旧的逐轴模型已经退役，别留半套
     assert 'AX_THROTTLE' not in c and 'AX_STEER' not in c
     assert 'THROTTLE_FLIP' not in c and 'STEER_FLIP' not in c
-    # 本文件对拍用的 CFG 必须跟节点一致，否则测的是另一套参数
-    for k in ('VX_MAX', 'WZ_MAX', 'R_MIN', 'V_MIN', 'LAT_EPS', 'STICK_DEADZONE',
+    # 本文件对拍用的 CFG 必须跟节点一致（R_MIN 除外：云端移植版是 0.6，
+    # PS2 现行律是 1.0，两套模型分开测）
+    for k in ('VX_MAX', 'WZ_MAX', 'V_MIN', 'LAT_EPS', 'STICK_DEADZONE',
               'GEAR_MIN', 'GEAR_MAX', 'GEAR_STEP', 'GEAR_DEFAULT'):
         assert CFG[k] == c[k], k
 
@@ -262,15 +336,15 @@ def test_node_keeps_arm_state_and_drops_chassis_state():
 
 
 def test_node_tick_calls_the_port_exactly_once():
-    """底盘必须走移植进来的 `stick_to_drive`，不是又在 tick 里手写一遍公式
+    """底盘必须走 `ps2_drive`，不是又在 tick 里手写一遍公式
     （手写一遍 = 以后改 chassis.py 不再影响车）。"""
     tick = next(f for f in ast.walk(_node_tree())
                 if isinstance(f, ast.FunctionDef) and f.name == 'tick')
     calls = [n for n in ast.walk(tick)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-             and n.func.id == 'stick_to_drive']
+             and n.func.id == 'ps2_drive']
     assert len(calls) == 1
-    x, y, gear, c = calls[0].args                        # 形参就该是 stick_to_drive(x, y, self.gear, c)
+    x, y, gear, c = calls[0].args                        # 形参就该是 ps2_drive(x, y, self.gear, c)
     assert (x.id, y.id, c.id) == ('x', 'y', 'c')
     assert isinstance(gear, ast.Attribute) and gear.attr == 'gear'
 
