@@ -2,29 +2,49 @@
 <!--
   Minimal robot description for the nepu robot.
 
-  It exists so that base_link -> laser is published by robot_state_publisher
-  instead of a hand-started static_transform_publisher, and so the lidar's
-  real mounting offset has one obvious place to live.
+  Frame convention (right-handed, REP-103):
+    x = forward, y = left, z = up
 
-  NOTE: the origin below is identity, i.e. it claims the lidar sits exactly at
-  base_link. That is a stand-in carried over from the old setup, NOT a
-  measurement. Once you measure where the lidar actually is, put the real
-  xyz/rpy here and every consumer (slam_toolbox, RViz's RobotModel, anything
-  added later) picks it up automatically.
+  Frame layout:
+    base_footprint  ground projection of the robot (z = 0 at the floor)
+    base_link       body plane reference point
+    laser           RPLIDAR A1M8 scan center
 
-  TODO: add wheel / IMU links here when those drivers land. The odom ->
-  base_link transform deliberately does NOT belong here -- that is a dynamic
-  transform owned by the odometry driver, not a fixed joint.
+  Mounting values measured 2026-10-23 (user):
+    * laser is 25.6 cm BEHIND the base reference point  -> x = -0.256
+    * laser is  0.65 cm to the LEFT                     -> y = +0.0065
+    * laser is 21 cm above the floor / 6.8 cm above the
+      body plane, so the body plane is 14.2 cm high     -> base_link z = +0.142
+      and laser z = +0.068 relative to base_link
+
+  Assumption: the x/y reference point is the base_link origin used when
+  measuring. If the offset was measured from another point (rear bumper,
+  wheel axle, ...), adjust here -- nothing else hardcodes it.
+
+  The laser is assumed to have its 0 deg ray pointing along +x (rpy = 0).
+  If the map comes out rotated by a constant, put the real yaw here.
+
+  NOTE: odom -> base_footprint is NOT here. That is a dynamic transform
+  owned by the l150pro_driver (published at ~50 Hz), and two publishers
+  for the same edge would fight.
 -->
 <robot name="nepu">
 
+  <link name="base_footprint"/>
+
   <link name="base_link"/>
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <!-- body plane, 14.2 cm above the floor (21 - 6.8) -->
+    <origin xyz="0 0 0.142" rpy="0 0 0"/>
+  </joint>
 
   <link name="laser"/>
   <joint name="laser_joint" type="fixed">
     <parent link="base_link"/>
     <child link="laser"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <origin xyz="-0.256 0.0065 0.068" rpy="0 0 0"/>
   </joint>
 
 </robot>

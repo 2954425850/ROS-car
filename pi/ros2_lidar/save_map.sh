@@ -1,20 +1,19 @@
 #!/bin/bash
-# Save the current SLAM map as <name>.pgm + <name>.yaml
+# Save the current SLAM map as <name>.pgm + <name>.yaml + <name>.png
 #
-#   ./save_map.sh                    -> /home/cy/maps/map.pgm + .yaml
-#   ./save_map.sh /home/cy/maps/room -> /home/cy/maps/room.pgm + .yaml
+#   ./save_map.sh                    -> /home/cy/ros2_lidar/maps/map.*
+#   ./save_map.sh /home/cy/ros2_lidar/maps/room
 #
-# This uses slam_toolbox's own SaveMap service, so nav2_map_server is not
-# needed.
+# The map is read straight from the latched /map topic. slam_toolbox's own
+# /slam_toolbox/save_map service is NOT used: on this install it returns 255
+# because nav2_map_server is missing (see tools/save_map_snapshot.py).
 source /opt/ros/jazzy/setup.bash
 
-NAME="${1:-/home/cy/maps/map}"
+NAME="${1:-/home/cy/ros2_lidar/maps/map}"
 DIR="$(dirname "$NAME")"
 mkdir -p "$DIR"
 
-echo "saving map to ${NAME}.pgm / ${NAME}.yaml ..."
-ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap \
-    "{name: {data: '${NAME}'}}"
+python3 "$(dirname "$0")/tools/save_map_snapshot.py" "$NAME"
 
 echo
 echo "--- files in $DIR ---"

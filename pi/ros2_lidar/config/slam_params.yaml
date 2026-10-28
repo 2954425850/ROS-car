@@ -18,11 +18,10 @@ slam_toolbox:
     # ROS Parameters
     odom_frame: odom
     map_frame: map
-    # --- EDIT (stock: base_footprint) ---
-    # This robot has no base_footprint link. urdf/robot.urdf defines
-    # base_link -> laser, and the odom -> base_link static transform is a
-    # placeholder until the wheel-odometry driver exists.
-    base_frame: base_link
+    # base_footprint is the frame the l150pro_driver uses for its
+    # odom -> base_footprint transform (~50 Hz). urdf/robot.urdf defines
+    # base_footprint -> base_link -> laser.
+    base_frame: base_footprint
     scan_topic: /scan
     use_map_saver: true
     mode: mapping #localization
