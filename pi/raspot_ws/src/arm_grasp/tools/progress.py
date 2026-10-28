@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """看采集进度：每条的姿态 + 相机到瓶盖的距离覆盖范围。
 
-    progress.py <samples.json> [--point 17,0,-12.3] [--t 12.3]
+    progress.py <samples.json> --point x,y,z [--t 12.3]
 
-★ 「相机->盖」是**算出来的**：相机位置 = tip − t·axis（t 用实测 12.3，
-   axis 是夹爪下扎方向）。这个约定已用两个独立样本的瓶盖**成像面积**反验过
+★ 「相机->目标」是**算出来的**：相机位置 = tip − t·axis（t = 相机镜头到爪尖的
+   实测距离 12.3cm，**不是目标点的 z**；axis 是夹爪下扎方向）。
+   这个约定已用两个独立样本的瓶盖**成像面积**反验过
   （预测面积比 1.54/0.783 vs 实测 1.48/0.822）。
   标定真正吃的是**这个距离的变化**，不是 tip 到盖的变化——§4 说上一轮它只有 15%。
 """
@@ -22,8 +23,10 @@ from arm_grasp.calib_solve import Sample
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('samples')
-    ap.add_argument('--point', default='17,0,-12.3')
-    ap.add_argument('--t', type=float, default=12.3)
+    ap.add_argument('--point', required=True,
+                    help='当前目标点 x,y,z（cm，车体安装面系；现测/现给，不用旧值）')
+    ap.add_argument('--t', type=float, default=12.3,
+                    help='相机镜头到爪尖的距离 cm（手眼安装常数，不是目标 z）')
     args = ap.parse_args()
     cap = tuple(float(x) for x in args.point.split(','))
 

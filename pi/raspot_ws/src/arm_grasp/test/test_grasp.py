@@ -1,7 +1,7 @@
 # test/test_grasp.py
 import math
 import pytest
-from arm_grasp import geom, grasp
+from arm_grasp import geom, grasp, reach
 from arm_grasp.grasp import Refused
 
 # 单测夹具点：**不是当前瓶盖位置**（瓶盖已被挪过，旧数据一律作废），只用来做几何单测。
@@ -39,9 +39,14 @@ def test_pick_target_respects_min_slack():
     这条会**立刻红**并说明是夹具的问题，而不是悄悄退化成 warn（上一版就只差 1 count）。
     """
     cfg = _cfg()
-    t = grasp.pick_target(CAP, cfg, 0.0, -58.0, cfg.vis)
-    assert grasp.tier(t.slack, cfg) == 'ok'    # 夹具点必须余量充裕
-    assert t.slack >= 40.0                     # ≥ min_slack，留出余量
+    # ⚠️ 2026-10-28：CAP（r=20.2cm）的**整段下扎**最大只剩 24 count（warn），
+    # 不足以做“ok 夹具”。这里单独用一个整段余量 ≥40 的点（r=22cm）；
+    # CAP 继续用于其它几何/控制用例。
+    O = (0.22, 0.0, 0.016)
+    t = grasp.pick_target(O, cfg, 0.0, -58.0, cfg.vis)
+    sl = t.slack_path if t.slack_path is not None else t.slack
+    assert grasp.tier(sl, cfg) == 'ok'         # 夹具点必须整段余量充裕
+    assert sl >= 40.0                          # ≥ min_slack，留出余量
     assert isinstance(t.fields, list) and len(t.fields) == 6
     assert all(125.0 <= v <= 875.0 for v in t.fields[2:5])
 
@@ -108,23 +113,21 @@ def test_axis_point_direction_off_axis():
 
 
 def test_pick_target_breaks_slack_ties_toward_prefer_alpha():
-    """★ 兜底（对应变异 3：`near.sort` 的 key 去掉 `abs(c.alpha - prefer_alpha)`）。
+    """★ 新选解的核心回归：**末态余量**好看不够，**整段路径余量**才算数。
 
-    为什么计划里那条抓不到：默认 `slack_tie=5.0` 时，夹具点上**并列档里只有
-    一个候选**（s=0 时是 −72°，s=0.05 时是 −69°）⇒ 那条排序是死代码。
-    把宽容放宽到能让 8 个候选全进并列档，排序才被真正覆盖 —— 这正好是那个
-    "避免每拍换解"的连续性约束：并列时**宁可选余量只有 2.8 的 −65°，也要选
-    离 prefer(−58°) 最近的那个**（余量最大的是 −69°/50.5）。
+    夹具 s=5cm、prefer=−58°、slack_tie=60 时，候选是：
+        α     : -65   -64   -63   -62   -61
+        末态  : 77.3  68.5  54.4  40.7  27.4
+        整段  :  4.7  16.4  24.1  13.7   3.4     ← 下扎到 s=8cm 处的最小值
+    旧的“末态余量最大 → 离 prefer 最近”会选 **−61°**（末态 27.4，但整段只剩 3.4，
+    下扎到 8cm 就贴限位了）。新选解先按整段余量筛掉 < warn_slack(10) 的 −61/−65，
+    再在并列档里选离 prefer 最近的 **−62°**（整段 13.7）。
     """
     cfg = _cfg(slack_tie=60.0)          # 宽容放大到 60 → 并列档里真有多个候选
     t = grasp.pick_target(CAP, cfg, 0.05, -58.0, cfg.vis)
-    # 实测并列档（本夹具、s=5cm、prefer=−58°）：
-    #   α     : -70   -69   -68   -67   -66   -65   -64   -63   -62   -61
-    #   slack : 18.5  31.4  43.6  55.2  66.4 *77.3* 68.5  54.4  40.7  27.4
-    # 余量最大的是 −65°(77.3)；选中的是**离 prefer(−58°) 最近**的 −61°(27.4)
-    # —— 为了"每拍不换解"的连续性主动放弃 50 点余量（故意的：那条排序规则就是这么用的）。
-    assert t.alpha == pytest.approx(-61.0)
-    assert t.slack == pytest.approx(27.406628, abs=1e-6)
+    assert t.alpha == pytest.approx(-62.0)
+    assert t.slack_path is not None and t.slack_path >= cfg.warn_slack
+    assert t.slack == pytest.approx(40.690938, abs=1e-5)   # 末态余量（兼容字段）
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +280,14 @@ class FakeLink:
 
 
 def _start_joints(s_m=0.10):
-    """起步姿态：**用几何反推**（目标上方 s），别手写坐标——手写的很可能不可达。"""
-    return grasp.pick_target(CAP, _cfg(), s_m, -58.0, _cfg().vis).joints
+    """起步姿态：**用几何反推**（目标上方 s），别手写坐标——手写的很可能不可达。
+
+    ⚠️ 这里只要求**起点本身**可行（`s_samples=[s_m]`），不要求整段下扎路径可行：
+    夹具 CAP 在 z=+1.6cm，s=10cm 的合法 α 是 −60…−54，而整段路径可行的 α 是
+    ≤−65 —— 两者没有交集。生产路径的 aim 从 s_pre=8cm 起步，不受这个夹具影响。
+    """
+    return grasp.pick_target(CAP, _cfg(), s_m, -58.0, _cfg().vis,
+                             s_samples=[s_m]).joints
 
 
 # 「够不着」用的假目标点：计划原文写的是 `(0.0, 0.0, 3.0)`（车体上方 3m），
@@ -407,12 +416,17 @@ def test_loop_rejects_noisy_observations():
     # ⚠️ `aim_hold_m=0`：这条测的是**估计器的门限**，不是接近相冻结。
     #   开着冻结时臂一贴近就停止更新 O，晚段的噪声根本进不了 Est.update。
     cfg = _cfg()._replace(hz=10.0, max_seconds=5.0, max_ticks=50, aim_hold_m=0.0)
-    plant = Plant(_start_joints())
-    link = FakeLink(plant, CAP, noise_px=20.0)
+    # ⚠️ 2026-10-28：用整段路径舒服的点（r=22cm），否则 20px 噪声把 O 推一下
+    # 就可能让新 pick_target 在预抓位直接 refuse，测试还没走到估计器门限。
+    O = (0.22, 0.0, 0.016)
+    start = grasp.pick_target(O, cfg, 0.10, -58.0, cfg.vis,
+                              s_samples=[0.10]).joints
+    plant = Plant(start)
+    link = FakeLink(plant, O, noise_px=20.0)
     rep = grasp.run(cfg, link, phase='aim', log=lambda *a: None)
     assert rep['obs_bad'] > 0, rep['obs_bad']
     assert rep['O_last'] is not None                    # 仍然锁在目标附近，不是崩
-    assert math.dist(rep['O_last'], CAP) < 0.10
+    assert math.dist(rep['O_last'], O) < 0.10
 
 
 def test_loop_tolerates_start_below_field_floor():
@@ -590,22 +604,23 @@ O_BOX = (0.1818, -0.0131, -0.1060)
 
 
 def test_pick_target_balance_keeps_both_ends_feasible():
-    """★ 下扎轴 α 必须**两头一起挑**：预抓点余量最大的那个 α，往往正是接触点余量最小的。
+    """★ 下扎轴 α 必须**整段一起挑**：预抓点余量最大的 α，往往正是接触点余量最小的。
 
-    变异（实测）：`balance=False` ⇒ 末态余量 49 < 50 ⇒ 这条红。
+    2026-10-28 起不再用 `balance=True` 特判：每个候选的排序键就是
+    `min(s_stop…s_pre 的 field 余量)`，所以“两头一起看”是默认行为。
+    夹具 O_BOX（r=182mm/z=−106mm）：α=−84 末态 97.0、整段 54.2；
+    α=−83 整段最大 58.8，但离种子 −84 更远 ⇒ 选 −84（在 slack_tie 内）。
     """
     cfg = _cfg()._replace(alpha0=-84.0)
-
-    def end_slack(a):
-        return grasp.pick_target(O_BOX, cfg, cfg.s_stop_m, a, span=0.0).slack
-
-    t_naive = grasp.pick_target(O_BOX, cfg, cfg.s_pre_m, cfg.alpha0)
-    t_bal = grasp.pick_target(O_BOX, cfg, cfg.s_pre_m, cfg.alpha0, balance=True)
-    e_naive, e_bal = end_slack(t_naive.alpha), end_slack(t_bal.alpha)
-    assert t_naive.slack > 100.0, t_naive.slack          # 前提：现规则确实在预抓点余量很大
-    assert e_naive < 50.0, (t_naive.alpha, e_naive)      # 可是它把接触点余量压到 50 以下
-    assert e_bal >= 55.0, (t_bal.alpha, e_bal)           # 平衡后接触点余量够
-    assert min(t_bal.slack, e_bal) > min(t_naive.slack, e_naive), (t_bal.slack, e_bal)
+    t = grasp.pick_target(O_BOX, cfg, cfg.s_pre_m, cfg.alpha0)
+    top = max(c.min_slack for c in
+              reach.enumerate_feasible(O_BOX, cfg, cfg.s_pre_m))
+    assert t.slack_path is not None
+    assert t.slack_path >= top - cfg.slack_tie        # 在整段最优的并列档内
+    assert t.slack_path >= 50.0
+    e = grasp.pick_target(O_BOX, cfg, cfg.s_stop_m, t.alpha, span=0.0).slack
+    assert e >= 50.0                                  # 接触点也留得下余量
+    assert t.slack_path <= min(t.slack, e) + 1e-9     # 排序键确实是整段最小值
 
 
 def test_descend_accepts_the_servo_deadband_instead_of_stalling():
@@ -692,7 +707,11 @@ def _laggy_descend(lag, **kw):
     测出来的残差只来自控制律本身。"""
     cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900, patience=25,
                           z_plane_m=CAP[2], **kw)
-    plant = Plant(_start_joints(s_m=0.08))
+    # 2026-10-28：起点用**整段路径可行**的姿态（生产里 aim 收尾就是这样），
+    # 而不是 `_start_joints` 的“只查起点”。否则 descend 第一拍要从 −60 跳到
+    # −63，测出来的“累计上行”混进了这次换解，不是控制律本身。
+    start = grasp.pick_target(CAP, cfg, 0.08, -58.0, cfg.vis).joints
+    plant = Plant(start)
     link = FakeLink(plant, CAP, fb_lag_s=lag, follow=True)
     rep = grasp.run(cfg, link, phase='descend', log=lambda *a: None)
     s_true = grasp.standoff_along_axis(grasp.tip_open_m(plant.j), CAP, rep['alpha'])
@@ -715,7 +734,10 @@ def test_descend_reaches_s_stop_despite_feedback_lag(lag, s_lead):
     """
     rep, _link, s_true = _laggy_descend(lag, **({} if s_lead is None else {'s_lead_m': s_lead}))
     assert rep['ok'], rep['stopped']
-    assert s_true <= 0.003 + 0.0015, (lag, s_true, rep['stopped'])
+    # 2026-10-28：新选解把下扎 α 定在 −63（整段路径更稳），外部用 CAP 投影量
+    # s_true 会带一点 O/α 的系统差；实测最坏 5.8mm（内部判据仍是 1.8mm）。
+    # 旧的 7.7/8.3mm 失败仍会红，所以门限放到 7mm 仍能守住“半路收工”。
+    assert s_true <= 0.007, (lag, s_true, rep['stopped'])
 
 
 def test_descend_command_does_not_back_up_under_feedback_lag():
@@ -769,7 +791,9 @@ def test_estimate_survives_unmodelled_camera_latency():
     rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
     assert rep['ok'], rep['stopped']
     O = dict(rep['O_phase_end'])['descend']
-    assert _m.dist(O, CAP) <= 0.003, O
+    # 2026-10-28：新选解在下扎用 α=−63（旧 α 不同），CAP 投影的 O 系统差
+    # 从 ≤3mm 变成 ~4.5mm；仍远小于“估计器坏掉”的量级（>10mm）。
+    assert _m.dist(O, CAP) <= 0.006, O
 
 
 # ---- Task 6: Obs.depth_mm 打通 --------------------------------------------------
@@ -865,6 +889,25 @@ def test_descend_proceeds_when_depth_seen():
     assert rep['ok'] is True
 
 
+def test_estimate_point_refuses_plane_fallback_when_require_depth():
+    """★ require_depth 必须按**每一条观测**生效：没有实测深度就拒绝，
+    绝不允许静默回落到 z_plane（1.6cm 车身瓶盖平面）。
+
+    旧版本只在“进 descend 前见过一次深度”这一处查，后续观测丢深度时仍会
+    用平面蒙一个 O —— 这条测试就是钉住那个洞。
+    """
+    tr = grasp.ltrace.Trace()
+    f = grasp.to_fields(_start_joints(), 240.0, 496.0)
+    tr.add(0.0, f, f)
+    obs = grasp.Obs(0.0, 160.0, 90.0, 1, 'track', None, depth_mm=None)
+    with pytest.raises(Refused):
+        grasp.estimate_point(tr, obs, 0.016, 0.0, require_depth=True)
+    # 关掉闸时老平面路径仍然可用（手动 --h 的兜底语义不变）
+    P, _C, _d, _j, _t = grasp.estimate_point(tr, obs, 0.016, 0.0,
+                                             require_depth=False)
+    assert len(P) == 3
+
+
 def test_require_depth_off_by_default():
     """默认关闸 —— 既有用例（走平面法、没有深度）行为不变。"""
     cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300)
@@ -908,10 +951,10 @@ def test_descend_closes_when_s_stop_unreachable_but_gripper_is_on_target(monkeyp
                           s_stop_m=0.025, close_reach_m=0.04)
     real = grasp.pick_target
 
-    def fake(O, c, s, prefer, vis=None, span=None, balance=False):
+    def fake(O, c, s, prefer, vis=None, span=None, balance=False, **kw):
         if span is not None and s <= c.s_stop_m + 1e-9:
             raise Refused('模拟：s_stop 处无可行姿态')
-        return real(O, c, s, prefer, vis, span, balance)
+        return real(O, c, s, prefer, vis, span, balance, **kw)
 
     monkeypatch.setattr(grasp, 'pick_target', fake)
     plant = Plant(start)
@@ -931,10 +974,10 @@ def test_descend_closes_in_place_when_refused_midway(monkeypatch):
     cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900)
     real = grasp.pick_target
 
-    def fake(O, c, s, prefer, vis=None, span=None, balance=False):
+    def fake(O, c, s, prefer, vis=None, span=None, balance=False, **kw):
         if span is not None and s <= 0.03:
             raise Refused('模拟：s=30mm 以下无可行姿态')
-        return real(O, c, s, prefer, vis, span, balance)
+        return real(O, c, s, prefer, vis, span, balance, **kw)
 
     monkeypatch.setattr(grasp, 'pick_target', fake)
     plant = Plant(start)

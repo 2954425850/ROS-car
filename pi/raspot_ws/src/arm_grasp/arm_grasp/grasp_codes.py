@@ -10,6 +10,7 @@ OK_PREFIXES = ('对准完成', '扎到位', '合爪完成', '抬升完成')
 # (关键词, 码)，按顺序匹配第一个命中的
 _RULES = (
     ('从未拿到有效深度', 'NO_DEPTH'),
+    ('没有实测深度', 'NO_DEPTH'),
     ('已测目标核验失败', 'NO_TARGET'),
     ('目标 field 出界', 'OUT_OF_REACH'),
     ('refuse', 'REFUSED'),

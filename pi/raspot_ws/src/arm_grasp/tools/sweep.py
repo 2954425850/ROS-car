@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """扫关节标定：记一个「爪尖离桌面多少 cm」的点（只读回读）。
-真值 z = 桌面高度(-13.6) + h。不涉及相机，纯校验 field->角度 那一环。"""
+真值 z = **当前实测桌面高度** + h（必须用 --desk 给，不再有写死的桌面值）。
+不涉及相机，纯校验 field->角度 那一环。"""
 import argparse, json, math, os, sys, time
 sys.path.insert(0, '/home/cy/raspot_ws/src/arm_grasp')
 from arm_grasp.arm_kin import fk, from_fields
-DESK = -13.6
 
 def read_feedback(timeout=6.0):
     import rclpy
@@ -25,13 +25,15 @@ def read_feedback(timeout=6.0):
 
 ap = argparse.ArgumentParser()
 ap.add_argument('out'); ap.add_argument('--h', type=float, required=True)
+ap.add_argument('--desk', type=float, required=True,
+                help='当前实测桌面 z（cm，负；用 ToF/尺子现测，不要沿用旧值）')
 ap.add_argument('--note', default='')
 a = ap.parse_args()
 fb = read_feedback()
 if 0 in fb[2:6]:
     print('回读里有 0 -- 再叫一次'); sys.exit(1)
 j = from_fields(fb); tip, _ = fk(j)
-z_true = DESK + a.h
+z_true = a.desk + a.h
 rows = json.load(open(a.out)) if os.path.exists(a.out) else []
 rows.append({'fb': fb, 'joints': j, 'h_true': a.h, 'z_true': z_true,
              'model_tip_z': tip[2], 'note': a.note})

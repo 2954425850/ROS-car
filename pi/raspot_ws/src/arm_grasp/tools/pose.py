@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """只读当前姿态（不发指令、不拍照），约 1 秒。
 
-    pose.py [--point 17,0,-12.3]
+    pose.py --point x,y,z
 
-给摆姿态的人一个即时反馈：现在 tip 在哪、α 多少、离瓶盖多远、
+给摆姿态的人一个即时反馈：现在 tip 在哪、α 多少、离目标点多远、
 以及按实测经验这条「看不看得见」。
 """
 import argparse
@@ -51,7 +51,8 @@ def read_feedback(timeout=5.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--point', default='17,0,-12.3')
+    ap.add_argument('--point', required=True,
+                    help='当前目标点 x,y,z（cm，车体安装面系；现测/现给，不用旧值）')
     args = ap.parse_args()
     cap = tuple(float(x) for x in args.point.split(','))
 

@@ -327,6 +327,8 @@ class GraspServer(Node):
                 raise _Abort('BAD_GOAL', f'框不合法：{want}')
             alpha0 = g.alpha0 if g.alpha0 != 0.0 else self.get_parameter('alpha0_default').value
             lift = g.lift_m if g.lift_m > 0.0 else self.get_parameter('lift_m_default').value
+            # z_plane_m 只是占位：require_depth=True 时 estimate_point 绝不使用它，
+            # 缺深度走 NO_DEPTH / Refused，而不是拿旧 1.6cm 平面蒙一个 O。
             cfg = grasp.GraspConfig(z_plane_m=0.016, require_depth=True,
                                     alpha0=float(alpha0), lift_m=float(lift),
                                     joint_comp=float(self.get_parameter('joint_comp').value))
@@ -374,7 +376,9 @@ class GraspServer(Node):
             if obs.depth_mm is None:
                 raise _Abort('NO_DEPTH', '没拿到目标深度（ToF 盲区 <150mm / tof_node 没起？）')
             try:
-                O, _C, _d, _j, _t = grasp.estimate_point(trace, obs, cfg.z_plane_m, cfg.latency_s)
+                O, _C, _d, _j, _t = grasp.estimate_point(
+                    trace, obs, cfg.z_plane_m, cfg.latency_s,
+                    require_depth=cfg.require_depth)
             except Exception as e:     # noqa: BLE001
                 raise _Abort('NO_TARGET', f'算不出目标点：{e}')
             res.target_valid = True

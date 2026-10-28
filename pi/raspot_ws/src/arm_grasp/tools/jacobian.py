@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """实测图像雅可比：臂动一小段，瓶盖像素跟着移动多少。
 
-    jacobian.py --point 17,0,-12.3 [--delta 1.0]
+    jacobian.py --point x,y,z [--delta 1.0]
 
 为什么做这个（2026-09-28）：
   「合成数据能完美还原」是**闭环**——用 project() 生成、又用 project() 拟合，
@@ -49,7 +49,8 @@ def shoot(host, tag):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--point', default='17,0,-12.3')
+    ap.add_argument('--point', required=True,
+                    help='当前标定点 x,y,z（cm，车体安装面系；现测/现给，不用旧值）')
     ap.add_argument('--delta', type=float, default=1.0, help='每个方向的位移 cm')
     ap.add_argument('--out', default='/home/cy/raspot_ws/src/arm_grasp/docs/jacobian.json')
     args = ap.parse_args()

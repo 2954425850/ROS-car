@@ -74,10 +74,11 @@ def tip_open_m(joints):
     return tuple((tip_cm[i] - L4_BACK_CM * zh[i]) / 100.0 for i in range(3))
 
 
-def ik_open_m(x_m, y_m, z_m, alpha_deg):
+def ik_open_m(x_m, y_m, z_m, alpha_deg, branch=-1):
     """把**张开态**爪尖放到 (x, y, z) **米** 的关节角。坑 #2 的正解。
 
     做法：先沿 ẑ(alpha) 把目标推 1.7cm 换成"夹紧态的点"，再交给 `ikine`（它要 cm）。
+    branch 透传给 `ikine`（-1 肘下，+1 肘上）。
     """
     x, y, z = x_m * 100.0, y_m * 100.0, z_m * 100.0
     a = math.radians(alpha_deg)
@@ -85,7 +86,7 @@ def ik_open_m(x_m, y_m, z_m, alpha_deg):
     return ikine(x + L4_BACK_CM * math.cos(a) * math.cos(tb),
                  y + L4_BACK_CM * math.cos(a) * math.sin(tb),
                  z + L4_BACK_CM * math.sin(a),
-                 alpha_deg)
+                 alpha_deg, branch=branch)
 
 
 def fields_in_range(joints, gripper, wrist_roll):

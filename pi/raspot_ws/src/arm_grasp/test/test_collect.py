@@ -228,7 +228,9 @@ def cap_center_for_test(box, dz):
 # plan_poses_aimed：按"相机真能看到瓶盖"排姿态
 # ---------------------------------------------------------------------------
 
-CAP = (17.0, 0.0, -12.3)
+# 纯测试几何点（cm，车体安装面系）——**不是实测标定数据**，只用来让
+# plan_poses_aimed 有一组稳定的可达目标；换真实目标时不要再把它当基准。
+CAP = (17.0, 0.0, -10.0)
 
 
 def _alpha_of(j):
@@ -298,12 +300,14 @@ def test_path_clearance_helper_flags_a_path_through_the_cap():
     要让这段防御代码有非空语义，只能单独把几何那层拎出来测。
     """
     from arm_grasp.collect import _path_clear_of
-    # 同一个高度两侧走，直线正穿瓶盖
-    assert not _path_clear_of((11.0, 0.0, -12.3), (23.0, 0.0, -12.3), CAP, 3.0)
-    # 抬高到瓶盖上方 8cm 就该放行
-    assert _path_clear_of((11.0, 0.0, -4.0), (23.0, 0.0, -4.0), CAP, 3.0)
-    # 端点就贴着瓶盖也不放行
-    assert not _path_clear_of(CAP, (23.0, 0.0, -4.0), CAP, 3.0)
+    # 同一个高度两侧走，直线正穿目标
+    assert not _path_clear_of((CAP[0] - 6, CAP[1], CAP[2]),
+                              (CAP[0] + 6, CAP[1], CAP[2]), CAP, 3.0)
+    # 抬高到目标上方 8cm 就该放行
+    assert _path_clear_of((CAP[0] - 6, CAP[1], CAP[2] + 8),
+                          (CAP[0] + 6, CAP[1], CAP[2] + 8), CAP, 3.0)
+    # 端点就贴着目标也不放行
+    assert not _path_clear_of(CAP, (CAP[0] + 6, CAP[1], CAP[2] + 8), CAP, 3.0)
 
 
 def test_plan_poses_aimed_is_deterministic_and_spread():
@@ -321,4 +325,4 @@ def test_plan_poses_aimed_gives_up_on_a_cap_it_cannot_see():
     """瓶盖远到够不着时必须报错，而不是硬给一堆看不见它的姿态。"""
     from arm_grasp.collect import plan_poses_aimed
     with pytest.raises(RuntimeError):
-        plan_poses_aimed(6, (500.0, 0.0, -12.3))
+        plan_poses_aimed(6, (500.0, 0.0, CAP[2]))

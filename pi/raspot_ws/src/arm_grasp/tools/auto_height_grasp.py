@@ -54,8 +54,10 @@ def plan_measured_grasp(point, cfg):
     print('S0：%s — %s' % (level, msg))
     if level == 'refuse' or target is None:
         raise HeightRefused('measured target is unreachable; grasp refused')
-    pre = grasp.pick_target(point, cfg, cfg.s_pre_m, cfg.alpha0, balance=True)
-    if pre.slack < cfg.min_slack:
+    # 2026-10-28：pick_target 已默认按整段路径余量选解，不再需要 balance=True。
+    pre = grasp.pick_target(point, cfg, cfg.s_pre_m, cfg.alpha0)
+    sl = pre.slack_path if pre.slack_path is not None else pre.slack
+    if sl < cfg.min_slack:
         raise HeightRefused('measured approach has insufficient joint margin')
 
 

@@ -236,8 +236,10 @@ def main(argv=None):
     ap.add_argument('--dry-run', action='store_true',
                     help='只读：算一遍并打出来，**不发任何指令**')
     ap.add_argument('--phase', choices=('aim', 'descend', 'all'), default='aim')
-    ap.add_argument('--cap-z', type=float, default=0.016,
-                    help='瓶盖顶面高度（米）。⚠️ 这个数有 ±1cm 的不确定')
+    ap.add_argument('--cap-z', type=float, default=None,
+                    help='目标顶面高度（米，车体安装面系）——**必填**。'
+                         '这条旧伺服路径没有 ToF 深度，必须由人给当前实测值；'
+                         '不再默认 0.016（车身瓶盖的旧夹具值）')
     ap.add_argument('--max-step', type=float, default=6.0, help='每拍每关节最多走多少度')
     ap.add_argument('--tol-px', type=float, default=10.0,
                     help='对准判据（1280x720 系）；10px ≈ 2mm')
@@ -253,6 +255,10 @@ def main(argv=None):
 
     if args.selftest:
         return selftest()
+    if args.cap_z is None:
+        print('❌ 必须给 --cap-z（目标顶面高度，米，车体安装面系）。')
+        print('   这条旧伺服路径没有 ToF 深度；不再用 0.016 的旧夹具值蒙一个平面。')
+        return 2
 
     os.makedirs(args.out_dir, exist_ok=True)
     host = args.k230_host

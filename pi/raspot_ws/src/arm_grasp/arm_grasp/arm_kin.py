@@ -30,8 +30,8 @@ import math
 # ★★ z 的参考面 = **车体安装面**（不是臂自己的底板！臂底下有支撑）
 #
 #   官方 kinematics.h 的 LINKAGE_1 = 2.89 是「**臂自己的底板** -> 肩关节轴」。
-#   但本项目的**标记点 (17,0,-12.3) 和桌面 (-13.6) 都是从「与车体连接的安装面」
-#   量的**，而那个面比臂的底板低一个**支撑的高度**。两者混用会让末端 z 恒低约 6.8cm。
+#   本项目的任务空间坐标（目标点、支撑面/桌面高度）都从「与车体连接的安装面」量，
+#   那个面比臂的底板低一个**支撑的高度**。两者混用会让末端 z 恒低约 6.8cm。
 #
 #   ★ 2026-09-29 定案：**底座安装面【就是车身】**，这个量 = 车身 -> 肩关节轴
 #     = **9.49 cm**（用户尺子实测；与从 5 次实测末端高度独立反推的 9.41、
@@ -40,7 +40,8 @@ import math
 #   从 6 次合拢状态的实测末端高度独立反推 = 9.0~9.65（均值 9.41，散度 ±0.3）。
 #   改前末端 z 误差 −6.13~−6.76 cm；改后 +0.05~+0.68 cm。
 #
-#   ⇒ **本模块的 z 与标记点/桌面同帧（车体安装面）。** 引用官方那套数值时别再混。
+#   ⇒ **本模块的 z 与目标点/支撑面同帧（车体安装面）。** 引用官方那套数值时别再混。
+#     具体目标高度现在由 ToF/自动测高给出，不再有写死的桌面或标记点坐标。
 L1, L2, L3, L4 = 9.49, 10.43, 8.9, 17.7      # cm
 FACTOR = 1000.0 / 240.0                        # 肩/肘/腕
 BASE_SCALE = 1000.0 / 360.0                    # 底座（本固件）
@@ -53,11 +54,19 @@ class Unreachable(Exception):
     pass
 
 
-def ikine(x, y, z, alpha_deg):
+def ikine(x, y, z, alpha_deg, branch=-1):
     """(x, y, z) 是夹爪尖目标，alpha_deg 是末端下扎角（度，负=往下）。
+
+    branch: 肘支。
+      * -1（默认）= 肘向下，即 k2 = −acos(ck2)，与历史行为逐位一致；
+      * +1        = 肘向上，即 k2 = +acos(ck2)。
+    两支的 |k2| 相同，所以 field 的肘限位对两支一样紧；差别在肩/腕角。
+    默认保持 -1，避免改坏既有调用方。
 
     返回 {'base','shoulder','elbow','wrist_pitch'}，单位度。
     """
+    if branch not in (-1, 1):
+        raise ValueError('branch 只能是 -1 或 +1，收到 %r' % (branch,))
     theta_base = math.degrees(math.atan2(y, x))
     r = math.hypot(x, y)
     a = r - L4 * math.cos(math.radians(alpha_deg))
@@ -65,7 +74,7 @@ def ikine(x, y, z, alpha_deg):
     ck2 = (a * a + b * b - L2 * L2 - L3 * L3) / (2.0 * L2 * L3)
     if not (-1.0 <= ck2 <= 1.0):
         raise Unreachable('no solution, ck2=%.6f' % ck2)
-    k2 = math.atan2(-math.sqrt(1.0 - ck2 * ck2), ck2)
+    k2 = branch * math.acos(max(-1.0, min(1.0, ck2)))
     c = L2 + L3 * math.cos(k2)
     d = L3 * math.sin(k2)
     k1 = math.atan2(c, d) - math.atan2(a, b)

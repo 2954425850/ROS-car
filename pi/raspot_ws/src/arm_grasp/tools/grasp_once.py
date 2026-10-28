@@ -30,10 +30,10 @@
 `--height-session ... --dry-run` 离线重算与预演，不接触 ROS/相机。
 详见 `docs/2026-10-01-auto-height.md`。
 
-手动模式的 `--h` 是尺度来源：
-单目没有距离：用"射线 ∩ z = h 平面"当尺度（design §2.3）。目标面高度默认 0.016 m
-（车身安装面上 1.6cm）。**它进 `cfg.z_plane_m`**，不是随手一个常数 —— 填错 =
-整条链的落点整体偏（`--dry-run` 打印的就是它算出来的 O）。
+手动模式的 `--h` 是**显式**的平面兜底：
+单目没有距离时，用"射线 ∩ z = h 平面"当尺度（design §2.3）。**它进 `cfg.z_plane_m`**，
+填错 = 整条链的落点整体偏（`--dry-run` 打印的就是它算出来的 O）。
+**不给 `--h` 就只认 ToF/结果流实测深度；缺深度直接拒绝，不会用 0.016 或任何默认值蒙一个平面。**
 
 ## 安全（每条都是踩出来的，照抄 `tools/stream_move.py`）
 * **先 `systemctl stop ps2-teleop.service`（不许 kill**，`Restart=always` 会被拉起
@@ -69,7 +69,8 @@ from arm_grasp.arm_kin import from_fields, to_fields
 from arm_grasp.servo import limit_step
 from stream_move import ArmLink, _fmt_fields, _print_rows, _print_trace, _stable_fb
 
-# 默认目标面高度（米）：车身安装面之上 1.6cm（与 Task 6/9 的写法一致）
+# ★ 仅供 --selftest 校验 `build_cfg(h) -> z_plane_m` 的占位值，**不是运行时默认**。
+# 手动模式不给 --h 时 `require_depth=True`，z_plane 根本不会被使用（缺深度就拒绝）。
 DEFAULT_H_M = 0.016
 # 锁框之后等结果流刷出这个框的最长时间（板子 6~10Hz ⇒ 秒级足够）
 OBS_WAIT_S = 5.0
@@ -359,8 +360,9 @@ def selftest():
             print('  ✗ refuse 与 "有没有 Target" 不吻合')
             ok = False
         if tgt is not None:
-            print('    末态 α=%.1f°  field=[%s]  余量=%d count'
-                  % (tgt.alpha, _fmt_fields(tgt.fields[2:5]), tgt.slack))
+            _sl = tgt.slack_path if tgt.slack_path is not None else tgt.slack
+            print('    末态 α=%.1f°  field=[%s]  整段余量=%d（末态 %d）count'
+                  % (tgt.alpha, _fmt_fields(tgt.fields[2:5]), _sl, tgt.slack))
 
     # ③b 不可达点必须是 refuse（这条能红：把 tier 改了就会变）
     try:
@@ -396,8 +398,9 @@ def main(argv=None):
                     help='归一化 l,t,r,b（与板子 8557 同约定，1280x720 推流系）—— '
                          '**人画的那个框**')
     ap.add_argument('--h', type=float, default=None,
-                    help='目标面高度（米），默认 %.3f（安装面上 1.6cm）**进 cfg.z_plane_m**'
-                         % DEFAULT_H_M)
+                    help='手动平面兜底：目标面高度（米，车体安装面系）。'
+                         '**不给就只认 ToF/结果流实测深度；缺深度直接拒绝，'
+                         '不会用任何默认值蒙一个平面**')
     height_mode = ap.add_mutually_exclusive_group()
     height_mode.add_argument('--auto-height', action='store_true',
                              help='先动臂采集多视角照片并自动测高；失败不抓取')
@@ -449,7 +452,9 @@ def main(argv=None):
                          '（默认 30mm，0 = 关掉兜底、退回整轮 refuse）。'
                          '目标在工作空间边缘、臂已套住物体但计划器要更深才肯合时用。')
     ap.add_argument('--alpha0', type=float, default=None,
-                    help='覆盖 cfg.alpha0（下扎轴角的**搜索种子**，默认 −58°）。'
+                    help='覆盖 cfg.alpha0（选解偏好/连续性种子，默认 −58°）。'
+                         '2026-10-28 起 **不再是硬搜索窗**：aim 扫全包络 '
+                         '[−88°,−45°]，桌面目标不需要再手动给 −75°。'
                          '**α0 不是"选哪个 α"，是"从哪开始搜"**：每拍每相位都拿 `prev_alpha` 当'
                          '中心、`span` 当半径去搜，第一拍的中心就是 α0 ⇒ α0 错了、'
                          '真解又在窗外，第一拍就 refuse（臂一步不动）。'
@@ -516,14 +521,16 @@ def main(argv=None):
                     bias_r=args.bias_r,
                     max_seconds=args.max_seconds,
                     require_depth=not explicit_h)
-    print('框 box=%s（归一化）  目标面高 h=%.4f m（%.1f mm）→ cfg.z_plane_m'
-          % (want, args.h, args.h * 1000))
-    if not explicit_h:
-        print('深度来源：实测（require-depth 开）—— %s'
+    if explicit_h:
+        print('框 box=%s（归一化）  目标面高 h=%.4f m（%.1f mm）→ cfg.z_plane_m'
+              % (want, args.h, args.h * 1000))
+        print('深度来源：手填 --h 平面假设（require-depth 关）')
+    else:
+        print('框 box=%s（归一化）  目标面高：**未给** —— 只认实测深度（require-depth 开），'
+              '缺深度直接拒绝，不使用 z_plane 兜底' % (want,))
+        print('深度来源：实测 —— %s'
               % ('Pi 侧 ToF 优先 → K230 结果流兜底' if args.tof
                  else '**ToF 已关**，只认 K230 结果流里的 depth_mm'))
-    else:
-        print('深度来源：手填 --h 平面假设（require-depth 关）')
     print('相位 %s   限速 %.2f°/拍   %.0f Hz' % (args.phase, cfg.max_step_deg, cfg.hz))
 
     collect = None
@@ -622,8 +629,9 @@ def main(argv=None):
               % (obs.src, ' '.join('%.3f' % v for v in obs.box_norm),
                  obs.u_ai, obs.v_ai, obs.frame))
         try:
-            O, C, d, j_fr, t_fr = grasp.estimate_point(trace, obs, cfg.z_plane_m,
-                                                       cfg.latency_s)
+            O, C, d, j_fr, t_fr = grasp.estimate_point(
+                trace, obs, cfg.z_plane_m, cfg.latency_s,
+                require_depth=cfg.require_depth)
         except Exception as e:                                # noqa: BLE001
             print('❌ 算不出目标点 O：%s —— 不动臂。' % e)
             return 1
@@ -639,8 +647,9 @@ def main(argv=None):
         lvl, tgt, msg = grasp.plan_verdict(O, cfg)
         print('S0 判定：%s —— %s' % (lvl, msg))
         if tgt is not None:
-            print('  末态 α=%.1f°  field=[%s]  余量=%d count'
-                  % (tgt.alpha, _fmt_fields(tgt.fields[2:5]), tgt.slack))
+            _sl = tgt.slack_path if tgt.slack_path is not None else tgt.slack
+            print('  末态 α=%.1f°  field=[%s]  整段余量=%d（末态 %d）count'
+                  % (tgt.alpha, _fmt_fields(tgt.fields[2:5]), _sl, tgt.slack))
         else:
             print('  （S0 没给出末态姿态 ⇒ 这个点现在干不了）')
 
@@ -662,9 +671,10 @@ def main(argv=None):
                 return 3
             print('⚠️ 仍按 --yes 继续；aim 相会在第一拍 refuse。')
         elif lvl == 'refuse':
-            print('⚠️ S0 余量只剩 %.0f count（< warn_slack %.0f），但**有可行姿态**'
+            _sl = tgt.slack_path if tgt.slack_path is not None else tgt.slack
+            print('⚠️ S0 整段最小余量只剩 %.0f count（< warn_slack %.0f），但**有可行姿态**'
                   '——按"先试"继续；下扎解不出来会自动走合爪兜底。'
-                  % (tgt.slack, cfg.warn_slack))
+                  % (_sl, cfg.warn_slack))
 
         # 发指令前把**第一拍要发的那条**打出来（人看的就是这个）
         if tgt is not None:
@@ -725,7 +735,9 @@ def main(argv=None):
                     print('   最终 爪尖→目标点 %.2fmm  余量 slack=%s'
                           % (rep['err_m'] * 1000.0,
                              '-' if rep['target'] is None
-                             else '%.0f' % rep['target'].slack))
+                             else '%.0f' % (rep['target'].slack_path
+                                            if rep['target'].slack_path is not None
+                                            else rep['target'].slack)))
                 if args.rows_out:
                     # ★ 诊断用：把**每一拍**都留住（控制回路本身不看它）。
                     #   rows = (t, err, s_ach, α, slack, has_obs)；link_log = (t, 发, 读)。

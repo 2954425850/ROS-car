@@ -17,9 +17,10 @@ import math
 from collections import namedtuple
 
 from . import geom, ltrace
-from .arm_kin import FIELD_HI, FIELD_LO, Unreachable, from_fields, to_fields
-from .servo import (ServoRefused as Refused, field_slack, fields_in_range,
-                    ik_open_m, limit_step, tip_open_m)
+from .arm_kin import FIELD_HI, FIELD_LO, from_fields, to_fields
+from .reach import (NoFeasible, axis_point, enumerate_feasible,
+                    feasible_alpha_intervals, select)
+from .servo import ServoRefused as Refused, limit_step, tip_open_m
 
 JOINT_KEYS = ('base', 'shoulder', 'elbow', 'wrist_pitch')
 
@@ -31,7 +32,11 @@ def _refuse(msg):
 Obs = namedtuple('Obs', 't_arrive u_ai v_ai frame src box_norm depth_mm',
                  defaults=(None,))
 Vis = namedtuple('Vis', 'u_lo u_hi v_lo v_hi')
-Target = namedtuple('Target', 'alpha s_m joints fields slack err_m visible upx vpx')
+Target = namedtuple('Target',
+                    'alpha s_m joints fields slack err_m visible upx vpx slack_path')
+# slack      = 当前 s_m 这一点的余量（兼容旧字段名）
+# slack_path = 整段 s_stop→s_pre 的最小余量（新选解用的安全项；旧构造器不传时为 None）
+Target.__new__.__defaults__ = (None,)
 
 GraspConfig = namedtuple('GraspConfig',
     'alpha_lo alpha_hi alpha_span alpha_step alpha0 '   # α 搜索
@@ -166,20 +171,8 @@ def apply_bias(O_m, bias_m=(0.0, 0.0, 0.0), bias_r_m=0.0):
             z + bias_m[2])
 
 
-def axis_point(O_m, s_m, alpha_deg):
-    """过 O、沿下扎轴 ẑ_T(α) 退 s 的那一点（米）。s=0 就是 O 本身。
-
-    ⚠️ ẑ_T 的水平方向取决于**爪尖自己的方位角**，不是目标点的方位角（两者差
-    atan(s·cosα / r)，s=5cm、r=20cm 时约 7.8°，不是小量）⇒ 迭代一次即可收敛。
-    """
-    tb = math.atan2(O_m[1], O_m[0])
-    for _ in range(2):
-        a = math.radians(alpha_deg)
-        ux, uy, uz = (math.cos(a) * math.cos(tb),
-                      math.cos(a) * math.sin(tb), math.sin(a))
-        T = (O_m[0] - s_m * ux, O_m[1] - s_m * uy, O_m[2] - s_m * uz)
-        tb = math.atan2(T[1], T[0])
-    return T
+# axis_point 现在在 reach.py（grasp import 它，避免 reach ↔ grasp 循环依赖）。
+# 对外 `grasp.axis_point` 仍然可用。
 
 
 def visible(joints, O_m, vis):
@@ -188,10 +181,17 @@ def visible(joints, O_m, vis):
     return (vis.u_lo <= u <= vis.u_hi and vis.v_lo <= v <= vis.v_hi), (u, v)
 
 
-def pick_target(O_m, cfg, s_m, prefer_alpha, vis=None, span=None, balance=False):
-    """在 α 上搜一个把**张开态爪尖**放到 `axis_point(O, s, α)` 的可行姿态。
+def pick_target(O_m, cfg, s_m, prefer_alpha, vis=None, span=None, balance=False,
+                j_prev=None, branches=(-1, 1), step_deg=None, s_samples=None):
+    """在 α 上选一个把**张开态爪尖**放到 `axis_point(O, s, α)` 的可行姿态。
 
-    硬门：p3/p4/p5 ∈ [125,875]。排序：余量最大 → α 最接近 prefer_alpha（连续性，避免每拍换解）。
+    ★ 2026-10-28 起是“全包络可行集 + 整段路径余量 + 字典序选解”：
+      - `span=None`  ⇒ 扫**整个配置包络** `[alpha_lo, alpha_hi]`（aim 用）；
+      - `span=<x>`  ⇒ 只扫 `prefer_alpha ± x`（下扎冻结窗用）；
+      - 每个候选都要在 `s_stop → s_pre` 的整段路径上 field 合法；
+      - 选解：① 整段最小余量最大 → ② α 离 prefer 最近 → ③ 关节行程最少
+        → ④ |α−prefer|、α 本身。详见 `reach.select()`。
+      - `balance` 保留为兼容参数：整段路径余量已经包含“两头一起看”，不再单独处理。
 
     ★★ **"看得见"不能当选择判据** —— 2026-09-30 由变异自检证明，**别再加回来**：
        候选之间 `visible` **恒相同**。证明：`ik_open_m` 恰好把爪尖放在过 O 的下扎轴上，于是
@@ -202,64 +202,69 @@ def pick_target(O_m, cfg, s_m, prefer_alpha, vis=None, span=None, balance=False)
        推论（有用）：**目标在画面里的位置是留量 s 的纯函数** ⇒ "接近阶段看得见吗"由 `s_pre` 决定，
        与目标在哪无关；`visible/upx/vpx` 只当**诊断量**（S0 报给人看），不参与选择。
     """
-
     vis = cfg.vis if vis is None else vis
-    span = cfg.alpha_span if span is None else span
-    cands = []
-    k = 0.0
-    while k <= span + 1e-9:
-        for a in ((prefer_alpha,) if k == 0.0
-                  else (prefer_alpha - k, prefer_alpha + k)):
-            if not (cfg.alpha_lo - 1e-9 <= a <= cfg.alpha_hi + 1e-9):
-                continue
-            T = axis_point(O_m, s_m, a)
-            try:
-                j = ik_open_m(T[0], T[1], T[2], a)
-            except Unreachable:
-                continue
-            ok, f = fields_in_range(j, cfg.gripper, cfg.wrist_roll)
-            if not ok:
-                continue
-            vis_ok, px = visible(j, O_m, vis)
-            sl = field_slack(f)
-            if balance and s_m > 0.0:
-                # ★★ **两头一起看**（2026-10-01 第五跑查明）：下扎轴 α 一旦定下，接触点那个姿态
-                #   也就定了 —— 而"预抓点余量最大"的 α 往往正是"接触点余量最小"的那个。
-                #   实测（r=182mm/z=−106mm）：α=−85 在 8cm 处 slack 106 但末态只剩 43；
-                #   α=−79 末态 67 但 8cm 处只有 13。真机就是栽在这：aim 挑了 −85/−88，
-                #   肩顶到 field 864（离固件上限 875 只差 11）**舵机撑不住** ⇒ 下扎全程跟不上。
-                #   取 `min(此处余量, 接触点余量)` 当排序键 ⇒ 选到的 α 两头都留得下余量（−82：57/57）。
-                #   接触点解不出来 ⇒ 直接判死（−1），别选一个到不了底的角度。
-                try:
-                    Tb = axis_point(O_m, cfg.s_stop_m, a)
-                    jb = ik_open_m(Tb[0], Tb[1], Tb[2], a)
-                    okb, _fb = fields_in_range(jb, cfg.gripper, cfg.wrist_roll)
-                    sl = min(sl, field_slack(_fb)) if okb else -1.0
-                except Unreachable:
-                    sl = -1.0
-            cands.append(Target(a, s_m, j, f, sl,
-                                math.dist(tip_open_m(j), O_m), vis_ok, px[0], px[1]))
-        k += cfg.alpha_step
+    if step_deg is None:
+        step_deg = getattr(cfg, 'alpha_step', 1.0)
+    if span is None:
+        lo, hi = cfg.alpha_lo, cfg.alpha_hi
+    else:
+        lo = max(cfg.alpha_lo, prefer_alpha - span)
+        hi = min(cfg.alpha_hi, prefer_alpha + span)
+    cands = enumerate_feasible(O_m, cfg, s_m, alpha_lo=lo, alpha_hi=hi,
+                               step_deg=step_deg, branches=branches,
+                               s_samples=s_samples)
     if not cands:
-        # ⚠️ 印**搜过的窗口**（alpha0 ± span 再夹到配置包络），别印 cfg.alpha_lo/alpha_hi ——
-        #   印包络会把操作者引向"整个合法范围都搜遍了 ⇒ 这个点不可达"，而真相常常是
-        #   "种子太缓、窗口没够到，换 --alpha0 就行"。2026-10-02 真机实测：默认 α0=−58°
-        #   窗口只有 [−72°,−45°]，桌面高度的真解在 −73°…−88°，**恰好落在印出来的那个
-        #   −88°…−45° 里面** ⇒ 照着这句话判断会直接放弃一个本来抓得到的点。
-        lo, hi = sorted((max(cfg.alpha_lo, prefer_alpha - span),
-                         min(cfg.alpha_hi, prefer_alpha + span)))
-        # 只有窗口没铺满包络时才提换种子 —— 铺满了就没什么可搜的了，再提就是误导。
-        hint = ('；窗口没铺满配置包络 [%.0f°,%.0f°]，可换 --alpha0 再试'
-                % (cfg.alpha_lo, cfg.alpha_hi)
-                if lo > cfg.alpha_lo + 1e-9 or hi < cfg.alpha_hi - 1e-9 else '')
-        raise _refuse('搜过的 α∈[%.0f°,%.0f°]（种子 α0=%.0f°、半径 %.0f°）、'
-                      '留量 %.1fcm 下无可行姿态（不可解或越界）%s'
-                      % (lo, hi, prefer_alpha, span, s_m * 100, hint))
-    good = cands          # ← 别加 visible 过滤：那是恒等变换（证明见 docstring）
-    top = max(c.slack for c in good)
-    near = [c for c in good if c.slack >= top - cfg.slack_tie]
-    near.sort(key=lambda c: (abs(c.alpha - prefer_alpha), c.alpha))
-    return near[0]
+        # 2026-10-28：现在印的是**真正扫过的窗口**（全包络时就是包络本身），
+        # 并且把“几何/field 都不可行”说清楚；不再把种子窗伪装成包络。
+        tag = ('全包络 [%.0f°,%.0f°]' % (lo, hi) if span is None
+               else '[%.0f°,%.0f°]（prefer %.0f° ± %.0f°）'
+                    % (lo, hi, prefer_alpha, span))
+        # 额外诊断：只查当前留量 s_m 时有没有可行 α（区分“几何/限位不行”
+        # 和“末态行、整段下扎不行”）。
+        endpoint = enumerate_feasible(O_m, cfg, s_m, alpha_lo=lo, alpha_hi=hi,
+                                      step_deg=step_deg, branches=branches,
+                                      s_samples=[s_m])
+        if endpoint:
+            iv = ', '.join('[%.0f°,%.0f°]' % (a, b) for a, b in
+                           feasible_alpha_intervals(endpoint))
+            extra = ('；只查留量 %.1fcm 时这些 α 可行 %s，但整段路径不可行'
+                     % (s_m * 100.0, iv))
+        else:
+            extra = '；当前留量处也没有可行 α（几何不可解或 field 越界）'
+        raise _refuse('搜过的 α∈%s、留量 %.1fcm 下无整段可行姿态%s'
+                      % (tag, s_m * 100.0, extra))
+    try:
+        c = select(cands, cfg, alpha_prev=prefer_alpha,
+                   prefer_alpha=prefer_alpha, j_prev=j_prev)
+    except NoFeasible as e:
+        raise _refuse(str(e))
+    vis_ok, px = visible(c.joints, O_m, vis)
+    return Target(c.alpha, s_m, c.joints, c.fields, c.slack,
+                  math.dist(tip_open_m(c.joints), O_m), vis_ok, px[0], px[1],
+                  c.min_slack)
+
+
+def pick_target_descend(O_m, cfg, s_m, anchor_alpha, j_prev=None):
+    """下扎相选解：以**进相时的 α** 为锚，窗口不够时逐级放宽。
+
+    为什么不能每拍拿上一拍 α 当窗口中心（2026-10-28）：可行区间随 s 移动，
+    逐拍中心会“随机游走” —— 实测 α 从 −61 漂到 −64，沿轴指令累计上行 5.3mm。
+    锚定后先试**精确锚（0°）**；中间点无解才 3°→7°→14°→全包络放大，并更新锚。
+
+    返回 Target（`slack_path` 已填）。
+    """
+    # 先试**精确锚**：aim 选出的 α 已经通过整段路径检查，理论上可以钉死一条直线；
+    # 只有采样间隙导致中间点无解时，才 3°→7°→14°→全包络放宽。
+    spans = (0.0, cfg.alpha_freeze_span, 7.0, 14.0,
+             cfg.alpha_hi - cfg.alpha_lo)
+    last = None
+    for sp in spans:
+        try:
+            return pick_target(O_m, cfg, s_m, anchor_alpha,
+                               span=sp, j_prev=j_prev)
+        except Refused as e:      # noqa: PERF203 — 逐级放宽本来就要吞
+            last = e
+    raise last
 
 
 def tier(slack, cfg):
@@ -286,21 +291,23 @@ def plan_verdict(O_m, cfg, vis=None):
     # 诊断（见 pick_target docstring 的推论）：目标投影像素只由留量 s 决定 ⇒
     # "接近阶段看得见吗 / 在不在可锁带里"是 s_pre 的函数，与目标在哪无关。S0 就报出来给人看。
     try:
-        tp = pick_target(O_m, cfg, cfg.s_pre_m, cfg.alpha0, vis, balance=True)
-        pix = '；s_pre=%.1fcm 处：预测像素 (%.0f, %.0f) %s有效区（可锁带 v ≤ %.0f）、slack %.0f' % (
+        tp = pick_target(O_m, cfg, cfg.s_pre_m, cfg.alpha0, vis)
+        sp = tp.slack_path if tp.slack_path is not None else tp.slack
+        pix = '；s_pre=%.1fcm 处：预测像素 (%.0f, %.0f) %s有效区（可锁带 v ≤ %.0f）、整段余量 %.0f' % (
             cfg.s_pre_m * 100, tp.upx, tp.vpx,
-            '在' if tp.visible else '**不在**', 0.893 * 180.0, tp.slack)
+            '在' if tp.visible else '**不在**', 0.893 * 180.0, sp)
     except Refused as e:
         pix = '；但 s_pre=%.1fcm 处解不出姿态：%s' % (cfg.s_pre_m * 100, e)
-    lvl = tier(t.slack, cfg)
+    sl = t.slack_path if t.slack_path is not None else t.slack
+    lvl = tier(sl, cfg)
     if lvl == 'refuse':
         return ('refuse', t,
-                '余量只剩 %d count（< %d）——臂已到工作空间边缘，'
-                '把目标往底座方向挪 5~8cm 再来%s' % (t.slack, cfg.warn_slack, pix))
+                '整段最小余量只剩 %d count（< %d）——臂已到工作空间边缘，'
+                '把目标往底座方向挪 5~8cm 再来%s' % (sl, cfg.warn_slack, pix))
     if lvl == 'warn':
-        return ('warn', t, '余量 %d count（< %d）——接近限位，成功率可能下降%s'
-                % (t.slack, cfg.min_slack, pix))
-    return 'ok', t, '余量 %d count%s' % (t.slack, pix)
+        return ('warn', t, '整段最小余量 %d count（< %d）——接近限位，成功率可能下降%s'
+                % (sl, cfg.min_slack, pix))
+    return 'ok', t, '整段最小余量 %d count%s' % (sl, pix)
 
 
 def limit_step_floor(j_cur, j_des, max_step_deg, min_step_deg):
@@ -354,12 +361,17 @@ def standoff_along_axis(tip_m, O_m, alpha_deg):
 # → 按相位给目标 → 限速发一帧。**没有任何一处会阻塞在"等到位"上**。
 # --------------------------------------------------------------------------
 
-def estimate_point(trace, obs, z_plane_m, latency_s):
+def estimate_point(trace, obs, z_plane_m, latency_s, require_depth=False):
     """一条观测 → 基座系目标点 O。
 
     ★ 两条路：
       * `obs.depth_mm` 有值（ToF 实测）⇒ **射线 × 实测光轴深度**。这是首选。
       * 否则 ⇒ 老的 **射线 ∩ 假设平面 z=z_plane_m**（`--h` 兜底路径）。
+
+    ★ `require_depth=True` 时**禁止**走第二条路：没有实测深度就 Refused。
+      这是"绝不拿 1.6cm 车身瓶盖平面蒙一个 O"的硬闸。它按**每一条观测**生效，
+      不只是第一条 —— 上一版本的 `run()` 只在进 descend 前查过"见过一次深度"，
+      后续观测丢深度时仍会静默回落，这个参数就是补那个洞。
 
     返回 (O, C, d, joints, t_frame)。**绝不返回垃圾深度** —— 算不出来一律 Refused。
     """
@@ -375,6 +387,11 @@ def estimate_point(trace, obs, z_plane_m, latency_s):
         except ValueError as e:
             raise _refuse('算不出目标点（实测深度）：%s' % e)
         return P, C, d, j, t_frame
+    if require_depth:
+        raise _refuse('这一条观测没有实测深度（require_depth=True）—— '
+                      '拒绝用 z=%.1fmm 的假设平面蒙一个目标点；'
+                      '请检查 ToF/结果流，或手动给 --h'
+                      % (z_plane_m * 1000.0))
     try:
         P, _, _ = geom.target_from_pixel(j, obs.u_ai, obs.v_ai, z_plane_m)
     except ValueError as e:
@@ -467,13 +484,14 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         est.update(initial_point)
     rep = {'phase': phase, 'ticks': 0, 'stopped': None, 'ok': False,
            'O_last': None, 'obs_n': 0, 'obs_bad': 0, 'obs_lost': False,
-           'depth_seen': False,
+           'depth_seen': False, 'depth_refused': 0,
            'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None, 'comp': None,
            'target': None, 's_ach_m': None, 'rows': [], 'phases': [], 'O_phase_end': []}
     dt = 1.0 / cfg.hz
     j_ref, cmd_sent, f_prev, near = None, None, None, 0
     f_now = None          # 上一拍的 field（底座外环补偿要用；本拍的更晚才算）
     prev_alpha = cfg.alpha0
+    descend_alpha = None   # 下扎相的 α 锚（进相时定；只有窗口放宽才改）
     stall, best = 0, None
     s_cmd = cfg.s_pre_m
     t0 = None
@@ -490,7 +508,6 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
     j_prev_cmd = None     # 上一拍的**未补偿**关节指令（限速的起点，见 ④）
     phase_ticks = 0       # 本相已走几拍
     aim_hold = False      # 'aim' 相：已贴到目标 ⇒ 冻结 O 与 α（见 cfg.aim_hold_m）
-    wide_tried = False    # 'aim' 相：α0 窗口无解时铺满包络重试过没有（只试一次）
 
     def advance_or_stop(reason):
         """本相结束：有下一相就切过去（返回 True 继续），最后一相就定稿（返回 False）。
@@ -499,6 +516,7 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         """
         nonlocal cur, near, stall, best, phase_ticks, hold_j, j_ref, s_cmd
         nonlocal close_cmd, close_stuck, p1_prev, p1_start, close_armed, comps, grip_hold
+        nonlocal descend_alpha
         # 第三项 = 本相走了几拍。**量"时间花在哪一相"全靠它**（47s 里到底是接近慢、
         # 下扎慢、还是合爪慢，不量就只能猜）。放最后一位，读 `p[0]/p[1]` 的调用方不受影响。
         rep['phases'].append((cur, reason, phase_ticks))
@@ -528,6 +546,9 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
             #   清成 None、抬起相就落到 close_field(578) ⇒ "碰上东西就冻结"之后，**抬起时照样全力夹**。
             grip_hold = close_cmd
         cur = seq[k]
+        if cur == 'descend':
+            # 下扎锚 = aim 收尾时的 α。之后窗口中心固定，不再逐拍游走。
+            descend_alpha = prev_alpha
         near, stall, best, phase_ticks = 0, 0, None, 0
         hold_j, j_ref, s_cmd = None, None, cfg.s_pre_m
         close_cmd, close_stuck, p1_prev = None, 0, None
@@ -565,13 +586,15 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         elif initial_point is not None and obs_age is not None:
             obs_age += dt
         if obs is not None:
+            # obs_age 从**第一条观测**开始计时（哪怕它随后被 Refused 掉）；
+            # 只有算出 O 才清零。否则"有框但没深度"会永远走不到丢失判据。
+            if obs_age is None and initial_point is None:
+                obs_age = 0.0
             # 盲区硬闸（require_depth）：记下"本轮到底见过没有真实 ToF 深度"。
             # 用 `rep` 而不是局部变量，省得在闭包 `advance_or_stop` 里纠结 `nonlocal`，
             # 而且报告里也留了证据。（见设计 §6。）
             if getattr(obs, 'depth_mm', None) is not None:
                 rep['depth_seen'] = True
-            if initial_point is None:
-                obs_age = 0.0
             try:
                 if initial_point is not None:
                     validate_measured_observation(trace, obs, initial_point, cfg.latency_s)
@@ -579,18 +602,41 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                     rep['obs_n'] += 1
                 elif cur == 'aim' and aim_hold:
                     # ★ 已经贴到目标（见 cfg.aim_hold_m）：**不再更新 O**。
-                    #   观测照旧算"见到目标"（上面的 obs_age 已清零），
-                    #   但运动中的框/深度配出来的 O 会漂，不能拿来移动目标点。
+                    #   观测照旧算"见到目标"，但运动中的框/深度配出来的 O 会漂，
+                    #   不能拿来移动目标点。
+                    obs_age = 0.0
                     rep['obs_n'] += 1
                 else:
                     O_new, C_obs, d_obs, j_obs, t_fr = estimate_point(
-                        trace, obs, cfg.z_plane_m, cfg.latency_s)
+                        trace, obs, cfg.z_plane_m, cfg.latency_s,
+                        require_depth=cfg.require_depth)
+                    # ★ 只有**算出了 O** 才算"见到目标"：estimate_point 因缺深度
+                    #   被拒绝时不能把 obs_age 清零，否则 require_depth 会一直等到
+                    #   max_ticks 也不报"没有深度"（2026-10-28 补）。
+                    obs_age = 0.0
                     if est.update(O_new):
                         rep['obs_n'] += 1
                     else:
                         rep['obs_bad'] += 1
             except Refused as e:
                 rep['obs_bad'] += 1
+                if cfg.require_depth and '没有实测深度' in str(e):
+                    rep['depth_refused'] += 1
+                    # ★ 一直算不出 O（连一条深度都没见过）时别干等到 max_ticks：
+                    #   连续 patience 拍没有深度就明确停住。等 patience 是为了容忍
+                    #   ToF 的瞬时掉帧；patience=25 @10Hz = 2.5s。
+                    if est.O is None and rep['depth_refused'] >= cfg.patience:
+                        rep['stopped'] = (
+                            '没有实测深度（require_depth=True）：连续 %d 拍没有深度，'
+                            '拒绝用 z=%.1fmm 平面兜底；请检查 ToF/结果流，'
+                            '或手动给 --h' % (rep['depth_refused'],
+                                             cfg.z_plane_m * 1000.0))
+                        break
+                # ★ 观测**存在但不可用**也要推进 obs_age：否则缺深度时每拍都
+                #   Refused、obs_age 恒 0，永远走不到"观测丢失"的停止点，
+                #   最后只是撞 max_ticks 且 stopped=None（2026-10-28 补）。
+                if obs_age is not None and initial_point is None:
+                    obs_age += dt
                 log('  [obs] 丢：%s' % e)
                 if initial_point is not None:
                     rep['stopped'] = '已测目标核验失败：%s' % e
@@ -603,6 +649,19 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
             rep['stopped'] = '超时（%.0fs）' % cfg.max_seconds
             break
         if est.O is None:
+            # ★ 还没算出 O 时也要判"观测丢失/缺深度"：否则每拍都在这里 continue，
+            #   永远走不到后面那个 obs_lost 检查点，最后撞 max_ticks 且 stopped=None
+            #   （2026-10-28：require_depth + 全程无深度时实测）。
+            if obs_age is not None and obs_age > cfg.obs_lost_s:
+                rep['obs_lost'] = True
+                if cfg.require_depth and rep['depth_refused']:
+                    rep['stopped'] = (
+                        '没有实测深度（require_depth=True）：已拒绝 %d 次 '
+                        'z=%.1fmm 平面兜底；始终没算出目标点'
+                        % (rep['depth_refused'], cfg.z_plane_m * 1000.0))
+                else:
+                    rep['stopped'] = '观测丢失 %.1fs（还没算出目标点）' % obs_age
+                break
             if fbf is not None:                          # 还没见到目标 → 原地不动
                 cmd_sent = j_ref = to_fields(from_fields(fbf), cfg.gripper, cfg.wrist_roll)
                 j_prev_cmd = None
@@ -662,18 +721,30 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                              to_fields(hold_j, close_cmd, cfg.wrist_roll),
                              0.0, 0.0, True, 0.0, 0.0)
             else:
-                # ★ 一旦离开 aim 就把 α **冻住**：下扎必须是一条**直线**。
-                #   实机实测（2026-10-01）：下扎中 α 自己从 −60° 漂到 −67° ⇒ 轴线转向 ⇒
-                #   爪尖沿旧轴走下去、横向偏出 4.6cm（比瓶盖还大）⇒ 夹在瓶盖**后面**。
-                # ⚠️ 中心必须跟上一拍的 α（±span 内搜）：可行 α 区间**随留量 s 移动**，
-                #   钉死进相那一刻的 α 会在半路无解（2026-10-21 试过冻结中心，
-                #   `test_descend_reaches_s_stop_despite_feedback_lag` 立刻红）。
-                # aim 贴住之后也把 α 搜索窗收到 ±alpha_freeze_span：
-                # 否则 O 虽冻结，±alpha_span(14°) 的候选仍会随余量排序换来换去。
-                span = (None if (cur == 'aim' and not aim_hold)
-                        else cfg.alpha_freeze_span)
-                tgt = pick_target(O_u, cfg, s_cmd, prev_alpha,
-                                  span=span, balance=(cur == 'aim'))
+                # ★ 下扎必须是一条**直线**（2026-10-01 实测：α 漂 7° ⇒ 轴线转向
+                #   ⇒ 爪尖横向偏 4.6cm，夹到瓶盖后面）。2026-10-28 起 aim 选出的
+                #   α 已经通过**整段路径**检查，所以下扎可以**钉死这个锚**；只有
+                #   采样间隙导致中间点无解时，才在 `pick_target_descend()` 里
+                #   0°→3°→7°→14°→全包络逐级放宽，并更新锚。
+                # aim 贴住之后也把搜索窗收到 ±alpha_freeze_span：否则 O 虽冻结，
+                # 候选仍会随余量排序换来换去。
+                if cur == 'descend':
+                    # 下扎：窗口中心锚在进相时的 α（单独跑 --phase descend 时用
+                    # 当前实际姿态的 α 当锚）。窗口内不够才逐级放宽；放宽后才改锚。
+                    if descend_alpha is None:
+                        descend_alpha = (j_cur_m['shoulder'] + j_cur_m['elbow']
+                                         + j_cur_m['wrist_pitch'])
+                    tgt = pick_target_descend(O_u, cfg, s_cmd, descend_alpha,
+                                              j_prev=j_cur_m)
+                    # 精确锚成功时 tgt.alpha == descend_alpha；只有放宽后才改锚
+                    # （把新 α 作为下一拍继续钉死的直线）。
+                    if abs(tgt.alpha - descend_alpha) > 1e-9:
+                        descend_alpha = tgt.alpha
+                else:
+                    span = (None if (cur == 'aim' and not aim_hold)
+                            else cfg.alpha_freeze_span)
+                    tgt = pick_target(O_u, cfg, s_cmd, prev_alpha,
+                                      span=span, j_prev=j_cur_m)
         except Refused as e:
             # ★★ 下扎已经到 s_stop 地板、几何上解不出更深的姿态，但**爪尖已经进合爪窗口**：
             #   这不是"这轮抓不了"，而是"机械极限先到了" ⇒ 直接进合爪。
@@ -692,24 +763,10 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                         % (s_cmd * 1000.0, e, err_now * 1000.0)):
                     break
                 continue
-            # 对准阶段在 α0±alpha_span 窗口里解不出 ⇒ 先把窗口铺满整个包络再试一次，
-            # 别因为种子 α0 选得不好就整轮放弃（2026-10-21：α0=-58 窗口无解，-75 就行）。
-            if cur == 'aim' and not aim_hold and not wide_tried:
-                wide_tried = True
-                try:
-                    tgt = pick_target(O_u, cfg, s_cmd, prev_alpha,
-                                      span=cfg.alpha_hi - cfg.alpha_lo, balance=True)
-                    log('  [aim] α0 窗口无解，铺满包络后找到 α=%.1f°' % tgt.alpha)
-                except Refused as e2:
-                    # 预抓位（留量 s_pre 处）解不出姿态 ⇒ 别报"够不着"整轮放弃。
-                    # 目标在机械极限内时，臂能下扎到极限 + 合爪兜底套住它
-                    # （2026-10-22 用户：瓶盖 25cm 实测够得着，aim 留量处解不出却报"够不着"）。
-                    log('  [aim] 预抓位解不出（%s）⇒ 直接下扎兜底' % e2)
-                    if not advance_or_stop('refuse：接近相解不出预抓位（直接下扎兜底）'):
-                        break
-                    continue
-            elif cur == 'aim':
-                # 贴住后（aim_hold）窄窗口内解不出 ⇒ 同样下扎兜底，别整轮放弃
+            # 2026-10-28：aim 相现在默认扫**整个包络**，不再需要“窗口无解 → 铺满
+            # 包络重试”。预抓位解不出就直接下扎兜底，别整轮放弃（2026-10-22 用户：
+            # 瓶盖 25cm 实测够得着，aim 留量处解不出却报“够不着”）。
+            if cur == 'aim':
                 log('  [aim] 预抓位解不出（%s）⇒ 直接下扎兜底' % e)
                 if not advance_or_stop('refuse：接近相解不出预抓位（直接下扎兜底）'):
                     break
@@ -815,7 +872,8 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         rep['err_m'] = err_act
         rep['s_ach_m'] = s_ach
         rep['comp'] = comps
-        rep['rows'].append((now, err_act, s_ach, tgt.alpha, tgt.slack,
+        rep['rows'].append((now, err_act, s_ach, tgt.alpha,
+                            tgt.slack_path if tgt.slack_path is not None else tgt.slack,
                             0.0 if obs is None else 1.0))
 
         # ⑤ 判据 / 阶段切换（全用实际量）
@@ -938,7 +996,13 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                 and obs_age > cfg.obs_lost_s:
             rep['obs_lost'] = True
             if cur == 'aim':
-                rep['stopped'] = '观测丢失 %.1fs（接近阶段丢了就停下）' % obs_age
+                if cfg.require_depth and rep['depth_refused']:
+                    rep['stopped'] = (
+                        '没有实测深度（require_depth=True）：已拒绝 %d 次 '
+                        'z=%.1fmm 平面兜底；观测丢失 %.1fs'
+                        % (rep['depth_refused'], cfg.z_plane_m * 1000.0, obs_age))
+                else:
+                    rep['stopped'] = '观测丢失 %.1fs（接近阶段丢了就停下）' % obs_age
                 break
 
     rep['ok'] = bool(rep['stopped']) and rep['stopped'].startswith(
