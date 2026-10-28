@@ -1,0 +1,20 @@
+# 生产环境（云服务器）。所有密钥仍来自环境变量，本文件不含任何机密。
+server:
+  forward-headers-strategy: framework
+
+spring:
+  jpa:
+    show-sql: false
+  datasource:
+    hikari:
+      # 2 核 / 1.7 GB：堆限 512m，连接池也要克制
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      minimum-idle: ${DB_POOL_MIN_IDLE:2}
+
+logging:
+  level:
+    root: INFO
+    com.robot.upper: INFO
+    com.robot.upper.robot.gateway.RosbridgeClient: WARN
+  file:
+    name: ${LOG_FILE:/var/log/robot-upper/backend.log}

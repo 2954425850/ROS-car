@@ -1,0 +1,13 @@
+# 开发环境：默认 MOCK 网关（无真机也能跑通全链路），日志放宽
+app:
+  robot:
+    gateway: ${APP_ROBOT_GATEWAY:MOCK}
+
+logging:
+  level:
+    com.robot.upper: DEBUG
+    com.robot.upper.robot.gateway.RosbridgeClient: INFO
+
+spring:
+  jpa:
+    show-sql: false

@@ -1,0 +1,109 @@
+spring:
+  application:
+    name: robot-upper-computer
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/robot_upper}
+    username: ${DB_USERNAME:robot}
+    # 无默认值 —— 留空即被 RequiredEnvValidator 拦下，进程拒绝启动（验收 B2）
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      # 1.7 GB 内存的机器：连接池别开大，每条连接都是内存
+      minimum-idle: ${DB_POOL_MIN_IDLE:2}
+      connection-timeout: 10000
+  jpa:
+    hibernate:
+      ddl-auto: validate          # Schema 由 Flyway 管理，JPA 只校验
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc.time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # 占位符（初始管理员用户名/密码哈希）由 FlywayConfig 从 AppProperties 显式注入 ——
+    # 不用 spring.flyway.placeholders.*：那条 Map 绑定的 key 大小写会漂移，
+    # 一旦漂移，V2 迁移里的 ${adminPasswordHash} 就替换不到。
+  jackson:
+    # ★ 刻意**不设** default-property-inclusion: non_null。
+    #   status 契约要求 voltage 字段**存在且为 null**（"电池电压不可用"是一个事实，
+    #   不是"字段没实现"）—— 全局 NON_NULL 会把它整个抹掉，前端就分不清两者。
+    #   需要省 null 的地方各自加 @JsonInclude(NON_NULL)：WsMessage、ApiError。
+    serialization:
+      write-dates-as-timestamps: false
+  servlet:
+    multipart:
+      max-request-size: 8MB
+      max-file-size: 8MB
+
+server:
+  port: ${SERVER_PORT:8080}
+  forward-headers-strategy: framework  # 置于 Nginx 之后
+  compression:
+    enabled: false                     # 视频是 chunked 字节流，压缩只会添乱
+  tomcat:
+    max-swallow-size: -1
+    connection-timeout: 60000
+
+app:
+  robot:
+    gateway: ${APP_ROBOT_GATEWAY:MOCK}
+    # 经反向隧道映射到树莓派 rosbridge（协议契约 §6.2）
+    bridge-url: ${APP_ROBOT_BRIDGE_URL:ws://127.0.0.1:19090}
+    reconnect-seconds: ${APP_ROBOT_RECONNECT_SECONDS:30}
+    # 上限频率：指令"变化即发"时的速率封顶，防高频客户端打满隧道
+    pump-max-hz: ${APP_ROBOT_PUMP_MAX_HZ:50}
+    client-timeout-ms: ${APP_ROBOT_CLIENT_TIMEOUT_MS:3000}
+    limits:
+      max-vx: ${APP_ROBOT_LIMITS_MAX_VX:0.5}
+      max-wz: ${APP_ROBOT_LIMITS_MAX_WZ:1.5}
+      # U7 决议：协议全范围 500~2500（有扫齿风险，见 docs/07-决议记录.md §2.1）
+      gimbal-min-us: ${APP_ROBOT_LIMITS_GIMBAL_MIN_US:500}
+      gimbal-max-us: ${APP_ROBOT_LIMITS_GIMBAL_MAX_US:2500}
+      over-limit-policy: ${APP_ROBOT_LIMITS_OVER_LIMIT_POLICY:CLAMP}
+  auth:
+    # 无默认值（验收 B1）
+    jwt-secret: ${JWT_SECRET:}
+    token-ttl-minutes: ${JWT_TTL_MINUTES:60}
+    admin-username: ${ADMIN_USERNAME:}
+    admin-password-hash: ${ADMIN_PASSWORD_HASH:}
+  security:
+    cors-allowed-origins: ${APP_CORS_ALLOWED_ORIGINS:}
+  video:
+    url: ${APP_VIDEO_URL:/video/stream}
+    kind: ${APP_VIDEO_KIND:mpegts}
+    codec: ${APP_VIDEO_CODEC:}
+    width: ${APP_VIDEO_WIDTH:1280}
+    height: ${APP_VIDEO_HEIGHT:720}
+    fps: ${APP_VIDEO_FPS:30}
+    bitrate-kbps: ${APP_VIDEO_BITRATE_KBPS:2000}
+    h264-listen: ${APP_VIDEO_H264_LISTEN:0.0.0.0:8555}
+    ffmpeg-path: ${APP_FFMPEG_PATH:}
+    healthy-window-ms: ${APP_VIDEO_HEALTHY_WINDOW_MS:2000}
+    # 每订阅者缓冲块数（1 块 = 16KB ≈ 65ms @2Mbps）。越小延迟越低、越怕抖动。
+    # 原值 16 ≈ 1 秒蓄水池（按"不反压 ffmpeg"选，非按延迟选）→ 改为 2 ≈ 130ms
+    fanout-queue-size: ${APP_VIDEO_FANOUT_QUEUE_SIZE:2}
+    shutdown-grace-ms: ${APP_VIDEO_SHUTDOWN_GRACE_MS:15000}
+  results:
+    listen: ${APP_RESULTS_LISTEN:0.0.0.0:8556}
+    max-hz: ${APP_RESULTS_MAX_HZ:10}
+    max-line-bytes: ${APP_RESULTS_MAX_LINE_BYTES:8192}
+  ai:
+    provider: ${APP_AI_PROVIDER:null}
+    api-key: ${APP_AI_API_KEY:}
+    base-url: ${APP_AI_BASE_URL:}
+    model: ${APP_AI_MODEL:}
+    history-rounds: ${APP_AI_HISTORY_ROUNDS:20}
+    timeout-ms: ${APP_AI_TIMEOUT_MS:30000}
+  audit:
+    enabled: ${APP_AUDIT_ENABLED:true}
+    queue-capacity: ${APP_AUDIT_QUEUE_CAPACITY:2000}
+
+logging:
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{traceId:-}] %logger{36} - %msg%n"
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.robot.upper: ${LOG_LEVEL_APP:INFO}
+    # rosbridge 客户端重连很频繁，日志量控制住
+    com.robot.upper.robot.gateway.RosbridgeClient: ${LOG_LEVEL_BRIDGE:WARN}

@@ -1,0 +1,52 @@
+[Unit]
+Description=Robot Upper Computer Backend (robot-upper)
+# 注意：Documentation= 只接受 URI。写本地路径（尤其含中文）会被 systemd 拒绝并
+# 报 "Invalid URL, ignoring"，所以文档位置只写在注释里：
+#   /opt/robot-upper/deploy/ + docs/部署手册-云服务器.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+# 视频收流要连 ffmpeg 子进程，网络就绪后再起更稳
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=robot-upper
+Group=robot-upper
+WorkingDirectory=/opt/robot-upper
+
+# 所有密钥/地址来自这里，单元文件本身不含机密
+EnvironmentFile=/etc/robot-upper/backend.env
+
+# ★ 验收 J6：堆必须显式限制（服务器只有 1.7 GB 内存）
+#   512m 堆 + 192m Metaspace + 线程栈，留足余量给 ffmpeg 与 PostgreSQL。
+#   SerialGC：2 核小堆场景下比 G1 省几十 MB，且停顿更可预测。
+ExecStart=/usr/bin/java \
+    -Xmx512m -Xms128m \
+    -XX:MaxMetaspaceSize=192m \
+    -XX:+UseSerialGC \
+    -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/log/robot-upper \
+    -Dfile.encoding=UTF-8 -Duser.timezone=UTC \
+    -jar /opt/robot-upper/backend.jar \
+    --spring.profiles.active=prod
+
+# 视频/结果端口是 8555/8556（>1024），无需任何特权
+AmbientCapabilities=
+CapabilityBoundingSet=
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/log/robot-upper
+
+Restart=on-failure
+RestartSec=5s
+# SIGTERM 后给足时间：@PreDestroy 要发零速、杀 ffmpeg、关收流端口
+TimeoutStopSec=30s
+SuccessExitStatus=143
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=robot-upper
+
+[Install]
+WantedBy=multi-user.target
