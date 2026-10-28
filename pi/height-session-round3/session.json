@@ -1,0 +1,185 @@
+{
+  "schema": "arm_grasp.height_session/v1",
+  "coordinate_frame": "raw_stream",
+  "calibration_id": "997e38fcd4e619bb8ce0a29da8ac590731c169c40cb99b40ab355f424ac4dd5e",
+  "calibration": {
+    "intrinsics": [
+      277.25526835902406,
+      276.3123247310423,
+      150.21484884942453,
+      97.14799560154957,
+      [
+        0.17965918630312014,
+        -0.7166182076277368,
+        0.00782884309815537,
+        0.0027021964720660633,
+        0.8938154550073525
+      ],
+      320,
+      180
+    ],
+    "cam_closed_m": [
+      -0.0075,
+      0.034,
+      -0.136
+    ],
+    "sigma": -1.0,
+    "arm_lengths_cm": [
+      9.49,
+      10.43,
+      8.9,
+      17.7
+    ],
+    "stream_size": [
+      1280,
+      720
+    ],
+    "coordinate_frame": "raw_stream",
+    "wrist_roll_field": 496.0
+  },
+  "reference_box": [
+    0.395,
+    0.09,
+    0.535,
+    0.33
+  ],
+  "views": [
+    {
+      "image": "view-00.jpg",
+      "fields": [
+        243.0,
+        499.0,
+        181.0,
+        149.0,
+        643.0,
+        13.0
+      ],
+      "joints": {
+        "base": 4.680000000000001,
+        "shoulder": 55.68,
+        "elbow": -84.24,
+        "wrist_pitch": -76.55999999999999
+      },
+      "feedback_samples": 15,
+      "feedback_span_counts": [
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "image": "view-01.jpg",
+      "fields": [
+        243.0,
+        499.0,
+        181.0,
+        181.0,
+        664.5,
+        13.0
+      ],
+      "joints": {
+        "base": 4.680000000000001,
+        "shoulder": 50.52,
+        "elbow": -76.55999999999999,
+        "wrist_pitch": -76.55999999999999
+      },
+      "feedback_samples": 14,
+      "feedback_span_counts": [
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "image": "view-02.jpg",
+      "fields": [
+        243.0,
+        499.0,
+        181.0,
+        148.0,
+        647.0,
+        31.0
+      ],
+      "joints": {
+        "base": 11.16,
+        "shoulder": 54.720000000000006,
+        "elbow": -84.47999999999999,
+        "wrist_pitch": -76.55999999999999
+      },
+      "feedback_samples": 16,
+      "feedback_span_counts": [
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "image": "view-03.jpg",
+      "fields": [
+        243.0,
+        499.0,
+        181.0,
+        148.0,
+        647.0,
+        -7.0
+      ],
+      "joints": {
+        "base": -2.52,
+        "shoulder": 54.720000000000006,
+        "elbow": -84.47999999999999,
+        "wrist_pitch": -76.55999999999999
+      },
+      "feedback_samples": 21,
+      "feedback_span_counts": [
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        1.0,
+        1.0
+      ]
+    }
+  ],
+  "scan_config": {
+    "lateral_base_deg": 8.0,
+    "use_base_views": true,
+    "radial_m": 0.02,
+    "max_tip_travel_m": 0.035,
+    "max_joint_travel_deg": 12.0,
+    "plan_travel_margin_deg": 2.0,
+    "max_step_deg": 1.5,
+    "min_field_margin": 8.0,
+    "max_feedback_undershoot": 8.0,
+    "max_feedback_drift": 2.0,
+    "max_feedback_spike": 6.0,
+    "max_base_exposure_drift": 10.0,
+    "arrived_tolerance": 12.0,
+    "stationary_seconds": 1.0,
+    "move_timeout_s": 12.0,
+    "shot_timeout_s": 4.0
+  },
+  "complete": true,
+  "reason": null,
+  "known_support_z_m": -0.1355,
+  "support_z_source": "firmware_0x56_base",
+  "base_angle": {
+    "support_z_mm": -135.5,
+    "orientation": "front",
+    "source": "firmware_0x56_base",
+    "angle_deg": 4.68,
+    "field": 13.0,
+    "pot_raw": 521.0,
+    "status": 3,
+    "known": true
+  },
+  "acquisition_seconds": 29.67952623300016
+}
