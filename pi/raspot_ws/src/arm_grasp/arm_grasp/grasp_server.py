@@ -412,6 +412,14 @@ class GraspServer(Node):
             if res.code == 'REFUSED' and 'aim' not in done:
                 res.code = 'OUT_OF_REACH'      # 对准都没完成 ⇒ 这个点臂够不着（车臂联动看这个）
             res.reason = rep.get('stopped') or '超过最大拍数'
+            # ★ 2026-10-30：下扎中途就地合爪、且爪尖离 s_stop 目标点 >12mm 时，
+            #   后面 close/lift 仍会“成功”，但用户看到的是没抓到。不能报 OK。
+            fb_err = rep.get('fallback_err_m')
+            if rep.get('descend_fallback') and fb_err is not None and fb_err > 0.012:
+                res.ok = False
+                res.code = 'REFUSED'
+                res.reason = ('下扎没到位：爪尖离 s_stop 目标点 %.1fmm（>12mm），'
+                              '就地合爪位置可能偏，未确认抓住' % (fb_err * 1000.0))
             try:
                 res.err_m = float(rep.get('err_m'))
             except (TypeError, ValueError):

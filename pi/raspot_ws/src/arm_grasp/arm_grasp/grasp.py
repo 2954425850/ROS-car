@@ -245,26 +245,16 @@ def pick_target(O_m, cfg, s_m, prefer_alpha, vis=None, span=None, balance=False,
 
 
 def pick_target_descend(O_m, cfg, s_m, anchor_alpha, j_prev=None):
-    """下扎相选解：以**进相时的 α** 为锚，窗口不够时逐级放宽。
+    """下扎相选解：**只接受进相时钉死的 α**，不换解、不漂。
 
-    为什么不能每拍拿上一拍 α 当窗口中心（2026-10-28）：可行区间随 s 移动，
-    逐拍中心会“随机游走” —— 实测 α 从 −61 漂到 −64，沿轴指令累计上行 5.3mm。
-    锚定后先试**精确锚（0°）**；中间点无解才 3°→7°→14°→全包络放大，并更新锚。
-
-    返回 Target（`slack_path` 已填）。
+    2026-10-30 真机：aim 选 −86、下扎中途放宽到 −81，最后爪尖离目标 17.7mm
+    （用户看到“又往下扎了一点，偏了”）。下扎改成硬冻结：
+      · 成功路径是 aim 选出的 α（它已通过整段路径检查）；
+      · 精确 α 在某个 s 解不出 ⇒ 抛 Refused，交给 run 的“就地合爪”兜底，
+        **不要换一个 3° 外的 α 继续扎**。
+    这样轴线是一条直线，不会因为逐拍放宽而漂。
     """
-    # 先试**精确锚**：aim 选出的 α 已经通过整段路径检查，理论上可以钉死一条直线；
-    # 只有采样间隙导致中间点无解时，才 3°→7°→14°→全包络放宽。
-    spans = (0.0, cfg.alpha_freeze_span, 7.0, 14.0,
-             cfg.alpha_hi - cfg.alpha_lo)
-    last = None
-    for sp in spans:
-        try:
-            return pick_target(O_m, cfg, s_m, anchor_alpha,
-                               span=sp, j_prev=j_prev)
-        except Refused as e:      # noqa: PERF203 — 逐级放宽本来就要吞
-            last = e
-    raise last
+    return pick_target(O_m, cfg, s_m, anchor_alpha, span=0.0, j_prev=j_prev)
 
 
 def tier(slack, cfg):
@@ -485,6 +475,7 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
     rep = {'phase': phase, 'ticks': 0, 'stopped': None, 'ok': False,
            'O_last': None, 'obs_n': 0, 'obs_bad': 0, 'obs_lost': False,
            'depth_seen': False, 'depth_refused': 0,
+           'descend_fallback': False, 'fallback_err_m': None,
            'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None, 'comp': None,
            'target': None, 's_ach_m': None, 'rows': [], 'phases': [], 'O_phase_end': []}
     dt = 1.0 / cfg.hz
@@ -600,10 +591,11 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                     validate_measured_observation(trace, obs, initial_point, cfg.latency_s)
                     obs_age = 0.0
                     rep['obs_n'] += 1
-                elif cur == 'aim' and aim_hold:
-                    # ★ 已经贴到目标（见 cfg.aim_hold_m）：**不再更新 O**。
-                    #   观测照旧算"见到目标"，但运动中的框/深度配出来的 O 会漂，
-                    #   不能拿来移动目标点。
+                elif (cur == 'aim' and aim_hold) or (cur == 'descend' and est.O is not None):
+                    # ★ 贴住目标（aim_hold）或进入下扎后：**不再更新 O**。
+                    #   2026-10-30 真机：下扎期间 O 随观测漂 → 可行的 α 区间变 →
+                    #   选解从 −86 放宽到 −81 → 爪尖横向偏 17.7mm。
+                    #   目标是静止的，aim 阶段一条干净观测足够；下扎只沿固定 O 走。
                     obs_age = 0.0
                     rep['obs_n'] += 1
                 else:
@@ -728,18 +720,17 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                 #   0°→3°→7°→14°→全包络逐级放宽，并更新锚。
                 # aim 贴住之后也把搜索窗收到 ±alpha_freeze_span：否则 O 虽冻结，
                 # 候选仍会随余量排序换来换去。
-                if cur == 'descend':
-                    # 下扎：窗口中心锚在进相时的 α（单独跑 --phase descend 时用
-                    # 当前实际姿态的 α 当锚）。窗口内不够才逐级放宽；放宽后才改锚。
-                    if descend_alpha is None:
-                        descend_alpha = (j_cur_m['shoulder'] + j_cur_m['elbow']
-                                         + j_cur_m['wrist_pitch'])
+                if cur == 'descend' and descend_alpha is None:
+                    # 单独跑 --phase descend：没有 aim 给的锚。只在**第一拍**用
+                    # 全包络选一个整段可行的 α，选完立即锁死；之后不再换解。
+                    tgt = pick_target(O_u, cfg, s_cmd, prev_alpha,
+                                      span=None, j_prev=j_cur_m)
+                    descend_alpha = tgt.alpha
+                elif cur == 'descend':
+                    # 硬冻结：只接受进相时的 α；解不出就抛给下面的“就地合爪”兜底，
+                    # 绝不换一个 α 继续扎（2026-10-30：−86 漂到 −81 后偏 17.7mm）。
                     tgt = pick_target_descend(O_u, cfg, s_cmd, descend_alpha,
                                               j_prev=j_cur_m)
-                    # 精确锚成功时 tgt.alpha == descend_alpha；只有放宽后才改锚
-                    # （把新 α 作为下一拍继续钉死的直线）。
-                    if abs(tgt.alpha - descend_alpha) > 1e-9:
-                        descend_alpha = tgt.alpha
                 else:
                     span = (None if (cur == 'aim' and not aim_hold)
                             else cfg.alpha_freeze_span)
@@ -770,8 +761,12 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
             if cur == 'descend':
                 T_stop = axis_point(O_u, cfg.s_stop_m, prev_alpha)
                 err_now = math.dist(tip_open_m(j_cur_m), T_stop)
+                # 给 grasp_server 判“这轮是否真的到位”：偏差大时不能报 OK。
+                rep['descend_fallback'] = True
+                rep['fallback_err_m'] = err_now
                 if not advance_or_stop(
-                        '下扎到机械极限：s=%.1fmm 处无可行姿态（%s）；爪尖离 s_stop 目标点 %.1fmm ⇒ 就地合爪'
+                        '下扎到机械极限：锚定 α 在 s=%.1fmm 处无可行姿态（%s）；'
+                        '爪尖离 s_stop 目标点 %.1fmm ⇒ 就地合爪'
                         % (s_cmd * 1000.0, e, err_now * 1000.0)):
                     break
                 continue
