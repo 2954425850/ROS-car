@@ -122,6 +122,11 @@ class GraspServer(Node):
         self.declare_parameter('normal_arm_t_ms', 40)        # 抓完还原成这个（= 驱动默认）
         self.declare_parameter('driver_node', 'l150pro_driver')
         self.declare_parameter('use_tof', True)
+        # 2026-10-30：真机 descend 结束爪尖离目标稳定 ~11.7mm；grasp_once 的
+        # --bias-r 帮助里早写着“这臂几乎每次偏后 ~1cm，要消掉填 −1(cm)”。
+        # 这里补上服务端径向偏置（mm，+ = 目标向外）。可运行时调：
+        #   ros2 param set /arm_grasp_server bias_r_mm -8
+        self.declare_parameter('bias_r_mm', -10.0)
 
         cb = ReentrantCallbackGroup()
         self.fb = None
@@ -332,9 +337,11 @@ class GraspServer(Node):
             lift = g.lift_m if g.lift_m > 0.0 else self.get_parameter('lift_m_default').value
             # z_plane_m 只是占位：require_depth=True 时 estimate_point 绝不使用它，
             # 缺深度走 NO_DEPTH / Refused，而不是拿旧 1.6cm 平面蒙一个 O。
-            cfg = grasp.GraspConfig(z_plane_m=0.016, require_depth=True,
-                                    alpha0=float(alpha0), lift_m=float(lift),
-                                    joint_comp=float(self.get_parameter('joint_comp').value))
+            cfg = grasp.GraspConfig(
+                z_plane_m=0.016, require_depth=True,
+                alpha0=float(alpha0), lift_m=float(lift),
+                joint_comp=float(self.get_parameter('joint_comp').value),
+                bias_r_m=float(self.get_parameter('bias_r_mm').value) / 1000.0)
 
             # ① 锁框（臂还没动，失败可重试）
             self._feedback(gh, 'preflight', '锁框')
