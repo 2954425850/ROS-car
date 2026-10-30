@@ -747,9 +747,13 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                     #   2026-10-30 真机：用默认路径检查把抬起解误拒成 REFUSED。
                     s_samples = None
                     if cur == 'lift':
-                        s_samples = path_samples(
-                            cfg, s_lo=cfg.s_stop_m,
-                            s_hi=max(cfg.s_stop_m, s_cmd))
+                        # 从**当前实际留量**开始查，不从 s_stop 开始：
+                        # 下扎可能停在 s_stop 之上（实测 3.9mm），要求它先回到
+                        # 3mm 再抬是多余的，而且可能把本来可行的抬起解拒掉。
+                        s_now = standoff_along_axis(
+                            tip_open_m(j_cur_m), O_u, prev_alpha)
+                        s_lo = min(s_cmd, max(cfg.s_stop_m, s_now))
+                        s_samples = path_samples(cfg, s_lo=s_lo, s_hi=s_cmd)
                     tgt = pick_target(O_u, cfg, s_cmd, prev_alpha,
                                       span=span, j_prev=j_cur_m,
                                       s_samples=s_samples)
