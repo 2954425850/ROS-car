@@ -85,6 +85,23 @@ def test_select_travel_breaks_equal_continuity():
                         j_prev=j_prev) is near
 
 
+def test_lift_path_does_not_require_full_descent():
+    """★ 2026-10-30 真机：抬起相只需要 s_stop→s_stop+lift 可行。
+
+    这里的目标/α 在下扎整段路径上不可行，但在抬起这一段可行；如果 pick_target
+    仍拿整段路径检查，就会把抬起解误拒成 REFUSED。
+    """
+    cfg = _cfg()._replace(lift_m=0.055)
+    O = (0.15, 0.0, -0.04)
+    s_m = cfg.s_stop_m + cfg.lift_m
+    assert not reach.enumerate_feasible(O, cfg, s_m, alpha_lo=-85.0,
+                                        alpha_hi=-85.0)
+    lift = reach.path_samples(cfg, s_lo=cfg.s_stop_m, s_hi=s_m)
+    cands = reach.enumerate_feasible(O, cfg, s_m, alpha_lo=-85.0,
+                                     alpha_hi=-85.0, s_samples=lift)
+    assert cands and cands[0].min_slack > 0.0
+
+
 def test_feasible_intervals_merges_contiguous_alphas():
     assert reach.feasible_alpha_intervals(
         [_cand(-88, 1), _cand(-87, 1), _cand(-85, 1)]) == [[-88.0, -87.0],

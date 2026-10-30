@@ -56,9 +56,15 @@ def axis_point(O_m, s_m, alpha_deg):
     return T
 
 
-def path_samples(cfg, n=9):
-    """下扎路径的留量采样（米），含 s_stop 与 s_pre 两端。"""
-    lo, hi = float(cfg.s_stop_m), float(cfg.s_pre_m)
+def path_samples(cfg, n=9, s_lo=None, s_hi=None):
+    """留量路径的采样（米），含两端。
+
+    默认是下扎路径 `s_stop → s_pre`；**抬起相要传 `s_hi=s_stop+lift_m`** ——
+    抬起只走 `s_stop → s_stop+lift`，不需要整段下扎路径都可行（2026-10-30 真机：
+    用整段路径检查把抬起解误拒成 REFUSED）。
+    """
+    lo = float(cfg.s_stop_m if s_lo is None else s_lo)
+    hi = float(cfg.s_pre_m if s_hi is None else s_hi)
     if hi <= lo or n < 2:
         return [lo]
     return [lo + i * (hi - lo) / float(n - 1) for i in range(n)]

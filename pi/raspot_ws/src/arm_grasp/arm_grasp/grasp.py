@@ -19,7 +19,7 @@ from collections import namedtuple
 from . import geom, ltrace
 from .arm_kin import FIELD_HI, FIELD_LO, from_fields, to_fields
 from .reach import (NoFeasible, axis_point, enumerate_feasible,
-                    feasible_alpha_intervals, select)
+                    feasible_alpha_intervals, path_samples, select)
 from .servo import ServoRefused as Refused, limit_step, tip_open_m
 
 JOINT_KEYS = ('base', 'shoulder', 'elbow', 'wrist_pitch')
@@ -743,8 +743,16 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                 else:
                     span = (None if (cur == 'aim' and not aim_hold)
                             else cfg.alpha_freeze_span)
+                    # ★ 抬起只走 s_stop → s_stop+lift，不该要求整段下扎路径都可行。
+                    #   2026-10-30 真机：用默认路径检查把抬起解误拒成 REFUSED。
+                    s_samples = None
+                    if cur == 'lift':
+                        s_samples = path_samples(
+                            cfg, s_lo=cfg.s_stop_m,
+                            s_hi=max(cfg.s_stop_m, s_cmd))
                     tgt = pick_target(O_u, cfg, s_cmd, prev_alpha,
-                                      span=span, j_prev=j_cur_m)
+                                      span=span, j_prev=j_cur_m,
+                                      s_samples=s_samples)
         except Refused as e:
             # ★★ 下扎已经到 s_stop 地板、几何上解不出更深的姿态，但**爪尖已经进合爪窗口**：
             #   这不是"这轮抓不了"，而是"机械极限先到了" ⇒ 直接进合爪。
