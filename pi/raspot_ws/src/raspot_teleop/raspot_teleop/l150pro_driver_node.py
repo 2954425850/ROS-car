@@ -61,9 +61,15 @@ FAULT_IMU = 0x08
 
 CTRL_WAIT_MAX_S = 25.0       # 等固件报 control-live 的兜底上限（回位最长约 17s）
 # 复位窗口兜底。固件报 control-live 时窗口精确在 READY 那一刻结束，这只是上限。
-# ★ 2026-10-28 现场：动作走完到固件重新消费 0xAC 之间还有几秒（用户："复位完了还是
-#   摇不动，过几秒突然冲出去"）。取 25s = 回位最长 17s + 这段延迟 + 余量。
+# ★ 2026-10-28 现场：复位最长实测到 >25s（五关节 + 底座回中的行程决定），取 25s。
 RESET_GUARD_S = 25.0
+# 复位请求发出后多久还没看到固件进 HOMING（control-live=0），就认定这次请求没被执行。
+# 固件收帧到置 HOMING 只需 ~60ms，2s 是极宽的余量。
+# ★ 2026-10-30 现场：re-home 是**边沿**触发，而边沿只在下一帧 flags=0 的 0xAC 被消费
+#   时才复位；复位窗口把期间的 0xAC 全掐了 ⇒ 复位后只要用户不碰臂，固件那位一直挂着
+#   ⇒ 下一次 START 被**静默忽略**（日志：status 没有 0x0b(HOMING)、也没有 0x80(ESTOP)
+#   ⇒ ArmCanRehome 是放行的，就是边沿丢了），而窗口还在傻等 25s。
+RESET_ARM_S = 2.0
 CMD_STALE_S = 0.5            # /cmd_vel 超时视为上游死亡 → 零速
 VOLT_WARN_MV = 10500
 
@@ -397,6 +403,15 @@ class L150ProDriverNode(Node):
         # 固件跑的和上电同一套流程：五关节 → ARM_RESET_POSE，然后底座重锚 + 回中。
         # 这一帧的数值会被固件在归位后用自己的影子覆盖，所以这里发当前位姿只是把
         # "五关节原地不动"这个意图写清楚；真正决定结果的是固件那两条影子赋值。
+        # ★ 2026-10-30：先补一帧 flags=0 把固件的边沿锁存清掉，再发复位帧。
+        #   固件的 re-home 是边沿触发（ArmFlags 是"最近一帧的快照"，边沿要等下一帧
+        #   flags=0 被消费才复位）。复位窗口期间我们把 0xAC 全掐了，用户复位后不碰臂
+        #   ⇒ 没有任何 flags=0 的帧被消费 ⇒ 固件一直认为"还按着" ⇒ 下一次 START 被
+        #   静默忽略。两帧之间隔 60ms：arm 任务 50Hz（20ms 一拍），保证前清帧先被读走。
+        #   清边沿帧的数值 = 当前位姿，不含运动意图。
+        self.seq_ac = (self.seq_ac + 1) & 0xFF
+        self.rx.send(build_arm(*self.last_joints, self.last_base, 0, 0x00, self.seq_ac))
+        time.sleep(0.06)
         self.seq_ac = (self.seq_ac + 1) & 0xFF
         keep = keep_gripper or bool(self.get_parameter('rehome_keep_gripper').value)
         flags = ARM_FLAG_REHOME | (ARM_FLAG_KEEP_GRIPPER if keep else 0)
@@ -599,6 +614,14 @@ class L150ProDriverNode(Node):
                     (now - self.reset_t0) > RESET_GUARD_S:
                 self.get_logger().info(
                     f'复位窗口结束（{now - self.reset_t0:.1f}s）：恢复臂指令')
+                self.reset_t0 = None
+            elif self.ctrl_ever and not self.reset_saw_dead and \
+                    (now - self.reset_t0) > RESET_ARM_S:
+                # 固件压根没进 HOMING ⇒ 这次复位请求没被执行（边沿丢了/帧丢了），
+                # 没必要继续把臂锁着 —— 固件一直在 READY，指令本来就会被正常消费。
+                self.get_logger().warn(
+                    f'复位请求 {now - self.reset_t0:.1f}s 内没被执行'
+                    '（固件没进 HOMING，臂没动），提前放行')
                 self.reset_t0 = None
         # 现在能不能给臂下 0xAC。只在收到过 0x56 之后发：没数据 ≠ 固件在复位
         # （否则 driver 刚起那一秒 ps2_teleop 会把臂门住）。
