@@ -781,14 +781,17 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
             #   现在：**下扎途中任何一处解不出更深的姿态 ⇒ 就地合爪**，不再看距离。
             if cur == 'descend':
                 T_stop = axis_point(O_u, cfg.s_stop_m, prev_alpha)
-                err_now = math.dist(tip_open_m(j_cur_m), T_stop)
+                tip_now = tip_open_m(j_cur_m)
+                err_now = math.dist(tip_now, T_stop)
+                vec_now = tuple((T_stop[i] - tip_now[i]) * 1000.0 for i in range(3))
                 # 给 grasp_server 判“这轮是否真的到位”：偏差大时不能报 OK。
                 rep['descend_fallback'] = True
                 rep['fallback_err_m'] = err_now
                 if not advance_or_stop(
                         '下扎到机械极限：锚定 α 在 s=%.1fmm 处无可行姿态（%s）；'
-                        '爪尖离 s_stop 目标点 %.1fmm ⇒ 就地合爪'
-                        % (s_cmd * 1000.0, e, err_now * 1000.0)):
+                        '爪尖离 s_stop 目标点 %.1fmm（向量 %.1f,%.1f,%.1fmm）⇒ 就地合爪'
+                        % (s_cmd * 1000.0, e, err_now * 1000.0,
+                           vec_now[0], vec_now[1], vec_now[2])):
                     break
                 continue
             # 2026-10-28：aim 相现在默认扫**整个包络**，不再需要“窗口无解 → 铺满
@@ -820,10 +823,13 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         # ④ 限速参考 + 发
         # ★ 判据一律用**回读**算出来的实际量：`tgt.err_m` 是"目标姿态自己到 O 的距离"，
         #   它恒等于 s（因为姿态就是按 T=O+s·(−ẑ) 解出来的），拿它当收敛判据 ⇒ 永远不收敛。
-        j_cur = from_fields(trace.at(link.now(), 'auto'))
+        # ★ 必须用**同一拍已经过滤过 p6 的**回读；原来这里又 trace.at 一次原始值，
+        #   把 p6 毛刺重新引进来 ⇒ tip_act/s_ach/err_act 全被污染（2026-10-30）。
+        j_cur = j_cur_m
         tip_act = tip_open_m(j_cur)
         T_goal = axis_point(O_u, s_cmd, tgt.alpha)
         err_act = math.dist(tip_act, T_goal)
+        err_vec_mm = tuple((T_goal[i] - tip_act[i]) * 1000.0 for i in range(3))
         s_ach = standoff_along_axis(tip_act, O_u, tgt.alpha)
         # ★ 贴近 s_pre 之后冻结 O/α（见 cfg.aim_hold_m）：第一次进窗口就锁住，
         #   之后臂在一个固定的目标点上收敛。窗口外的接近段照常每拍更新。
@@ -936,8 +942,10 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                 stall += 1
         if cur == 'aim' and (err_act <= cfg.tol_m or near >= 3):
             if not advance_or_stop('对准完成：爪尖离目标点 %.1fmm（余量 %.1fcm，α=%.1f°；'
-                                   '回读与目标差 %d count ⇒ 已到舵机死区边界）'
-                                   % (err_act * 1000, s_cmd * 100, tgt.alpha, round(lag))):
+                                   '回读与目标差 %d count ⇒ 已到舵机死区边界；'
+                                   '误差向量 %.1f,%.1f,%.1fmm）'
+                                   % (err_act * 1000, s_cmd * 100, tgt.alpha, round(lag),
+                                      err_vec_mm[0], err_vec_mm[1], err_vec_mm[2])):
                 break
             continue
         # ★ 判据带 `min_gain_m`(0.5mm) 容差，**不是**裸的 `s_ach <= cfg.s_stop_m`：
@@ -957,10 +965,12 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
             # ★ 必须**两个条件同时成立**：沿轴到 s_stop / 回读进死区，**且**实际 3D
             #   误差 ≤ 10mm。只看 s_ach 会把“横向偏 2cm”误判成扎到位（2026-10-30）。
             if (at_floor or near >= 3) and err_act <= DESCEND_ERR_TOL_M:
-                if not advance_or_stop('扎到位：实际余量 %.1fmm（爪尖离目标 %.1fmm；%s）'
+                if not advance_or_stop('扎到位：实际余量 %.1fmm（爪尖离目标 %.1fmm；%s；'
+                                       '误差向量 %.1f,%.1f,%.1fmm）'
                                        % (s_ach * 1000, err_act * 1000,
                                           '留量到 s_stop' if at_floor
-                                          else '回读已达舵机死区极限 %d 拍' % near)):
+                                          else '回读已达舵机死区极限 %d 拍' % near,
+                                          err_vec_mm[0], err_vec_mm[1], err_vec_mm[2])):
                     break
                 continue
         if cur == 'close' and close_cmd is not None and close_cmd >= cfg.close_field - 1.0 \
@@ -1027,8 +1037,10 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
             rep['descend_fallback'] = True
             rep['fallback_err_m'] = err_act
             if not advance_or_stop(
-                    '下扎到机械极限：s=%.1fmm；爪尖离目标 %.1fmm（>10mm）且 %d 拍不动 ⇒ 就地合爪'
-                    % (s_cmd * 1000.0, err_act * 1000.0, stall)):
+                    '下扎到机械极限：s=%.1fmm；爪尖离目标 %.1fmm（>10mm，向量 %.1f,%.1f,%.1fmm）'
+                    '且 %d 拍不动 ⇒ 就地合爪'
+                    % (s_cmd * 1000.0, err_act * 1000.0,
+                       err_vec_mm[0], err_vec_mm[1], err_vec_mm[2], stall)):
                 break
             continue
         if stall >= cfg.patience:
