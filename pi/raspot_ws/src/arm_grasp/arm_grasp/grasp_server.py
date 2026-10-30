@@ -110,7 +110,10 @@ class GraspServer(Node):
 
     def __init__(self):
         super().__init__('arm_grasp_server')
-        self.declare_parameter('alpha0_default', -75.0)      # 桌面高度的目标要 -75（-58 窗口够不着）
+        # 2026-10-30 真机：同一目标 α=−88 下扎后爪尖离目标 3.8mm，α=−81 却是 22.7mm
+        # （浅角下扎横向漂）。这臂可靠的抓取角在 −84…−88，默认种子改 −84；
+        # 需要浅角的目标仍可在 goal 里显式给 alpha0。
+        self.declare_parameter('alpha0_default', -84.0)
         self.declare_parameter('lift_m_default', 0.055)      # 用户流程：抬 5~6cm
         # 关节下垂补偿增益（GraspConfig.joint_comp）。0 = 关掉。A/B 用（2026-10-22 查扎深）：
         # ros2 param set /arm_grasp_server joint_comp 0.0 后抓一次，对比是否还压进桌面。
