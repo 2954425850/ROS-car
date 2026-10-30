@@ -38,6 +38,11 @@ Target = namedtuple('Target',
 # slack_path = 整段 s_stop→s_pre 的最小余量（新选解用的安全项；旧构造器不传时为 None）
 Target.__new__.__defaults__ = (None,)
 
+# ★ 下扎“到位”的 3D 误差上限（米）。`s_ach` 只是**沿轴投影**：爪尖横向偏 2cm 时
+#   它仍可能只有 3mm。2026-10-30 真机就是“s_ach=3.2mm、爪尖离目标 22.8mm”被当成
+#   扎到位，合爪后没抓到。必须同时要求实际 3D 误差够小。
+DESCEND_ERR_TOL_M = 0.010
+
 GraspConfig = namedtuple('GraspConfig',
     'alpha_lo alpha_hi alpha_span alpha_step alpha0 '   # α 搜索
     'min_slack warn_slack slack_tie '                   # S0 三级 + 并列宽容
@@ -476,6 +481,7 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
            'O_last': None, 'obs_n': 0, 'obs_bad': 0, 'obs_lost': False,
            'depth_seen': False, 'depth_refused': 0,
            'descend_fallback': False, 'fallback_err_m': None,
+           'base_glitch': 0,
            'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None, 'comp': None,
            'target': None, 's_ach_m': None, 'rows': [], 'phases': [], 'O_phase_end': []}
     dt = 1.0 / cfg.hz
@@ -483,6 +489,7 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
     f_now = None          # 上一拍的 field（底座外环补偿要用；本拍的更晚才算）
     prev_alpha = cfg.alpha0
     descend_alpha = None   # 下扎相的 α 锚（进相时定；只有窗口放宽才改）
+    base_fb_prev = None    # p6 回读连续性过滤（电位器毛刺会让 base_comp 乱补）
     stall, best = 0, None
     s_cmd = cfg.s_pre_m
     t0 = None
@@ -673,6 +680,20 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         #   每次都一路合到 close_field —— 用户明确否决过的"全力抓"其实一直没被修掉。
         #   合爪相的一切判据**只许用 `p1_read`**。
         f_raw = trace.at(link.now(), 'auto')
+        # ★ 2026-10-30 黑匣子抓到：底座 p6 回读会在 40ms 内 -9→+129→-342
+        #   （电位器毛刺，不是真实运动）。base_comp 拿它补底座 ⇒ 底座指令乱摆 ⇒
+        #   爪尖横向偏 2cm。p6 每拍变化超过 60 count（21.6°，物理不可能）就沿用上一拍。
+        if len(f_raw) >= 6:
+            _b = float(f_raw[5])
+            if base_fb_prev is not None and abs(_b - base_fb_prev) > 60.0:
+                f_raw = list(f_raw)
+                f_raw[5] = base_fb_prev
+                rep['base_glitch'] += 1
+                if rep['base_glitch'] <= 3:
+                    log('  [base] p6 回读跳变 %.0f→%.0f（>60 count），本拍沿用上一拍'
+                        % (base_fb_prev, _b))
+            else:
+                base_fb_prev = _b
         j_cur_m = from_fields(f_raw)
         p1_read = float(f_raw[0])
         if cur == 'descend':
@@ -931,13 +952,17 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         #   **5.7mm**，离 3.5mm 的判据只差 2mm，而舵机死区让它**再也动不了** ⇒ 25 拍后
         #   被"卡住"判死、白跑一整轮。接近相**一直**用第二种判据（`tol_m` 那条比硬件还细，
         #   真机永远满足不了），下扎相漏了。**别再把这条删掉。**
-        if cur == 'descend' and (s_ach <= cfg.s_stop_m + cfg.min_gain_m or near >= 3):
-            if not advance_or_stop('扎到位：实际余量 %.1fmm（爪尖离目标 %.1fmm；%s）'
-                                   % (s_ach * 1000, err_act * 1000,
-                                      '留量到 s_stop' if s_ach <= cfg.s_stop_m + cfg.min_gain_m
-                                      else '回读已达舵机死区极限 %d 拍' % near)):
-                break
-            continue
+        if cur == 'descend':
+            at_floor = s_ach <= cfg.s_stop_m + cfg.min_gain_m
+            # ★ 必须**两个条件同时成立**：沿轴到 s_stop / 回读进死区，**且**实际 3D
+            #   误差 ≤ 10mm。只看 s_ach 会把“横向偏 2cm”误判成扎到位（2026-10-30）。
+            if (at_floor or near >= 3) and err_act <= DESCEND_ERR_TOL_M:
+                if not advance_or_stop('扎到位：实际余量 %.1fmm（爪尖离目标 %.1fmm；%s）'
+                                       % (s_ach * 1000, err_act * 1000,
+                                          '留量到 s_stop' if at_floor
+                                          else '回读已达舵机死区极限 %d 拍' % near)):
+                    break
+                continue
         if cur == 'close' and close_cmd is not None and close_cmd >= cfg.close_field - 1.0 \
                 and p1_read >= cfg.close_field - cfg.deadband_counts:
             # ★ **读回也到了底**才算"合到底"。判据必须查读回、不能只查指令：2026-10-01 第三跑
@@ -993,6 +1018,17 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
             # 抬起来了：沿轴留量从 s_stop 涨到 lift_m 的 80%
             if not advance_or_stop('抬升完成：沿轴留量 %.1fcm（目标 %.1fcm）'
                                    % (s_ach * 100, cfg.lift_m * 100)):
+                break
+            continue
+        if cur == 'descend' and s_ach <= cfg.s_stop_m + cfg.min_gain_m \
+                and err_act > DESCEND_ERR_TOL_M and stall >= cfg.patience:
+            # 已经到 s_stop 地板、但 3D 偏差仍 >10mm，且臂连续 patience 拍不动：
+            # 不是“扎到位”，是横向/机械极限。就地合爪并让 server 报未确认抓住。
+            rep['descend_fallback'] = True
+            rep['fallback_err_m'] = err_act
+            if not advance_or_stop(
+                    '下扎到机械极限：s=%.1fmm；爪尖离目标 %.1fmm（>10mm）且 %d 拍不动 ⇒ 就地合爪'
+                    % (s_cmd * 1000.0, err_act * 1000.0, stall)):
                 break
             continue
         if stall >= cfg.patience:
