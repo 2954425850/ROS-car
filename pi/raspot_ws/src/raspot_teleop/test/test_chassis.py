@@ -237,13 +237,21 @@ def test_ps2_lateral_deadzone():
 
 
 def test_ps2_reverse_is_proportional_after_deadzone():
-    """后拉：行程中点（y≈0.56）为 0，拉满为 -gear；倒车时转向方向与前进一致。"""
+    """后拉：行程中点（y≈0.56）为 0，拉满为 -gear。"""
     dz = CFG_PS2['STICK_DEADZONE']
     mid = dz + 0.5 * (1.0 - dz)
     assert chassis.ps2_drive(0.0, mid, 0.50, CFG_PS2) == pytest.approx((0.0, 0.0))
     assert chassis.ps2_drive(0.0, 1.0, 0.50, CFG_PS2) == pytest.approx((-0.50, 0.0))
-    # 满左推 + 满倒车：wz 仍 >0（左转），不因倒车翻向
-    assert chassis.ps2_drive(-1.0, 1.0, 0.50, CFG_PS2) == pytest.approx((-0.50, 0.50))
+
+
+def test_ps2_reverse_steering_flips_with_vx():
+    """倒车时转向翻向（原厂 `if(Move_X<0) Move_Z=-Move_Z`）：
+    后退中左推 → wz<0（车尾往左），右推 → wz>0（车尾往右）。"""
+    assert chassis.ps2_drive(-1.0, 1.0, 0.50, CFG_PS2) == pytest.approx((-0.50, -0.50))
+    assert chassis.ps2_drive(1.0, 1.0, 0.50, CFG_PS2) == pytest.approx((-0.50, 0.50))
+    # 前进时符号不翻：左推 wz>0，右推 wz<0
+    assert chassis.ps2_drive(-1.0, -1.0, 0.50, CFG_PS2) == pytest.approx((0.50, 0.50))
+    assert chassis.ps2_drive(1.0, -1.0, 0.50, CFG_PS2) == pytest.approx((0.50, -0.50))
 
 
 @pytest.mark.parametrize('gear', GEARS)

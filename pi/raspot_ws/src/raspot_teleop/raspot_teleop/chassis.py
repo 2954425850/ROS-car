@@ -70,7 +70,11 @@ def ps2_drive(x, y, gear, c):
           a=0.5 → R = 2.0 m
           a→0   → 直行
       · `wz = vx / R = vx·a / R_MIN`，**不乘 √(1+a²)**（转弯不加速）
-      · x 右为正 ⇒ wz<0（右转）；左推 ⇒ wz>0（左转）。前进/倒车同一套方向。
+      · x 右为正 ⇒ 前进时 wz<0（右转）、左推 ⇒ wz>0（左转）。
+      · **倒车时转向随 vx 翻向**（`wz ∝ vx`，不是 `|vx|`）：后退中往左推，
+        车尾往左走。这就是原厂 `balance.c:454` 的 `if(Move_X<0) Move_Z=-Move_Z`；
+        云端轮盘缺这一行，所以云端「左后」会走成右后（见记忆
+        `l150pro-turn-decisions` ②）。PS2 这边我们自己有映射，按原厂补上。
 
     `c` 需要 `STICK_DEADZONE`、`R_MIN`。
     """
@@ -85,7 +89,8 @@ def ps2_drive(x, y, gear, c):
     vx = gear * (1.0 - 2.0 * back)
     if a == 0.0 or vx == 0.0:
         return vx, 0.0
-    wz = (-1.0 if x > 0.0 else 1.0) * abs(vx) * a / c['R_MIN']
+    # 注意是 vx（带符号），不是 abs(vx)：倒车时转向翻向，车尾才跟着摇杆走。
+    wz = (-1.0 if x > 0.0 else 1.0) * vx * a / c['R_MIN']
     return vx, wz
 
 
