@@ -1,0 +1,487 @@
+# 机械臂语音工具评测语料（Task 1）。scripts/eval_arm_tools.py 读它。
+#
+# 每条：
+#   id      唯一编号；前缀即类别：s=单步模糊 n=带数 m=多轮相对 c=混淆对照 k=组合 h=状态/复位
+#   say     用户这一句（口语，照真人随口说的写）
+#   history 可选，之前的轮次。臂动作用 spec 写（设计 §5 的形状），评测脚本按变体渲染成
+#           arm_act 或 arm_look/arm_move；其它工具用 call: {name, args} 原样写。
+#   expect  语义断言：
+#     单个备选，或 any: [备选...]（命中任一即过）。备选可以是
+#       arm: [模式...]   臂动作：每个模式至少匹配一个原子，且每个原子至少被一个模式解释
+#                        （extra_ok: true 时允许多出来的原子）；ordered: true 要求按模式顺序出现；
+#                        speed: 要求的速度档。
+#       tool: 名字       必须调了这个工具；tool: none = 不该调任何动作类工具（臂/车/抓/跟）
+#       tools_any: [...] 调了其中任意一个
+#     forbid: [...]      （写在 expect 里）额外禁止的工具名；默认已禁：臂条目禁 car_move/car_turn，非臂条目禁臂动作工具
+#   原子模式字段：kind = toward|turn|shift|approach|gripper|oscillate；
+#     toward: to；turn/shift/approach: dir、amount、degrees、cm；gripper: value；oscillate: axis、times。
+#     值写列表 = 任一即可；数字写 {gte, lte} = 范围，写裸数 = 相等（±0.5）。
+
+# ---------------- 单步模糊 ----------------
+- id: s01
+  say: 低下头
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 下}]
+      - arm: [{kind: toward, to: [地上, 脚下, 地上远处]}]
+- id: s02
+  say: 抬头
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 上}]
+      - arm: [{kind: toward, to: [上方, 前方]}]
+- id: s03
+  say: 左边看看
+  expect:
+    any:
+      - arm: [{kind: toward, to: [左边, 左前]}]
+      - arm: [{kind: turn, dir: 左, amount: [一些, 很多, 到底]}]
+      - arm: [{kind: turn, dir: 左, degrees: {gte: 20}}]
+- id: s04
+  say: 往右瞄一下
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 右}]
+      - arm: [{kind: toward, to: [右边, 右前]}]
+- id: s05
+  say: 看看地上
+  expect:
+    any:
+      - arm: [{kind: toward, to: [地上, 脚下, 地上远处]}]
+      - arm: [{kind: turn, dir: 下, amount: [很多, 到底]}]
+- id: s06
+  say: 看前面
+  expect:
+    arm: [{kind: toward, to: 前方}]
+- id: s07
+  say: 往前伸点
+  expect:
+    any:
+      - arm: [{kind: shift, dir: 前, amount: [一点, 一些]}]
+      - arm: [{kind: approach, dir: 靠近, amount: [一点, 一些]}]
+- id: s08
+  say: 收回来
+  expect:
+    any:
+      - arm: [{kind: shift, dir: 后}]
+      - arm: [{kind: approach, dir: 远离}]
+      - tool: arm_home
+- id: s09
+  say: 举高点
+  expect:
+    arm: [{kind: shift, dir: 上}]
+- id: s10
+  say: 张开爪子
+  expect:
+    arm: [{kind: gripper, value: 张开}]
+- id: s11
+  say: 爪子合上
+  expect:
+    arm: [{kind: gripper, value: 合上}]
+- id: s12
+  say: 点点头
+  expect:
+    arm: [{kind: oscillate, axis: 上下}]
+- id: s13
+  say: 摇摇头
+  expect:
+    arm: [{kind: oscillate, axis: 左右}]
+- id: s14
+  say: 诶往右瞄一眼
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 右}]
+      - arm: [{kind: toward, to: [右边, 右前]}]
+- id: s15
+  say: 头低一点
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 下, amount: [一点, 一些]}]
+      - arm: [{kind: turn, dir: 下, degrees: {lte: 15}}]
+- id: s16
+  say: 往上看看
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 上}]
+      - arm: [{kind: toward, to: 上方}]
+- id: s17
+  say: 瞅瞅脚底下
+  expect:
+    any:
+      - arm: [{kind: toward, to: [脚下, 地上]}]
+      - arm: [{kind: turn, dir: 下, amount: [很多, 到底]}]
+- id: s18
+  say: 把爪子松开
+  expect:
+    arm: [{kind: gripper, value: 张开}]
+- id: s19
+  say: 爪子张一半就行
+  expect:
+    arm: [{kind: gripper, value: 半开}]
+- id: s20
+  say: 凑近点看看
+  expect:
+    any:
+      - arm: [{kind: approach, dir: 靠近}]
+      - arm: [{kind: shift, dir: 前}]
+- id: s21
+  say: 往回缩一点
+  expect:
+    any:
+      - arm: [{kind: shift, dir: 后, amount: [一点, 一些]}]
+      - arm: [{kind: approach, dir: 远离, amount: [一点, 一些]}]
+- id: s22
+  say: 手往左挪一点
+  expect:
+    arm: [{kind: shift, dir: 左, amount: [一点, 一些]}]
+- id: s23
+  say: 慢慢低头
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 下}]
+        speed: 慢
+      - arm: [{kind: toward, to: [地上, 脚下]}]
+        speed: 慢
+- id: s24
+  say: 看看右前方
+  expect:
+    arm: [{kind: toward, to: 右前}]
+- id: s25
+  say: 头低到底
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 下, amount: 到底}]
+      - arm: [{kind: toward, to: [脚下, 地上]}]
+- id: s26
+  say: 往左看
+  expect:
+    any:
+      - arm: [{kind: toward, to: [左边, 左前]}]
+      - arm: [{kind: turn, dir: 左}]
+- id: s27
+  say: 回头看看后面
+  expect:
+    arm: [{kind: toward, to: 后方}]
+- id: s28
+  say: 爪子开合两下
+  expect:
+    arm: [{kind: oscillate, axis: 夹爪, times: 2}]
+- id: s29
+  say: 手放低点
+  expect:
+    arm: [{kind: shift, dir: 下}]
+- id: s30
+  say: 稍微抬一下头
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 上, amount: [一点, 一些]}]
+      - arm: [{kind: turn, dir: 上, degrees: {lte: 15}}]
+
+# ---------------- 带数 ----------------
+- id: n01
+  say: 左转30度看看
+  expect:
+    arm: [{kind: turn, dir: 左, degrees: 30}]
+- id: n02
+  say: 往前伸5厘米
+  expect:
+    arm: [{kind: shift, dir: 前, cm: 5}]
+- id: n03
+  say: 头往下低10度
+  expect:
+    arm: [{kind: turn, dir: 下, degrees: 10}]
+- id: n04
+  say: 往右看45度
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 右, degrees: 45}]
+      - arm: [{kind: toward, to: 右前}]
+- id: n05
+  say: 手抬高3厘米
+  expect:
+    arm: [{kind: shift, dir: 上, cm: 3}]
+- id: n06
+  say: 往后缩2厘米
+  expect:
+    any:
+      - arm: [{kind: shift, dir: 后, cm: 2}]
+      - arm: [{kind: approach, dir: 远离, cm: 2}]
+- id: n07
+  say: 点五下头
+  expect:
+    arm: [{kind: oscillate, axis: 上下, times: 5}]
+
+# ---------------- 多轮相对 ----------------
+- id: m01
+  history:
+    - user: 低下头
+      spec: {steps: [{turn: [{dir: 下, amount: 一些}]}]}
+      result: 已向下转了 20°。视线朝前、向下 35°；爪尖在车前 16cm、高 8cm；夹爪合上。
+      reply: 好，低头了。
+  say: 再低点
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 下, amount: [一点, 一些]}]
+      - arm: [{kind: turn, dir: 下, degrees: {lte: 25}}]
+- id: m02
+  history:
+    - user: 左边看看
+      spec: {steps: [{toward: 左边}]}
+      result: 已看向左边。视线朝左 90°、向下 15°；爪尖在车左 15cm、高 10cm；夹爪合上。
+      reply: 好，在看左边了。
+  say: 再往左一点
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 左, amount: [一点, 一些]}]
+      - arm: [{kind: turn, dir: 左, degrees: {lte: 25}}]
+- id: m03
+  history:
+    - user: 看看地上
+      spec: {steps: [{toward: 地上}]}
+      result: 已看向地上。视线朝前、向下 75°；爪尖在车前 14cm、高 2cm；夹爪合上。
+      reply: 看着地上了。
+  say: 回到刚才那样
+  expect:
+    arm: [{kind: toward, to: 上一个姿态}]
+- id: m04
+  history:
+    - user: 头低一点
+      spec: {steps: [{turn: [{dir: 下, amount: 一点}]}]}
+      result: 已向下转了 8°。视线朝前、向下 23°；爪尖在车前 16cm、高 9cm；夹爪合上。
+      reply: 好的。
+  say: 还不够
+  expect:
+    arm: [{kind: turn, dir: 下}]
+- id: m05
+  history:
+    - user: 往前伸点
+      spec: {steps: [{shift: [{dir: 前, amount: 一点}]}]}
+      result: 已往前伸了 2cm。视线朝前、向下 15°；爪尖在车前 18cm、高 10cm；夹爪合上。
+      reply: 伸出去了。
+  say: 再伸一点
+  expect:
+    any:
+      - arm: [{kind: shift, dir: 前, amount: [一点, 一些]}]
+      - arm: [{kind: approach, dir: 靠近, amount: [一点, 一些]}]
+- id: m06
+  history:
+    - user: 往右瞄一下
+      spec: {steps: [{turn: [{dir: 右, amount: 一些}]}]}
+      result: 已向右转了 20°。视线朝右 20°、向下 15°；爪尖在车前 15cm、高 10cm；夹爪合上。
+      reply: 瞄过去了。
+  say: 回到刚才的位置
+  expect:
+    any:
+      - arm: [{kind: toward, to: 上一个姿态}]
+      - arm: [{kind: turn, dir: 左, amount: 一些}]
+      - arm: [{kind: turn, dir: 左, degrees: 20}]
+- id: m07
+  history:
+    - user: 点点头
+      spec: {steps: [{oscillate: {axis: 上下}}]}
+      result: 点了 3 下头。视线朝前、向下 15°；爪尖在车前 15cm、高 10cm；夹爪合上。
+      reply: 点好了。
+  say: 再点两下
+  expect:
+    arm: [{kind: oscillate, axis: 上下, times: 2}]
+- id: m08
+  history:
+    - user: 抬头
+      spec: {steps: [{turn: [{dir: 上, amount: 一些}]}]}
+      result: 已向上转了 20°。视线朝前、向上 5°；爪尖在车前 15cm、高 12cm；夹爪合上。
+      reply: 抬起来了。
+  say: 太高了 往下一点
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 下, amount: [一点, 一些]}]
+      - arm: [{kind: turn, dir: 下, degrees: {lte: 20}}]
+- id: m09
+  history:
+    - user: 张开爪子
+      spec: {steps: [{gripper: 张开}]}
+      result: 夹爪已张开。视线朝前、向下 15°；爪尖在车前 15cm、高 10cm；夹爪张开。
+      reply: 张开了。
+  say: 好 合上吧
+  expect:
+    arm: [{kind: gripper, value: 合上}]
+- id: m10
+  history:
+    - user: 左转
+      call: {name: car_turn, args: {angle_deg: 90}}
+      result: 已原地左转 90°。
+      reply: 转好了。
+  say: 再左转一点
+  expect:
+    tool: car_turn
+- id: m11
+  history:
+    - user: 低下头
+      spec: {steps: [{turn: [{dir: 下, amount: 一些}]}]}
+      result: 已向下转了 20°。视线朝前、向下 35°；爪尖在车前 16cm、高 8cm；夹爪合上。
+      reply: 低头了。
+  say: 低过了 回来一点
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 上, amount: [一点, 一些]}]
+      - arm: [{kind: turn, dir: 上, degrees: {lte: 20}}]
+- id: m12
+  history:
+    - user: 左边看看
+      spec: {steps: [{toward: 左边}]}
+      result: 已看向左边。视线朝左 90°、向下 15°；爪尖在车左 15cm、高 10cm；夹爪合上。
+      reply: 在看左边。
+  say: 那右边呢
+  expect:
+    arm: [{kind: toward, to: [右边, 右前]}]
+- id: m13
+  history:
+    - user: 往前伸5厘米
+      spec: {steps: [{shift: [{dir: 前, cm: 5}]}]}
+      result: 已往前伸了 5cm。视线朝前、向下 15°；爪尖在车前 21cm、高 10cm；夹爪合上。
+      reply: 伸好了。
+  say: 再来一次
+  expect:
+    arm: [{kind: shift, dir: 前, cm: 5}]
+
+# ---------------- 混淆对照（不该动臂） ----------------
+- id: c01
+  say: 左转
+  expect:
+    tool: car_turn
+- id: c02
+  say: 往前走
+  expect:
+    tool: car_move
+- id: c03
+  say: 掉个头
+  expect:
+    tool: car_turn
+- id: c04
+  say: 抓那个杯子
+  expect:
+    tool: grasp_object
+- id: c05
+  say: 盯着那个人
+  expect:
+    tools_any: [follow_person, track_object]
+- id: c06
+  say: 还有多少电
+  expect:
+    tool: car_status
+- id: c07
+  say: 今天天气怎么样
+  expect:
+    tools_any: [mcp__weather__get_current_weather, mcp__weather__get_forecast]
+- id: c08
+  say: 右转90度
+  expect:
+    tool: car_turn
+- id: c09
+  say: 往后退一点
+  expect:
+    tool: car_move
+- id: c10
+  say: 转个圈
+  expect:
+    tool: car_turn
+- id: c11
+  say: 把那个杯子拿起来
+  expect:
+    tool: grasp_object
+- id: c12
+  say: 跟着我
+  expect:
+    tool: follow_person
+- id: c13
+  say: 讲个笑话呗
+  expect:
+    tool: none
+- id: c14
+  say: 前面有什么
+  expect:
+    tool: look
+    forbid: [car_move, car_turn]
+- id: c15
+  say: 往前开两米
+  expect:
+    tool: car_move
+- id: c16
+  say: 你叫什么名字
+  expect:
+    tool: none
+
+# ---------------- 组合 ----------------
+- id: k01
+  say: 往左下看
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 左}, {kind: turn, dir: 下}]
+      - arm: [{kind: toward, to: [左边, 左前]}, {kind: turn, dir: 下}]
+- id: k02
+  say: 先低头再张开爪子
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 下}, {kind: gripper, value: 张开}]
+        ordered: true
+      - arm: [{kind: toward, to: [地上, 脚下]}, {kind: gripper, value: 张开}]
+        ordered: true
+- id: k03
+  say: 往前伸一下然后把爪子合上
+  expect:
+    any:
+      - arm: [{kind: shift, dir: 前}, {kind: gripper, value: 合上}]
+        ordered: true
+      - arm: [{kind: approach, dir: 靠近}, {kind: gripper, value: 合上}]
+        ordered: true
+- id: k04
+  say: 抬头看看右边
+  expect:
+    any:
+      - arm: [{kind: toward, to: [右边, 右前]}, {kind: turn, dir: 上}]
+      - arm: [{kind: toward, to: [右边, 右前]}]
+      - arm: [{kind: turn, dir: 右}, {kind: turn, dir: 上}]
+- id: k05
+  say: 慢慢往左边看
+  expect:
+    any:
+      - arm: [{kind: toward, to: [左边, 左前]}]
+        speed: 慢
+      - arm: [{kind: turn, dir: 左}]
+        speed: 慢
+- id: k06
+  say: 点三下头然后看前面
+  expect:
+    arm: [{kind: oscillate, axis: 上下, times: 3}, {kind: toward, to: 前方}]
+    ordered: true
+- id: k07
+  say: 低头凑近点看
+  expect:
+    any:
+      - arm: [{kind: turn, dir: 下}, {kind: approach, dir: 靠近}]
+      - arm: [{kind: toward, to: [地上, 脚下]}, {kind: approach, dir: 靠近}]
+- id: k08
+  say: 张开爪子 往前伸一点
+  expect:
+    any:
+      - arm: [{kind: gripper, value: 张开}, {kind: shift, dir: 前}]
+        ordered: true
+      - arm: [{kind: gripper, value: 张开}, {kind: approach, dir: 靠近}]
+        ordered: true
+
+# ---------------- 状态 / 复位 ----------------
+- id: h01
+  say: 手臂现在是啥姿势
+  expect:
+    tool: arm_state
+- id: h02
+  say: 你现在在看哪儿
+  expect:
+    tool: arm_state
+- id: h03
+  say: 机械臂复位
+  expect:
+    tool: arm_home
+- id: h04
+  say: 手收好吧 回原位
+  expect:
+    tool: arm_home
