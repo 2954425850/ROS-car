@@ -755,8 +755,20 @@ class ConversationManager:
             # 兜底那句一轮只念一次：多步动作（「云台往左再往右」）每步都应一声
             # 「稍等一下」太吵 —— 2026-09-17 14:22 实测 2.3s 内念了两遍。
             # 模型自己的进度话不受限制，每步照念。
+            # ★ 2026-10-31 用户嫌「说完到臂开始动」太慢：开场白同步念完才动，白等 1~2s。
+            #   这批全是物理动作类工具（车/臂/抓取，不碰喇叭）时，开场白放后台念、动作同时开始；
+            #   执行完先等开场白念完再往下走（后面的话不能和它叠在一起）。
+            #   其它工具（音乐、ask_user 等会用喇叭/麦克风的）保持原来的同步顺序。
+            say_thread = None
             if text or not self_speaking:
-                self._say_before_tools(text, allow_filler=iteration == 0)
+                if self._batch_is_motion_only(tool_calls) and iteration < self._max_tool_iterations:
+                    say_thread = threading.Thread(
+                        target=self._say_before_tools, args=(text,),
+                        kwargs={"allow_filler": iteration == 0},
+                        name="pre-tool-say", daemon=True)
+                    say_thread.start()
+                else:
+                    self._say_before_tools(text, allow_filler=iteration == 0)
 
             if iteration == self._max_tool_iterations:
                 logger.warning(
@@ -764,7 +776,11 @@ class ConversationManager:
                 )
                 break
 
-            speak_texts, followup = self._execute_tool_calls(tool_calls)
+            try:
+                speak_texts, followup = self._execute_tool_calls(tool_calls)
+            finally:
+                if say_thread is not None:
+                    say_thread.join()
             if repeated:
                 logger.info(f"→ 正文已问过，跳过工具的重复播报: {speak_texts!r}")
                 speak_texts = []
@@ -802,6 +818,20 @@ class ConversationManager:
         logger.info(f"→ 工具前出声: {line!r}")
         self._spoke_pre_tool = True
         self._speak(line)
+
+    _MOTION_GROUPS = frozenset({"car", "arm", "grasp"})
+
+    def _batch_is_motion_only(self, tool_calls: list[ToolCall]) -> bool:
+        """这批工具是不是全是物理动作类（车/臂/抓取）—— 它们不碰喇叭和麦克风，
+        开场白可以和它们并行。MCP 工具、未登记的名字一律当"不是"。"""
+        if not tool_calls:
+            return False
+        for call in tool_calls:
+            if call.name not in self._registry:
+                return False
+            if self._registry.get(call.name).group not in self._MOTION_GROUPS:
+                return False
+        return True
 
     def _batch_speaks(self, tool_calls: list[ToolCall]) -> bool:
         """这批工具里有没有「自己会念话」的（见 tools/registry.py 的 Tool.speaks）。

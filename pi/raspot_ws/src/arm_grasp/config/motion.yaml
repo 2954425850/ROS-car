@@ -12,9 +12,9 @@ min_frame_ms: 250
 
 # 速度档 = 关节空间最大角速度（°/s）。t_ms = max(min_frame_ms, max|Δ关节°| / 档速 × 1000)
 speeds:
-  慢: 45
-  正常: 100          # 2026-10-31 用户嫌慢：60→100（慢 30→45、快 120→160）
-  快: 160
+  慢: 30
+  正常: 60
+  快: 120
 default_speed: 正常
 oscillate_speed: 快          # oscillate 默认「快」（spec 里给了 speed 则以 spec 为准）
 
