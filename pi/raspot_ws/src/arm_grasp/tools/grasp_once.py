@@ -465,8 +465,8 @@ def main(argv=None):
                          'max_ticks，保证各判据的**秒数**不变。')
     ap.add_argument('--bias-r', type=float, default=None,
                     help='**沿半径**的静态偏置（cm，+ = 目标向外/远离车）。'
-                         '实测爪尖几乎每次偏后 ~1cm（= 舵机死区稳态残差），'
-                         '要消掉就填 **-1**。')
+                         '爪尖落点偏后（靠车）就填**正**值、偏前填负值。'
+                         '默认 0：慢档下横向已 ±2mm，旧说法"偏后填 -1"符号是反的。')
     ap.add_argument('--joint-comp', type=float, default=None,
                     help='肩/肘/腕位置环下垂补偿增益（默认 1.0；**0 = 关掉**）。'
                          'A/B 用：第 2 跑（无它）下扎通、第 4~6 跑（有它）下扎卡住。')

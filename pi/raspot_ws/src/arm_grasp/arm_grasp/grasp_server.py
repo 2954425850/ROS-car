@@ -122,11 +122,12 @@ class GraspServer(Node):
         self.declare_parameter('normal_arm_t_ms', 40)        # 抓完还原成这个（= 驱动默认）
         self.declare_parameter('driver_node', 'l150pro_driver')
         self.declare_parameter('use_tof', True)
-        # 2026-10-30：真机 descend 结束爪尖离目标稳定 ~11.7mm；grasp_once 的
-        # --bias-r 帮助里早写着“这臂几乎每次偏后 ~1cm，要消掉填 −1(cm)”。
-        # 这里补上服务端径向偏置（mm，+ = 目标向外）。可运行时调：
-        #   ros2 param set /arm_grasp_server bias_r_mm -8
-        self.declare_parameter('bias_r_mm', -10.0)
+        # 径向偏置（mm，+ = 目标向外/远离车，− = 往车这边拉）。可运行时调：
+        #   ros2 param set /arm_grasp_server bias_r_mm 5
+        # ★ 2026-10-31 归 0：10-30 照 grasp_once 那句自相矛盾的帮助（"偏后 ~1cm 填 −1"）
+        #   设成了 −10 ⇒ 目标点被往车这边拉 1cm ⇒ 用户实测抓取"偏后"。真偏后要往**正**调。
+        #   10-01 文档原话：慢档横向已 ±2mm，"−1 那次的偏后是快档的锅"，先别乱填。
+        self.declare_parameter('bias_r_mm', 0.0)
 
         cb = ReentrantCallbackGroup()
         self.fb = None
@@ -437,6 +438,12 @@ class GraspServer(Node):
                 self._feedback(gh, 'home', '回复位位姿（保持夹爪）')
                 self._go_home()
                 gh.succeed()
+            elif res.code == 'GRIP_EMPTY':
+                # 夹空：抬起已经走完、臂在桌面上方 ⇒ 照常回复位，但如实报失败
+                self.get_logger().warn(f'抓取结束：GRIP_EMPTY {res.reason}')
+                self._feedback(gh, 'home', '夹空，回复位位姿')
+                self._go_home()
+                gh.abort()
             else:
                 gh.abort()
             return res

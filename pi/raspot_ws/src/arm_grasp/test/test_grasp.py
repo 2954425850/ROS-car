@@ -458,7 +458,7 @@ def test_run_all_phases_closes_and_lifts():
 
     判据全是**物理量**，不看循环自己的说法：
       ① `rep['phases']` 恰好四相且顺序对；
-      ② 最后发出去的 p1 ≥ close_field−20 ⇒ **夹爪真的合上了**（且没有过冲）；
+      ② 爪里有东西（读回卡在 450）⇒ 报 OK；
       ③ 最终沿轴留量 ≥ lift_m×0.8、且远大于 s_stop ⇒ **真的抬起来了**。
 
     变异（实测过）：把 `advance_or_stop` 里的 `cur = seq[k]` 改成 `cur = seq[0]` ⇒
@@ -466,13 +466,40 @@ def test_run_all_phases_closes_and_lifts():
     """
     cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900)
     plant = Plant(_start_joints(s_m=0.10))
-    link = FakeLink(plant, CAP)
+    link = FakeLink(plant, CAP, grip_block=450.0)
     rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
     assert [p[0] for p in rep['phases']] == ['aim', 'descend', 'close', 'lift'], rep['phases']
     assert rep['ok'], rep['stopped']
-    assert cfg.close_field - 20.0 <= link.pub[0] <= cfg.close_field + 20.0, link.pub[0]
+    assert 440.0 <= link.grip <= 460.0, link.grip
     assert rep['s_ach_m'] >= cfg.lift_m * 0.8, rep['s_ach_m']
     assert rep['s_ach_m'] > cfg.s_stop_m * 5.0, rep['s_ach_m']
+
+
+def test_empty_gripper_is_reported_as_grip_empty_not_ok():
+    """★ 2026-10-31 真机：空爪合爪读回停在 559（令 578），旧代码按"读回不动 ⇒ 碰上东西"
+    报 OK ⇒ 语音说"抓到了"，其实是空的。空爪（读回停在 grip_empty_p1）必须报 GRIP_EMPTY。
+
+    变异（已实测）：去掉 run() 收尾的夹空核验 / 把 grip_empty_p1 置 0 ⇒ 这条红。
+    """
+    from arm_grasp.grasp_codes import code_for
+    cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900)
+    plant = Plant(_start_joints(s_m=0.10))
+    link = FakeLink(plant, CAP, grip_block=cfg.grip_empty_p1)   # 空爪：停在机械极限 559
+    rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
+    assert [p[0] for p in rep['phases']] == ['aim', 'descend', 'close', 'lift'], rep['phases']
+    assert rep['ok'] is False, rep['stopped']
+    assert rep['stopped'].startswith('夹空'), rep['stopped']
+    assert code_for(rep['stopped'], rep['ok']) == 'GRIP_EMPTY'
+    # 抬起照常完成（空着也要先抬离桌面，再由服务端回复位）
+    assert rep['s_ach_m'] >= cfg.lift_m * 0.8, rep['s_ach_m']
+
+
+def test_grip_empty_threshold_boundary():
+    cfg = _cfg()
+    assert grasp.grip_empty(559.0, cfg) and grasp.grip_empty(550.0, cfg)
+    assert not grasp.grip_empty(540.0, cfg)          # 夹住东西（真机 483/497 远小于它）
+    assert not grasp.grip_empty(0.0, cfg)            # 0 = 没读到，不下结论
+    assert not grasp.grip_empty(559.0, cfg._replace(grip_empty_p1=0.0))   # 0 = 关
 
 
 def _close_reason(rep):
@@ -787,7 +814,7 @@ def test_estimate_survives_unmodelled_camera_latency():
     import math as _m
     cfg = _cfg()._replace(hz=10.0, max_seconds=60.0, max_ticks=900, z_plane_m=CAP[2])
     plant = Plant(_start_joints(s_m=0.12))
-    link = FakeLink(plant, CAP, fb_lag_s=0.2, follow=True, cam_lag_s=0.5)
+    link = FakeLink(plant, CAP, fb_lag_s=0.2, follow=True, cam_lag_s=0.5, grip_block=450.0)
     rep = grasp.run(cfg, link, phase='all', log=lambda *a: None)
     assert rep['ok'], rep['stopped']
     O = dict(rep['O_phase_end'])['descend']
@@ -884,7 +911,8 @@ def test_descend_refuses_when_no_depth_ever_seen():
 def test_descend_proceeds_when_depth_seen():
     cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300,
                           require_depth=True)
-    rep = grasp.run(cfg, DepthLink(Plant(_start_joints()), CAP, depth='auto'),
+    rep = grasp.run(cfg, DepthLink(Plant(_start_joints()), CAP, depth='auto',
+                                   grip_block=450.0),
                     phase='all')
     assert rep['ok'] is True
 
@@ -912,7 +940,8 @@ def test_require_depth_off_by_default():
     """默认关闸 —— 既有用例（走平面法、没有深度）行为不变。"""
     cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300)
     assert cfg.require_depth is False
-    rep = grasp.run(cfg, FakeLink(Plant(_start_joints()), CAP), phase='all')
+    rep = grasp.run(cfg, FakeLink(Plant(_start_joints()), CAP, grip_block=450.0),
+                    phase='all')
     assert rep['ok'] is True
 
 

@@ -30,6 +30,7 @@ _CODE_CN = {
     'REFUSED': '这个位置臂摆不出抓取姿态',
     'TIMEOUT': '抓取超时了',
     'CLOSE_TIMEOUT': '合爪超时了',
+    'GRIP_EMPTY': '没抓住，爪子合上了但里面是空的',
     'STUCK': '臂好像卡住了',
     'OBS_LOST': '目标跟丢了',
     'CANCELED': '抓取被取消了',

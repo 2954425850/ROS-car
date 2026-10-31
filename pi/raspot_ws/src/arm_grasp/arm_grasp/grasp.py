@@ -58,7 +58,8 @@ GraspConfig = namedtuple('GraspConfig',
     'joint_comp joint_comp_max '
     'bias_r_m '
     's_lead_m lead_max_counts require_depth '
-    'close_reach_m aim_hold_m')
+    'close_reach_m aim_hold_m '
+    'grip_empty_p1')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -148,7 +149,22 @@ GraspConfig.__new__.__defaults__ = (
     #   冻结后臂在一个**固定** O 上收敛；前几拍已经把 O 收敛到 1~2cm 内。
     #   0 = 关掉（退回旧行为，靠近时仍每拍更新 O）。
     0.030,
+    # grip_empty_p1：**空爪合到底**时 p1 的读回（count）。0 = 不判夹空（旧行为）。
+    #   2026-10-31 真机实测：空爪合爪静置读回恒 559（令 578，机械极限到不了 568）⇒
+    #   旧判据"读回 ≥ 578−10 才算合到底"永远不成立，空爪每次都走"读回不动 ⇒ 碰上东西"，
+    #   最后报 OK（用户：AI 说抓到了，实际根本没抓到）。
+    #   抓到东西时读回明显小于它（10-30 两次真抓住：497 / 483）。
+    #   判据：抬升收尾时读回 ≥ grip_empty_p1 − deadband_counts ⇒ 夹空、不报 OK。
+    #   代价：比 ~10 count 还薄的东西会被判成夹空（宁可报没抓到，不报假成功）。
+    #   换夹爪/改舵机零位后要重量一次：空爪合上，`ros2 topic echo /arm/feedback` 看第 0 位。
+    559.0,
 )
+
+
+def grip_empty(p1_read, cfg):
+    """合爪后读回贴着空爪合到底的位置 ⇒ 爪里没东西。p1=0 是没读到，不下结论。"""
+    return (cfg.grip_empty_p1 > 0.0 and p1_read > 0.0
+            and p1_read >= cfg.grip_empty_p1 - cfg.deadband_counts)
 
 
 # --------------------------------------------------------------------------
@@ -481,7 +497,7 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
            'O_last': None, 'obs_n': 0, 'obs_bad': 0, 'obs_lost': False,
            'depth_seen': False, 'depth_refused': 0,
            'descend_fallback': False, 'fallback_err_m': None,
-           'base_glitch': 0,
+           'base_glitch': 0, 'grip_p1': None,
            'max_step_deg_actual': 0.0, 'err_m': None, 'alpha': None, 'comp': None,
            'target': None, 's_ach_m': None, 'rows': [], 'phases': [], 'O_phase_end': []}
     dt = 1.0 / cfg.hz
@@ -696,6 +712,8 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
                 base_fb_prev = _b
         j_cur_m = from_fields(f_raw)
         p1_read = float(f_raw[0])
+        if cur in ('close', 'lift') and p1_read > 0.0:
+            rep['grip_p1'] = p1_read      # 合爪之后最近一次真读到的 p1（判夹空用）
         if cur == 'descend':
             tip = tip_open_m(j_cur_m)
             s_ach_now = standoff_along_axis(tip, O_u, prev_alpha)
@@ -1062,4 +1080,13 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
 
     rep['ok'] = bool(rep['stopped']) and rep['stopped'].startswith(
         ('对准完成', '扎到位', '合爪完成', '抬升完成'))
+    # ★ 2026-10-31：合爪/抬起"完成"不等于抓住了。空爪合到底读回 559、到不了 578，
+    #   上面的合爪判据会把它当"碰上东西" ⇒ 必须在收尾时拿读回再核一次（抬起后掉了也算）。
+    if rep['ok'] and any(p[0] == 'close' for p in rep['phases']) \
+            and rep['grip_p1'] is not None and grip_empty(rep['grip_p1'], cfg):
+        rep['stopped'] = ('夹空：合爪后 p1 读回 %.0f ≈ 空爪合到底 %.0f（差 ≤%.0f count）'
+                          '⇒ 爪里没东西（原收尾：%s）'
+                          % (rep['grip_p1'], cfg.grip_empty_p1, cfg.deadband_counts,
+                             rep['stopped']))
+        rep['ok'] = False
     return rep
