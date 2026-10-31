@@ -75,7 +75,9 @@ def mcp_schemas(config) -> list[dict[str, Any]]:
     """真起一次 MCPHost 取 MCP 工具 schema（weather / qqmusic），取完就关。"""
     from mcp_host import MCPHost
 
-    host = MCPHost(config, project_root=ROOT, log_dir=ROOT / "logs" / "arm_eval_mcp")
+    log_dir = ROOT / "logs" / "arm_eval_mcp"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    host = MCPHost(config, project_root=ROOT, log_dir=log_dir)
     try:
         host.start()
         return host.tool_schemas()
@@ -274,7 +276,25 @@ def judge(expect: dict[str, Any], calls: list[dict[str, Any]], arm_tool_schemas:
 
 # ====================================================================== 跑模型
 
-_ARM_DONE = "好的，做完了。视线朝前、向下 30°；爪尖在车前 16cm、高 8cm；夹爪合上。"
+# 臂动作的假结果按调用内容现编（"做了什么"），不带具体姿态读数——
+# 固定读数会和请求自相矛盾（让往上看却回"向下 30°"），模型会以为没做成而重调，污染评测。
+_ATOM_TEXT = {
+    "toward": lambda a: f"看向{a.get('to')}",
+    "turn": lambda a: f"视线往{a.get('dir')}转了" + (f"{a['degrees']}°" if "degrees" in a else str(a.get("amount", "一些"))),
+    "shift": lambda a: f"爪子往{a.get('dir')}挪了" + (f"{a['cm']}cm" if "cm" in a else str(a.get("amount", "一些"))),
+    "approach": lambda a: f"沿视线{a.get('dir')}了" + (f"{a['cm']}cm" if "cm" in a else str(a.get("amount", "一些"))),
+    "gripper": lambda a: f"夹爪{a.get('value')}",
+    "oscillate": lambda a: f"{a.get('axis')}来回了{a.get('times', 3)}下",
+}
+
+
+def _arm_done(name: str, args: dict[str, Any]) -> str:
+    try:
+        spec = to_spec(name, args) or {}
+        parts = [_ATOM_TEXT[a["kind"]](a) for a in atoms_of(spec)]
+    except Exception:  # noqa: BLE001
+        parts = []
+    return ("做完了：" + "，".join(parts) + "。") if parts else "参数不完整，没有动。"
 _FAKE = {
     "arm_state": "视线朝前、向下 15°；爪尖在车前 15cm、高 10cm；夹爪合上。",
     "arm_home": "已回到初始位置，夹爪保持合上。",
@@ -288,9 +308,9 @@ _FAKE = {
 }
 
 
-def fake_result(name: str) -> str:
+def fake_result(name: str, args: dict[str, Any] | None = None) -> str:
     if name in ("arm_look", "arm_move", "arm_act"):
-        return _ARM_DONE
+        return _arm_done(name, args or {})
     if name == "get_current_time":
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return _FAKE.get(name, "已完成。")
@@ -350,7 +370,7 @@ def run_one(client, llm: dict[str, Any], tools: list[dict[str, Any]], variant: s
             except json.JSONDecodeError:
                 args = {"__unparsable__": tc.function.arguments}
             calls.append({"name": tc.function.name, "args": args})
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": fake_result(tc.function.name)})
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": fake_result(tc.function.name, args)})
             if tc.function.name == "ask_user":
                 stop = True
         if stop:
