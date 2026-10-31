@@ -182,18 +182,51 @@ def _ik_near(tip, el, ref, cfg):
     return best
 
 
+def el_search_order(el0, cfg):
+    """从 el0 起向两侧按 1° 扩展的俯仰候选（不含 el0 本身），都在 el_range 内；|Δel| 小的在前。"""
+    lo, hi = el_limits(cfg)
+    out = []
+    for d in range(1, int(math.ceil(hi - lo)) + 1):
+        for el in (el0 - d, el0 + d):          # 同 |Δel| 先试往下
+            if lo - 1e-9 <= el <= hi + 1e-9:
+                out.append(el)
+    return out
+
+
 def _translate(delta, pose, ctx, verb, is_max):
-    """爪尖沿 delta（cm，车体系）平移、俯仰不变；不可达 ⇒ 二分找最大可行比例。"""
+    """爪尖沿 delta（cm，车体系）平移（设计 §7 shift，2026-10-31 修订）：
+
+    1. 保持当前俯仰能完整到达 ⇒ 用它；
+    2. 否则在俯仰上从当前值起向两侧按 1° 扩展，取能完整到达、|Δel| 最小的解
+       （同 |Δel| 取关节总改动最小）；位置要求满足了 ⇒ 不算截断，只说明俯仰变了多少；
+    3. 任何俯仰都到不了 ⇒ 二分找"某个俯仰下"能挪的最大比例，置 partial。
+    """
     cfg = ctx.cfg
     tip0, _ = fk(pose.j)
-    el = gaze_of(pose.j)[1]
+    el0 = gaze_of(pose.j)[1]
     want = math.sqrt(sum(d * d for d in delta))
     if want < 1e-9:
         return pose
+    others = el_search_order(el0, cfg)
+
+    def cost(c):
+        return sum(abs(c[k] - pose.j[k]) for k in _JK)
 
     def at(ratio):
+        """该比例下 |Δel| 最小（同档取关节改动最小）的解；都不行 None。"""
         tip = [tip0[i] + ratio * delta[i] for i in range(3)]
-        return _ik_near(tip, el, pose.j, cfg)
+        c = _ik_near(tip, el0, pose.j, cfg)
+        if c is not None:
+            return c
+        best, best_d = None, None
+        for el in others:
+            d = abs(el - el0)
+            if best is not None and d > best_d + 1e-9:
+                break
+            c = _ik_near(tip, el, pose.j, cfg)
+            if c is not None and (best is None or cost(c) < cost(best)):
+                best, best_d = c, d
+        return best
 
     j = at(1.0)
     ratio = 1.0
@@ -207,6 +240,11 @@ def _translate(delta, pose, ctx, verb, is_max):
             else:
                 hi = mid
         ratio = lo
+    if j is not None:
+        d_el = gaze_of(j)[1] - el0
+        if abs(d_el) > 0.5:
+            ctx.note('为了够到，视线俯仰变了 %.0f°（%s）' % (abs(d_el), '往上' if d_el > 0 else '往下'),
+                     partial=False)
     moved = ratio * want
     if is_max:
         if moved < _TRAVEL_EPS_CM:

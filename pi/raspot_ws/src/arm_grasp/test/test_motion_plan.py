@@ -6,8 +6,8 @@ import re
 
 import pytest
 
-from arm_grasp.arm_kin import FIELD_HI, FIELD_LO, fk, from_fields, to_fields
-from arm_grasp.gaze import gaze_of
+from arm_grasp.arm_kin import FIELD_HI, FIELD_LO, Unreachable, fk, from_fields, ikine, to_fields
+from arm_grasp.gaze import gaze_of, joints_ok
 from arm_grasp.motion_plan import nearest_equivalent_az, plan
 from arm_grasp.motion_spec import load_config
 
@@ -147,17 +147,66 @@ def test_shift_moves_tip_by_delta_keeping_el(cur, items, delta):
 
 
 def test_shift_unreachable_is_shortened_and_reported():
-    p = P({'steps': [{'shift': [{'dir': '前', 'amount': '一些'}]}]}, REACH)
+    # 复位位姿肘已贴 field 129，「往后」任何俯仰下都挪不满 5cm
+    p = P({'steps': [{'shift': [{'dir': '后', 'amount': '一些'}]}]}, HOME)
     f = p.keyframes[0].fields
     assert p.partial
     note = [n for n in p.notes if '挪了' in n]
     assert note, p.notes
     moved = float(re.search(r'挪了 ([\d.]+)cm', note[0]).group(1))
     assert 0.1 < moved < 5.0
-    assert math.dist(tip(REACH), tip(f)) == pytest.approx(moved, abs=0.2)
-    assert tip(f)[0] - tip(REACH)[0] == pytest.approx(moved, abs=0.2)      # 方向还是「前」
-    assert gaze(f)[1] == pytest.approx(gaze(REACH)[1], abs=0.5)
+    assert math.dist(tip(HOME), tip(f)) == pytest.approx(moved, abs=0.2)
+    assert tip(HOME)[0] - tip(f)[0] == pytest.approx(moved, abs=0.2)      # 方向还是「后」
     assert_valid(f)
+
+
+def _reachable(t, el):
+    """独立判定：爪尖 t、俯仰 el 时是否有 field 合法的 IK 解（两个肘支）。"""
+    for br in (-1, 1):
+        try:
+            j = ikine(t[0], t[1], t[2], el, branch=br)
+        except Unreachable:
+            continue
+        if joints_ok(j, CFG):
+            return True
+    return False
+
+
+def _sight_note_deg(notes):
+    m = [re.search(r'俯仰变了 (\d+)°', n) for n in notes]
+    m = [x for x in m if x]
+    return int(m[0].group(1)) if m else 0
+
+
+@pytest.mark.parametrize('step', [
+    {'shift': [{'dir': '上', 'cm': 5}]},
+    {'shift': [{'dir': '下', 'cm': 5}]},
+    {'approach': {'dir': '靠近', 'cm': 5}},
+    {'approach': {'dir': '远离', 'cm': 5}},
+], ids=['up', 'down', 'closer', 'away'])
+def test_shift_from_home_reaches_by_changing_el_minimally(step):
+    """设计 §7 修订：保持俯仰到不了 ⇒ 改俯仰，取 |Δel| 最小、能完整到达的解，不算截断。"""
+    p = P({'steps': [step]}, HOME)
+    f = p.keyframes[0].fields
+    assert_valid(f)
+    assert not p.partial, p.notes
+    t0, t1 = tip(HOME), tip(f)
+    if 'shift' in step:
+        want = [0, 0, 5 if step['shift'][0]['dir'] == '上' else -5]
+    else:                                   # approach 方向用**起始**视线
+        _, axis0 = fk(J(HOME))
+        sign = 1 if step['approach']['dir'] == '靠近' else -1
+        want = [5 * sign * a for a in axis0]
+    for i in range(3):
+        assert t1[i] - t0[i] == pytest.approx(want[i], abs=0.2)
+    el0, el1 = gaze(HOME)[1], gaze(f)[1]
+    d_el = abs(el1 - el0)
+    assert d_el > 0.5                       # 复位位姿下保持俯仰确实不行
+    assert not _reachable(t1, el0)
+    assert _sight_note_deg(p.notes) == round(d_el)
+    # 最小性：比它少 1° 的两个俯仰都到不了
+    for el in (el0 + (d_el - 1), el0 - (d_el - 1)):
+        assert not _reachable(t1, el), el
 
 
 def test_approach_moves_along_line_of_sight():
