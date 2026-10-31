@@ -301,7 +301,8 @@ def test_duration_formula_and_speed_order():
         p = P({'steps': [{'toward': '左边'}], 'speed': sp})
         t[sp] = p.keyframes[0].t_ms
     # 底座 0 → 90° 是最大关节变化
-    assert t == {'慢': 3000, '正常': 1500, '快': 750}
+    sp = CFG.speeds
+    assert t == {k: math.ceil(90.0 / sp[k] * 1000) for k in ('慢', '正常', '快')}
     assert t['慢'] > t['正常'] > t['快'] >= 250
 
 
@@ -314,12 +315,12 @@ def test_duration_has_floor():
 
 def test_default_speed_normal_and_oscillate_fast():
     big = {'steps': [{'turn': [{'dir': '左', 'degrees': 60}]}]}
-    assert P(big).keyframes[0].t_ms == 1000                       # 正常 60°/s
+    assert P(big).keyframes[0].t_ms == math.ceil(60.0 / CFG.speeds['正常'] * 1000)   # 默认「正常」
     osc = {'oscillate': {'axis': '左右', 'amount': '很多', 'times': 1}}
     p = P({'steps': [osc]})
-    assert p.keyframes[1].t_ms == math.ceil(50 / 120 * 1000)      # 快 120°/s；第 2 帧从 +25 摆到 -25
+    assert p.keyframes[1].t_ms == math.ceil(50 / CFG.speeds['快'] * 1000)      # 快；第 2 帧从 +25 摆到 -25
     p = P({'steps': [osc], 'speed': '慢'})
-    assert p.keyframes[1].t_ms == math.ceil(50 / 30 * 1000)
+    assert p.keyframes[1].t_ms == math.ceil(50 / CFG.speeds['慢'] * 1000)
 
 
 # ---------------------------------------------------------------- repeat / 杂项

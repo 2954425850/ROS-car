@@ -49,7 +49,7 @@ TO_SPEC_SAMPLES = [
 def test_config_values_match_design():
     assert CFG.base_limit_deg == 270
     assert CFG.min_frame_ms == 250
-    assert CFG.speeds == {'慢': 30, '正常': 60, '快': 120}
+    assert CFG.speeds == {'慢': 45, '正常': 100, '快': 160}
     assert CFG.oscillate_speed == '快'
     assert CFG.amounts['turn'] == {'一点': 8, '一些': 20, '很多': 40}
     assert CFG.amounts['shift'] == {'一点': 2, '一些': 5, '很多': 10}

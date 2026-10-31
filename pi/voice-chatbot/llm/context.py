@@ -84,7 +84,7 @@ class ConversationContext:
         messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         for turn in self._turns():
             messages.extend(turn)
-        return messages
+        return _patch_dangling_tool_calls(messages)
 
     def reset(self) -> None:
         """清空全部对话历史。"""
@@ -115,3 +115,36 @@ class ConversationContext:
 def _dumps_args(args: dict[str, Any]) -> str:
     """把工具参数序列化成 API 要求的 JSON 字符串。"""
     return json.dumps(args, ensure_ascii=False)
+
+
+UNANSWERED_TOOL_RESULT = "（没有执行：本轮工具调用次数用完或被打断）"
+
+
+def _patch_dangling_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """给"有 tool_calls 却没收到对应 tool 结果"的 assistant 消息补上占位结果。
+
+    ★ 2026-10-31 实车：工具调用达到上限（max_tool_iterations）时最后一轮的
+    assistant.tool_calls 已进历史、但工具没执行 ⇒ 之后**每一次**请求都被接口 400
+    拒掉（"An assistant message with 'tool_calls' must be followed by tool messages"），
+    用户体感就是"卡死了"，只能重启服务。打断等路径也可能留下同样的残缺，所以在
+    发出前统一修补，而不是在每个产生残缺的地方各补一次。占位文字如实告诉模型没执行。
+    """
+    out: list[dict[str, Any]] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        out.append(msg)
+        i += 1
+        calls = msg.get("tool_calls") if msg.get("role") == "assistant" else None
+        if not calls:
+            continue
+        answered = set()
+        while i < len(messages) and messages[i].get("role") == "tool":
+            answered.add(messages[i].get("tool_call_id"))
+            out.append(messages[i])
+            i += 1
+        for call in calls:
+            if call["id"] not in answered:
+                out.append({"role": "tool", "tool_call_id": call["id"],
+                            "content": UNANSWERED_TOOL_RESULT})
+    return out
