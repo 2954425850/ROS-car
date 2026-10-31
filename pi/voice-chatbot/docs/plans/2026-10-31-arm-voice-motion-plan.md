@@ -51,7 +51,7 @@
 ## Task 2：纯函数规划层（Pi 侧，无 ROS）
 
 **Files**（`pi/raspot_ws/src/arm_grasp/`）
-- Create `config/motion.yaml`：档位表、速度档、命名方向、夹爪值、`base_limit_deg: 150`、最短帧 250ms（设计 §3/§5.1/§7）。在 `setup.py` 的 `data_files` 装上。
+- Create `config/motion.yaml`：档位表、速度档、命名方向、夹爪值、`base_limit_deg: 270`、最短帧 250ms（设计 §3/§5.1/§7）。在 `setup.py` 的 `data_files` 装上。
 - Create `arm_grasp/motion_spec.py`：`load_config(path)`；`parse_spec(json_str) -> Spec`（dataclass），不合法抛 `SpecError(中文原因)`；`resolve_amount(kind, amount|None, number|None, cfg) -> float|"max"`。
 - Create `arm_grasp/gaze.py`：`gaze_of(joints) -> (az, el)`；`solve_gaze(az, el, cur_joints, cfg) -> (joints, notes)`，算法按设计 §7（先只动腕 → 肩肘网格最小改动 → 截断到最近可达 el）。
 - Create `arm_grasp/motion_plan.py`：`plan(spec, cur_fields, history, cfg) -> Plan(keyframes, notes, partial)`；`Keyframe(fields: list[6], t_ms: int, label: str)`。实现 toward/turn/shift/approach/gripper/oscillate/上一个姿态/repeat/speed 与时长公式。
