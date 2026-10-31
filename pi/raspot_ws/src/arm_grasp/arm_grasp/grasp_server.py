@@ -172,6 +172,10 @@ class GraspServer(Node):
         # 合拢后爪尖落在物体顶面以下 frac·h（0.5 = 半高）；0 = 关（对准顶面的旧行为）。
         # d 的算法与约束见 grasp.grip_depth()。
         self.declare_parameter('grip_depth_frac', 0.5)
+        # ★ 2026-10-31 用户实测：抓取**总是偏高** ⇒ 在按物体高算出的 d 上**固定再加 3mm**
+        #   （用户原话"直接固定往下多走 0.3cm"）。这是标定修正，不是兜底：
+        #   h 测没测到都加。A/B：ros2 param set /arm_grasp_server grip_extra_down_m 0.0
+        self.declare_parameter('grip_extra_down_m', 0.003)
 
         cb = ReentrantCallbackGroup()
         self.fb = None
@@ -446,6 +450,9 @@ class GraspServer(Node):
                 h_m = (float(_dinfo['table_mm']) - float(_dinfo['raw_mm'])) / 1000.0
             frac = float(self.get_parameter('grip_depth_frac').value)
             d_m = grasp.grip_depth(h_m, frac=frac) if frac > 0.0 else 0.0
+            # ★ 2026-10-31：固定再往下 3mm（用户：抓取总是偏高）。加在 clamp 之后 ——
+            #   要的就是"多走"，不再让 grip_depth 的桌面余量约束把它吃掉。
+            d_m += float(self.get_parameter('grip_extra_down_m').value)
             cfg = cfg._replace(grip_depth_m=d_m)
             O_g = (O[0], O[1], O[2] - d_m)
             lvl, tgt, msg = grasp.plan_verdict(O_g, cfg)
@@ -456,7 +463,8 @@ class GraspServer(Node):
                 f'区域={_dinfo.get("region")}  '
                 f'桌面={_dinfo.get("table_mm") and round(_dinfo["table_mm"])}mm '
                 f'h={"未知" if h_m is None else "%.0fmm" % (h_m * 1000)} '
-                f'⇒ 下扎 d={d_m * 1000:.0f}mm（合拢爪尖在顶面下 {(d_m + grasp.GRIP_EXTEND_M) * 1000:.0f}mm）')
+                f'⇒ 下扎 d={d_m * 1000:.0f}mm（含固定 +{float(self.get_parameter("grip_extra_down_m").value) * 1000:.0f}mm，'
+                f'合拢爪尖在顶面下 {(d_m + grasp.GRIP_EXTEND_M) * 1000:.0f}mm）')
             # S0 只做参考、不拦（用户 2026-10-21：防御判据导致的失败没必要）。
             # 真够不着时 aim 相会铺满 α 包络再试，还不行才以 OUT_OF_REACH 收场。
             if g.dry_run:
