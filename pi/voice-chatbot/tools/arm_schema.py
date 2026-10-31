@@ -38,7 +38,7 @@ STEP_FIELDS = LOOK_FIELDS + MOVE_FIELDS
 _AMOUNT = {
     "type": "string",
     "enum": AMOUNTS,
-    "description": "程度，照用户原话挑：「一点/稍微/一丢丢」=一点，「一些/点儿/看看」=一些，"
+    "description": "程度，照用户原话挑：「一点/稍微/一下/一丢丢」=一点，「一些/点儿/看看」=一些，"
                    "「很多/大幅」=很多，「到底/到头/最低/最高」=到底。用户说了具体数字就不填它。",
 }
 
