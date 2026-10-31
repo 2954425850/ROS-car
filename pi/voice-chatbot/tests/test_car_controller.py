@@ -177,7 +177,8 @@ def test_turn_by_finishes_in_about_the_expected_time():
     controller.turn_by(90.0)
     controller.wait_idle()
     moving = [c for c in bridge.velocity_calls if c != (0.0, 0.0)]
-    assert 30 <= len(moving) <= 45, f"发了 {len(moving)} 帧，与 1.5 秒的预期差太远"
+    # 提前停车：90° − 60°/s×0.35s = 69° ⇒ 1.15s ≈ 29 帧（假桥角速度即指令值、没有滑行）
+    assert 24 <= len(moving) <= 34, f"发了 {len(moving)} 帧，与 1.15 秒的预期差太远"
 
 
 def test_turn_by_360_degrees_finishes():
@@ -316,3 +317,28 @@ def test_status_text_includes_voltage_and_fault():
 def test_status_text_says_so_when_offline():
     controller, _, _ = _make(dead=True)
     assert "读不到" in controller.status_text() or "没在跑" in controller.status_text()
+
+
+
+def test_turn_stops_early_by_coast_lead():
+    """2026-10-31 实测：停车后滑 ≈ 角速度×0.35s。到 目标−滑行量 就该停，而不是到目标才停。"""
+    from car.types import CarLimits
+    controller, bridge, _ = _make()
+    coast = CarLimits().turn_coast_s
+    controller.turn_by(90.0)
+    controller.wait_idle()
+    moving = [c for c in bridge.velocity_calls if c != (0.0, 0.0)]
+    turned_deg = len(moving) * 60.0 / 25.0          # 假桥：每帧按指令角速度转 1/25 秒
+    assert turned_deg == pytest.approx(90.0 - 60.0 * coast, abs=60.0 / 25.0 * 1.5)
+    assert "完成" in controller.last_outcome
+
+
+def test_turn_coast_lead_is_configurable():
+    from car.types import CarLimits
+
+    class Cfg:
+        def get(self, key, default=None):
+            return 0.0 if key == "car.turn_coast_s" else default
+
+    assert CarLimits.from_config(Cfg()).turn_coast_s == 0.0
+    assert CarLimits.from_config(type("C", (), {"get": lambda self, k, d=None: d})()).turn_coast_s == 0.35

@@ -195,14 +195,22 @@ class CarController:
         turned_rad = 0.0
         last = self._clock()
 
+        # ★ 提前停车（2026-10-31 实测）：积分本身是准的（停车那刻与固件 yaw 差 ~1°），
+        #   多转全是停车后的滑行，且与转速成正比（60°/s 滑 ~22°、30°/s 滑 ~9°）。
+        #   所以剩余角度 ≤ |当前实测角速度| × turn_coast_s 时就停，让滑行把最后一段补上。
+        #   用**实测**角速度而不是指令值：起步段车还没转起来，提前量自然就小。
+        coast_s = self._limits.turn_coast_s
+
         def _done() -> bool:
             nonlocal turned_rad, last
             now = self._clock()
             state = bridge.state()
+            lead = 0.0
             if state.yaw_rate is not None:
                 turned_rad += abs(state.yaw_rate) * (now - last)
+                lead = abs(state.yaw_rate) * coast_s
             last = now
-            return turned_rad >= target_rad
+            return turned_rad + lead >= target_rad
 
         timeout = (abs(angle_deg) / max(dps, 1.0)) * 3.0 + 5.0
         direction_word = "左转" if angle_deg >= 0 else "右转"

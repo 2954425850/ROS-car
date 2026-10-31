@@ -41,6 +41,9 @@ class CarLimits:
     camera_max_us: int = 2200           # 云台行程上限
     camera_center_us: int = 1500        # 中位
     cmd_rate_hz: float = 25.0           # 发帧频率（驱动 cmd_rate_hz=20，留余量）
+    # 原地转向停车后的滑行时间（秒）：提前 |实测角速度|×它 停车。2026-10-31 实测
+    # 90°@60°/s 停车后滑 21.6°/22.5°（≈0.36~0.375s）、@30°/s 滑 8.7°（≈0.29s）。
+    turn_coast_s: float = 0.35
 
     @classmethod
     def from_config(cls, config) -> "CarLimits":
@@ -55,6 +58,7 @@ class CarLimits:
             camera_max_us=int(get("car.camera_max_us", 2200)),
             camera_center_us=int(get("car.camera_center_us", 1500)),
             cmd_rate_hz=float(get("car.cmd_rate_hz", 25.0)),
+            turn_coast_s=float(get("car.turn_coast_s", 0.35)),
         )
 
 
