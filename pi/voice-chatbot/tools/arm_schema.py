@@ -222,6 +222,8 @@ ARM_ACT = _fn(
     "每步里：toward = 整体看向某方向；turn = 在当前视线上再转一点（相对量，「再…一点」用它）；"
     "shift = 爪子平移；approach = 沿视线凑近/退远；gripper = 夹爪；oscillate = 来回几下（单独一步）。"
     "程度照用户原话选 amount；说了度数/厘米才填 degrees/cm，不要自己换算。"
+    '格式例：「往前伸5厘米」→ steps=[{"shift":[{"dir":"前","cm":5}]}]；'
+    '「先低头再张开爪子」→ steps=[{"turn":[{"dir":"下","amount":"一些"}]},{"gripper":"张开"}]。'
     + _NOT_CAR + _NOT_OTHERS,
     {
         "steps": {"type": "array", "minItems": 1, "items": _step_schema(),
