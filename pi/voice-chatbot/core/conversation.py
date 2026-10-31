@@ -78,6 +78,7 @@ from tools.follow import register_follow_tools
 from tools.identity import register_identity_tools, restrict_to_owner
 from tools.track import register_track_tools
 from tools.grasp import register_grasp_tools
+from tools.arm import register_arm_tools
 from vision.locate import Locator, VlmBoxer
 from identity.manager import IdentityManager
 from vision.k230_state import K230State
@@ -359,6 +360,16 @@ class ConversationManager:
             logger.error(f"抓取客户端：起不来 —— {e}")
             self._grasp = None
         register_grasp_tools(self._registry, self._locator, self._grasp)
+        # 机械臂语音动作（arm_act/arm_state/arm_home → /arm/motion 等）。同 grasp：起不来只降级，
+        # 工具照注册、调用时说明原因（设计 2026-10-31-arm-voice-motion §9）。
+        try:
+            from car.arm_client import ArmClient
+            self._arm = ArmClient()
+            self._arm.start()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"机械臂客户端：起不来 —— {e}")
+            self._arm = None
+        register_arm_tools(self._registry, self._arm)
         if self._identity is not None and config.get("identity.restrict_to_owner", False):
             n = restrict_to_owner(self._registry, self._identity, {"car", "follow"})
             logger.info(f"身份：{n} 个车/跟随工具只听主人 {sorted(self._identity.owners)}")
@@ -436,6 +447,11 @@ class ConversationManager:
             self._k230_state.close()
         if getattr(self, '_grasp', None) is not None:
             self._grasp.close()
+        if getattr(self, '_arm', None) is not None:
+            try:
+                self._arm.close()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"机械臂客户端：关闭出错 —— {e}")
         self._mcp.close()  # 关 portal + 终止 MCP server 子进程，防僵尸
         self._tool_executor.shutdown(wait=False)
         self._mic.close()
@@ -477,6 +493,15 @@ class ConversationManager:
         #   不是让它等会儿接着开。**这是安全要求，不是偏好**（设计 §9.2）。
         #   将来新增任何涉及物理位移的能力，都按这条例外办。
         self._car.stop_all()
+        # ★ 机械臂语音动作同属「物理位移」⇒ 同一条例外：取消、冻结在当前位置，**不续**。
+        #   cancel() 只置标志 + 发 cancel_goal_async，不阻塞；这里再兜一层，绝不让异常
+        #   打断急停路径（设计 2026-10-31-arm-voice-motion §9）。抓取的打断不在此列，不改。
+        try:
+            arm = getattr(self, '_arm', None)
+            if arm is not None:
+                arm.cancel()
+        except Exception:  # noqa: BLE001
+            pass
         # 流水线正忙 → 记下「这一声是打断」，等它说到一半时生效（设计 §9.4）。
         #
         # ★ 判 is_busy 是必须的：流水线空闲时**不需要**打断 —— 新一轮马上就自己
