@@ -59,7 +59,7 @@ GraspConfig = namedtuple('GraspConfig',
     'bias_r_m '
     's_lead_m lead_max_counts require_depth '
     'close_reach_m aim_hold_m '
-    'grip_empty_p1')
+    'grip_empty_p1 grip_depth_m')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -158,7 +158,32 @@ GraspConfig.__new__.__defaults__ = (
     #   代价：比 ~10 count 还薄的东西会被判成夹空（宁可报没抓到，不报假成功）。
     #   换夹爪/改舵机零位后要重量一次：空爪合上，`ros2 topic echo /arm/feedback` 看第 0 位。
     559.0,
+    # grip_depth_m：张开爪尖扎到**目标点（ToF 最近点 = 顶面）以下**多深（米），0 = 旧行为。
+    #   由 `grip_depth()` 按物体高 h 算好再传进来（grasp_server 每轮算一次），见那里。
+    0.0,
 )
+
+# 合爪时爪尖沿夹爪轴**往前伸**的量（夹紧态 L4 17.7 − 张开态 16.0）
+GRIP_EXTEND_M = 0.017
+GRIP_TABLE_MARGIN_M = 0.005     # 合拢后爪尖离桌面至少留这么多
+GRIP_DEPTH_MAX_M = 0.020        # 绝对上限：h 被测大时的兜底
+
+
+def grip_depth(h_m, frac=0.5, extend_m=GRIP_EXTEND_M, margin_m=GRIP_TABLE_MARGIN_M,
+               d_max_m=GRIP_DEPTH_MAX_M):
+    """物体高 h → 张开爪尖扎到顶面以下的深度 d（米）。
+
+    目标：合拢后的爪尖（= 张开爪尖再沿轴前伸 extend_m）落在顶面以下 `frac·h`（默认半高）
+      ⇒ d = frac·h − extend。
+    约束：d + extend + margin ≤ h —— 否则合爪前伸那段戳桌面，爪被顶住、读回停在半路，
+      会被当成"碰上东西"报**假成功**。再夹到 [0, d_max]。
+    h 未知（None / ≤0）⇒ 0，退回"对准顶面"的旧行为，不赌。
+    """
+    if h_m is None or not math.isfinite(h_m) or h_m <= 0.0:
+        return 0.0
+    d = frac * h_m - extend_m
+    d = min(d, h_m - extend_m - margin_m, d_max_m)
+    return max(0.0, d)
 
 
 def grip_empty(p1_read, cfg):
@@ -685,6 +710,8 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         # ★ 目标点 + **静态偏置**：实测指尖总落在目标左边 1cm ⇒ 目标往右挪 1cm 抵掉。
         #   下面所有几何（目标姿态/残差/沿轴留量）**一律用 `O_u`**，别混用 est.O。
         O_u = apply_bias(est.O, cfg.bias_m, cfg.bias_r_m)
+        if cfg.grip_depth_m > 0.0:      # 从顶面往下扎 d（竖直；α≈−84° 时与沿轴只差 <1%）
+            O_u = (O_u[0], O_u[1], O_u[2] - cfg.grip_depth_m)
 
         # ③ 目标（按**当前相** `cur`）
         # ★★ `f_raw` = 这一拍时间对齐后的 6 个 field（回读优先）。**p1 的真值只在 `f_raw[0]`**：

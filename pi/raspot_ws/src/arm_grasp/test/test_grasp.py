@@ -1097,3 +1097,42 @@ def test_close_does_not_treat_missing_p1_as_stuck():
     assert '碰上东西' not in close_reason, close_reason
     assert '超时兜底' in close_reason, close_reason
     assert rep['ok'], rep['stopped']
+
+
+# ---- 2026-10-31: 往顶面以下扎 d（ToF 最近点 = 顶面，合爪再前伸 1.7cm）-----------------
+
+def test_grip_depth_targets_half_height_and_never_hits_table():
+    """d = h/2 − 1.7cm，并且合拢爪尖（d + 1.7cm）离桌面至少留 5mm、d ≤ 2cm。
+
+    变异（已实测）：去掉 `h − extend − margin` 那道约束 / 去掉 d_max ⇒ 对应断言红。
+    """
+    g = grasp.grip_depth
+    assert g(None) == 0.0 and g(0.0) == 0.0 and g(-0.01) == 0.0
+    assert g(0.030) == 0.0                                # 矮于 3.4cm：不往下扎（旧行为）
+    assert g(0.060) == pytest.approx(0.013)               # 半高：0.03 − 0.017
+    assert g(0.100) == pytest.approx(0.020)               # 封顶 2cm
+    for h in [i / 1000.0 for i in range(1, 200)]:
+        d = g(h)
+        assert 0.0 <= d <= 0.020
+        if d > 0.0:
+            assert d + grasp.GRIP_EXTEND_M + grasp.GRIP_TABLE_MARGIN_M <= h + 1e-12, h
+    # frac 调大也不许越过桌面约束
+    for h in (0.030, 0.040, 0.050):
+        d = g(h, frac=1.0)
+        assert d + grasp.GRIP_EXTEND_M + grasp.GRIP_TABLE_MARGIN_M <= h + 1e-12, (h, d)
+
+
+def test_grip_depth_moves_the_open_tip_down_by_d():
+    """物理量：同一场景，grip_depth_m=15mm 时张开爪尖最终比 0 时**低约 15mm**。
+
+    变异（已实测）：删掉 run() 里 `O_u[2] - cfg.grip_depth_m` 那行 ⇒ 差值 ≈0、这条红。
+    """
+    z = {}
+    for d in (0.0, 0.015):
+        cfg = _cfg()._replace(hz=10.0, max_seconds=30.0, max_ticks=300, grip_depth_m=d)
+        plant = Plant(_start_joints(s_m=0.05))
+        rep = grasp.run(cfg, DepthLink(plant, CAP, depth='auto'), phase='descend',
+                        log=lambda *a: None)
+        assert rep['ok'], rep['stopped']
+        z[d] = grasp.tip_open_m(plant.j)[2]
+    assert z[0.0] - z[0.015] == pytest.approx(0.015, abs=0.004), z

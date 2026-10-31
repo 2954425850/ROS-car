@@ -227,9 +227,21 @@ class TofClient(object):
         #   "相机光心轴向深度"这个 `geom` 要的基准上。
         raw = int(d)
         off = float(self.cfg.get("offset_mm", 0.0))
+        # 同一帧、同一区域里的桌面深度（原始读数系，和 raw 相减即物体高，offset 抵消）
+        table = None
+        try:
+            region = a010.region_bounds(list(box_norm), map_cfg=self.cfg.get("map"),
+                                        pad=float(self.cfg["pad"]), rows=rows, cols=cols)
+            if region is not None:
+                table = a010.region_table_mm(
+                    mm, region, rows, cols, top_mm=raw, lo=float(self.cfg["min_mm"]),
+                    hi=int(self.cfg["val_max"]) * float(self.cfg["unit_mm_per_count"]))
+        except Exception:      # noqa: BLE001 —— 量不出桌面只是不往下扎，不影响深度本身
+            table = None
         return int(round(raw + off)), {"src": "tof", "age_s": age, "dt_s": dt,
                                        "n_msgs": self.n_msgs,
-                                       "raw_mm": raw, "offset_mm": off}
+                                       "raw_mm": raw, "offset_mm": off,
+                                       "table_mm": table}
 
     def info(self):
         return {"enabled": self.enabled, "reason": self.reason,

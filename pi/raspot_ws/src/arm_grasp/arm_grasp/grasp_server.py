@@ -128,6 +128,9 @@ class GraspServer(Node):
         #   设成了 −10 ⇒ 目标点被往车这边拉 1cm ⇒ 用户实测抓取"偏后"。真偏后要往**正**调。
         #   10-01 文档原话：慢档横向已 ±2mm，"−1 那次的偏后是快档的锅"，先别乱填。
         self.declare_parameter('bias_r_mm', 0.0)
+        # 合拢后爪尖落在物体顶面以下 frac·h（0.5 = 半高）；0 = 关（对准顶面的旧行为）。
+        # d 的算法与约束见 grasp.grip_depth()。
+        self.declare_parameter('grip_depth_frac', 0.5)
 
         cb = ReentrantCallbackGroup()
         self.fb = None
@@ -394,13 +397,24 @@ class GraspServer(Node):
                 raise _Abort('NO_TARGET', f'算不出目标点：{e}')
             res.target_valid = True
             res.target_xyz = [float(v) for v in O]
-            lvl, tgt, msg = grasp.plan_verdict(O, cfg)
             _dsrc, _dval, _dinfo = getattr(self, '_last_depth', ('?', None, {}))
+            # 物体高 h = 桌面 − 顶面（同一帧 ToF 原始读数）⇒ 往顶面以下扎 d
+            h_m = None
+            if _dinfo.get('table_mm') is not None and _dinfo.get('raw_mm') is not None:
+                h_m = (float(_dinfo['table_mm']) - float(_dinfo['raw_mm'])) / 1000.0
+            frac = float(self.get_parameter('grip_depth_frac').value)
+            d_m = grasp.grip_depth(h_m, frac=frac) if frac > 0.0 else 0.0
+            cfg = cfg._replace(grip_depth_m=d_m)
+            O_g = (O[0], O[1], O[2] - d_m)
+            lvl, tgt, msg = grasp.plan_verdict(O_g, cfg)
             self.get_logger().info(
                 f'O={tuple(round(v, 4) for v in O)}  S0={lvl}：{msg}  '
                 f'深度={_dval}mm 源={_dsrc} raw={_dinfo.get("raw_mm")} '
                 f'offset={_dinfo.get("offset_mm")} dt={_dinfo.get("dt_s")} '
-                f'区域={_dinfo.get("region")}')
+                f'区域={_dinfo.get("region")}  '
+                f'桌面={_dinfo.get("table_mm") and round(_dinfo["table_mm"])}mm '
+                f'h={"未知" if h_m is None else "%.0fmm" % (h_m * 1000)} '
+                f'⇒ 下扎 d={d_m * 1000:.0f}mm（合拢爪尖在顶面下 {(d_m + grasp.GRIP_EXTEND_M) * 1000:.0f}mm）')
             # S0 只做参考、不拦（用户 2026-10-21：防御判据导致的失败没必要）。
             # 真够不着时 aim 相会铺满 α 包络再试，还不行才以 OUT_OF_REACH 收场。
             if g.dry_run:

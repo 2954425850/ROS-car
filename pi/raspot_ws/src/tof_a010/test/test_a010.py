@@ -263,3 +263,40 @@ def test_depth_map_marks_invalid_as_zero():
     f = _frame_with({(0, 0): 100, (0, 1): 0, (0, 2): 255})
     mm = a010.depth_map_mm(f, unit_mm=4.0)
     assert mm[0] == 400 and mm[1] == 0 and mm[2] == 0
+
+
+# --------------------------------------------------------------------------
+# 桌面深度（物体高 h = 桌面 − 顶面）
+# --------------------------------------------------------------------------
+
+def _scene(rows=20, cols=20, top=200, table=260, obj=(5, 15, 5, 15), far=None):
+    v = [table] * (rows * cols)
+    r0, r1, c0, c1 = obj
+    for r in range(r0, r1):
+        for c in range(c0, c1):
+            v[r * cols + c] = top
+    if far:                          # 边上一条更远的地面
+        for r in range(rows):
+            for c in range(far):
+                v[r * cols + c] = 600
+    return v
+
+
+def test_region_table_finds_the_background_plane():
+    v = _scene()
+    t = a010.region_table_mm(v, (0, 20, 0, 20), 20, 20, top_mm=200, lo=150, hi=1016)
+    assert t == pytest.approx(260, abs=1)
+
+
+def test_region_table_uses_mode_not_max():
+    """★ 边上露出更远的地面（3 列 = 15%）不能把桌面拉远（拉远 ⇒ h 测大 ⇒ 扎太深戳桌面）。
+    变异（已实测）：把众数换成 max(far) ⇒ 这条红。"""
+    v = _scene(far=3)
+    t = a010.region_table_mm(v, (0, 20, 0, 20), 20, 20, top_mm=200, lo=150, hi=1016)
+    assert t == pytest.approx(260, abs=1)
+
+
+def test_region_table_none_when_object_fills_region():
+    v = _scene(obj=(0, 20, 0, 19))                 # 只剩 1 列桌面 = 5% < 15%
+    assert a010.region_table_mm(v, (0, 20, 0, 20), 20, 20, top_mm=200,
+                                lo=150, hi=1016) is None

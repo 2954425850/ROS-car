@@ -270,6 +270,44 @@ def box_depth_mm(mm_values, rows, cols, box_norm, unit_mm=DEFAULT_UNIT_MM,
                       lo=min_mm, hi=val_max * unit_mm, exclude=exclude)
 
 
+def region_table_mm(values, region, rows, cols, top_mm, lo, hi,
+                    gap_mm=10.0, bin_mm=8.0, min_frac=0.15):
+    """区域里**背景（桌面）**的深度，毫米；认不出就 `None`。给"物体高 h = 桌面 − 顶面"用。
+
+    做法：只看比顶面 `top_mm` 远 `gap_mm` 以上的有效像素，按 `bin_mm` 分箱取**众数**
+    （相邻三箱合计最多的那个窗口，返回窗口内均值）。
+    ★ 取众数、不取最大值：框边上露出的远处地面/桌沿外只占少数像素，最大值会被它拉大
+      ⇒ h 被测大 ⇒ 下扎过深、合爪戳桌面。众数跟着"占多数的那个平面"走。
+    ★ 众数窗口不到区域有效像素的 `min_frac` ⇒ 不认（物体把框占满、看不到桌面）。
+    """
+    r0, r1, c0, c1 = region
+    if rows <= 0 or cols <= 0 or len(values) < rows * cols:
+        return None
+    n_valid, far = 0, []
+    for r in range(r0, r1):
+        base = r * cols
+        for c in range(c0, c1):
+            v = float(values[base + c])
+            if lo <= v <= hi:
+                n_valid += 1
+                if v >= top_mm + gap_mm:
+                    far.append(v)
+    if not far or n_valid == 0:
+        return None
+    bins = {}
+    for v in far:
+        bins.setdefault(int(v // bin_mm), []).append(v)
+    best_k, best_n = None, 0
+    for k in bins:
+        n = sum(len(bins.get(k + i, ())) for i in (-1, 0, 1))
+        if n > best_n or (n == best_n and best_k is not None and k < best_k):
+            best_k, best_n = k, n
+    if best_n < min_frac * n_valid:
+        return None
+    win = [v for i in (-1, 0, 1) for v in bins.get(best_k + i, ())]
+    return sum(win) / len(win)
+
+
 # --------------------------------------------------------------------------
 # 给人看的
 # --------------------------------------------------------------------------
