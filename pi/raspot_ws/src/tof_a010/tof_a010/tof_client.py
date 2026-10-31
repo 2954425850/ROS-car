@@ -214,7 +214,8 @@ class TofClient(object):
                               pad=float(self.cfg["pad"]),
                               min_mm=float(self.cfg["min_mm"]),
                               val_max=int(self.cfg["val_max"]),
-                              exclude=self.cfg.get("exclude") or None)
+                              exclude=self.cfg.get("exclude") or None,
+                              kth=int(self.cfg.get("depth_kth", 1)))
         if d is None:
             self.n_null += 1
             return None, {"why": "框内没有落在 [%.0f, %.0f]mm 的有效回波"

@@ -300,3 +300,33 @@ def test_region_table_none_when_object_fills_region():
     v = _scene(obj=(0, 20, 0, 19))                 # 只剩 1 列桌面 = 5% < 15%
     assert a010.region_table_mm(v, (0, 20, 0, 20), 20, 20, top_mm=200,
                                 lo=150, hi=1016) is None
+
+
+def test_region_min_kth_ignores_isolated_flying_pixel():
+    """★ 2026-10-31 抓茄子：区域里 1 个 212mm 飞点（夹爪边缘），真顶面 ≥296 ⇒
+    kth=3 必须给出顶面，不能是飞点。变异（已实测）：kth 不传下去 ⇒ 这条红。"""
+    v = [320] * 400
+    for i in range(150, 160):
+        v[i] = 300                    # 真顶面：10 个像素
+    v[42] = 212                       # 飞点
+    d = a010.box_depth_mm(v, 20, 20, [0.0, 0.0, 1.0, 1.0], pad=0.0, min_mm=150,
+                          val_max=254, kth=3)
+    assert d == 300
+    assert a010.box_depth_mm(v, 20, 20, [0.0, 0.0, 1.0, 1.0], pad=0.0, min_mm=150,
+                             val_max=254) == 212          # kth=1 = 旧行为
+
+
+def test_region_min_kth_falls_back_when_few_pixels():
+    v = [0] * 400
+    v[10], v[11] = 300, 310
+    assert a010.region_min(v, (0, 20, 0, 20), 20, 20, 150, 1016, kth=3) == 310
+
+
+def test_region_min_kth_on_uint16_array():
+    """/tof/depth 是 uint16：结果要对。（取负的回绕恰好保序，不转 int 也对、只是刷警告 ——
+    这条**不**守 int() 转换，守的是 uint16 输入下 kth 的结果。）"""
+    np = pytest.importorskip('numpy')
+    v = np.full(400, 320, dtype=np.uint16)
+    v[150:160] = 300
+    v[42] = 212
+    assert a010.region_min(v, (0, 20, 0, 20), 20, 20, 150, 1016, kth=3) == 300

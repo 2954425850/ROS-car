@@ -183,8 +183,12 @@ def region_bounds(box_norm, map_cfg=None, pad=DEFAULT_PAD, rows=_ROWS, cols=_COL
     return (r0, r1, c0, c1)
 
 
-def region_min(values, region, rows, cols, lo, hi, exclude=None):
-    """区域内落在 `[lo, hi]` 的最小值；一个都没有就 `None`。
+def region_min(values, region, rows, cols, lo, hi, exclude=None, kth=1):
+    """区域内落在 `[lo, hi]` 的最小值（`kth>1` = 第 kth 小）；一个都没有就 `None`。
+
+    ★ `kth`（2026-10-31）：单个**飞点**（夹爪边缘的混合像素，实测第 20 列 55 帧里偶发 220mm，
+      邻列都 ≥296）就能把裸最小值拉走 ⇒ 目标点高出几厘米、抓在茄子上方。取第 3 小：
+      真实顶面总有好几个像素，飞点只有零星一两个。有效像素不足 kth 个 ⇒ 退回其中最大的那个。
 
     **核心是一条**：区域 + 下限 + 上限 → 取最小。`values` 的物理含义由调用方给
     （计数走 `region_depth`，毫米走 `tof_client` 那条），但**取最小的理由只有一份**：
@@ -211,7 +215,9 @@ def region_min(values, region, rows, cols, lo, hi, exclude=None):
         if not skip:
             skip = None
 
-    best = None
+    import heapq
+    k = max(1, int(kth))
+    small = []                        # 最大堆（取负）存最小的 k 个
     for r in range(r0, r1):
         base = r * cols
         for c in range(c0, c1):
@@ -219,9 +225,13 @@ def region_min(values, region, rows, cols, lo, hi, exclude=None):
                                         for (e0, e1, f0, f1) in skip):
                 continue
             v = values[base + c]
-            if lo <= v <= hi and (best is None or v < best):
-                best = v
-    return best
+            if lo <= v <= hi:
+                v = int(v) if float(v).is_integer() else float(v)   # numpy uint16 取负会溢出
+                if len(small) < k:
+                    heapq.heappush(small, -v)
+                elif v < -small[0]:
+                    heapq.heapreplace(small, -v)
+    return -small[0] if small else None
 
 
 def region_depth(frame, region, unit_mm=DEFAULT_UNIT_MM,
@@ -253,7 +263,7 @@ def box_depth(frame, box_norm, unit_mm=DEFAULT_UNIT_MM, map_cfg=None,
 
 def box_depth_mm(mm_values, rows, cols, box_norm, unit_mm=DEFAULT_UNIT_MM,
                  map_cfg=None, pad=DEFAULT_PAD, min_mm=DEFAULT_MIN_MM,
-                 val_max=DEFAULT_VAL_MAX, exclude=None):
+                 val_max=DEFAULT_VAL_MAX, exclude=None, kth=1):
     """同 `box_depth`，但吃的是**已经换算成毫米**的一维数组（0 = 无效）。
 
     `tof_client` 走这条：它从 `/tof/depth` 话题（16UC1，毫米）拿数，
@@ -267,7 +277,7 @@ def box_depth_mm(mm_values, rows, cols, box_norm, unit_mm=DEFAULT_UNIT_MM,
     if region is None:
         return None
     return region_min(mm_values, region, rows, cols,
-                      lo=min_mm, hi=val_max * unit_mm, exclude=exclude)
+                      lo=min_mm, hi=val_max * unit_mm, exclude=exclude, kth=kth)
 
 
 def region_table_mm(values, region, rows, cols, top_mm, lo, hi,
