@@ -3,6 +3,7 @@
 import json
 
 import pytest
+from dataclasses import replace
 
 from arm_grasp.arm_kin import to_fields
 from arm_grasp.motion_exec import (
@@ -165,9 +166,10 @@ def test_dropped_first_frame_resent_once_then_reached():
     assert code == 'OK', reason
     assert st['resends'] == 1 and st['published'] == 3
     t0, t1 = arm.pubs[0][0], arm.pubs[1][0]
-    assert 0.25 - 1e-9 <= t1 - t0 <= 0.25 + 2 * ECFG.poll_s
+    ra = ECFG.resend_after_ms / 1000.0
+    assert ra - 1e-9 <= t1 - t0 <= ra + 2 * ECFG.poll_s
     assert arm.pubs[1][1] == F1
-    assert arm.pubs[1][2] < 1000 and arm.pubs[1][2] >= 700    # 以剩余时间重发
+    assert 1000 - ECFG.resend_after_ms - 100 <= arm.pubs[1][2] < 1000    # 以剩余时间重发
 
 
 def test_resend_at_most_once_then_partial():
@@ -199,20 +201,50 @@ def test_unreachable_reports_residual_without_pushing():
 
 
 def test_timeout_is_t_ms_plus_extra():
+    """一直不"停住"（stall 判据关掉）时，兜底超时 = t_ms + timeout_extra_ms。"""
     arm = FakeArm(stuck={3: 160.0})
-    run(arm, KP((moved(HOME, p4=200.0), 300),))
+    run(arm, KP((moved(HOME, p4=200.0), 300),), cfg=replace(ECFG, stall_n=10 ** 6))
     total = 0.3 + ECFG.timeout_extra_ms / 1000.0
     assert total - 1e-9 <= arm.t <= total + 2 * ECFG.poll_s
 
 
 def test_base_tolerance_is_tighter():
-    """底座差 7 field（> tol_base 6）不算到位；腕差 7（< tol_joint 8）算。"""
+    """严格容差（stall 关掉时）：底座差 7 field（> tol_base 6）不算到位；腕差 7（< tol_joint 8）算。"""
+    nostall = replace(ECFG, stall_n=10 ** 6)
     arm = FakeArm(stuck={5: 33.0})
-    code, _r, st = run(arm, KP((moved(HOME, p6=40.0), 300),))
+    code, _r, st = run(arm, KP((moved(HOME, p6=40.0), 300),), cfg=nostall)
     assert code == 'PARTIAL' and 5 in st['misses'][0][1]
     arm = FakeArm(stuck={2: 253.0})
-    code, _r, _st = run(arm, KP((moved(HOME, p3=260.0), 300),))
+    code, _r, _st = run(arm, KP((moved(HOME, p3=260.0), 300),), cfg=nostall)
     assert code == 'OK'
+
+
+# ---------------------------------------------------------------- 停住即收工（2026-10-31 实车）
+
+def test_stalled_within_slack_finishes_ok_quickly():
+    """底座停在差 8 field（松量内）：过了 t_ms 停住几拍就收工、算到位，不等满超时。"""
+    arm = FakeArm(stuck={5: 32.0})
+    code, reason, st = run(arm, KP((moved(HOME, p6=40.0), 300),))
+    assert code == 'OK', reason
+    assert arm.t < 0.3 + (ECFG.stall_n + 4) * ECFG.poll_s
+    arm = FakeArm(stuck={2: 248.5})                       # 腕下垂 11.5 field
+    code, reason, _st = run(arm, KP((moved(HOME, p3=260.0), 300),))
+    assert code == 'OK', reason
+
+
+def test_stalled_beyond_slack_partial_quickly():
+    """被挡住差 40 field：停住就收工（不死等），记残差 PARTIAL。"""
+    arm = FakeArm(stuck={3: 160.0})
+    code, reason, st = run(arm, KP((moved(HOME, p4=200.0), 300),))
+    assert code == 'PARTIAL' and 3 in st['misses'][0][1]
+    assert arm.t < 0.3 + ECFG.timeout_extra_ms / 1000.0 - 0.5
+
+
+def test_not_moving_frame_resends_before_stall_exit():
+    """丢帧（完全没动）且 t_ms < resend_after：不能被"停住"提前收工，必须先重发。"""
+    arm = FakeArm(drop={0})
+    code, reason, st = run(arm, KP((F1, 250),))
+    assert st['resends'] == 1 and code == 'OK', reason
 
 
 # ---------------------------------------------------------------- 打断
@@ -410,3 +442,12 @@ def test_cancel_before_first_frame_publishes_nothing():
     arm = FakeArm(events=[(0.0, 'CANCELED', '取消了')])
     code, _r, st = run(arm, KP((F1, 300),))
     assert code == 'CANCELED' and arm.pubs == [] and 'freeze' not in st
+
+
+def test_side_is_not_called_rear():
+    """2026-10-31 实车：92° 被描述成"在车后方那一侧"。正侧方附近不该说后方，过了 100° 才说。"""
+    from arm_grasp.arm_kin import BASE_SCALE
+    side = list(HOME); side[5] = 92.0 * BASE_SCALE
+    assert '后方' not in describe_state(side, SCFG, None)['text']
+    back = list(HOME); back[5] = 150.0 * BASE_SCALE
+    assert '后方' in describe_state(back, SCFG, None)['text']

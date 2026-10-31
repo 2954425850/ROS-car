@@ -49,13 +49,17 @@ class ExecConfig:
     settle_n: int = 3               # 连续几拍在容差内算到位
     timeout_extra_ms: int = 1500    # 每帧超时 = t_ms + 这个
     poll_s: float = 0.04            # 回读 25Hz
-    resend_after_ms: int = 250      # 发出后这么久回读还完全没动 ⇒ 重发
+    resend_after_ms: int = 600      # 发出后这么久回读还完全没动 ⇒ 重发（实车：回读滞后+舵机起步，250 会误重发）
     max_resend: int = 1
     moved_eps: float = 3.0          # 朝目标挪了不到这么多 field 视为"没动"（回读底噪 ±1）
     resend_min_t_ms: int = 100      # 重发时剩余时间的下限
     freeze_t_ms: int = 100          # 取消时冻结帧的 t_ms
     normal_t_ms: int = 40           # 结束还原成这个（服务端用参数 normal_arm_t_ms 覆盖）
     fb_lost_s: float = 1.0          # 执行中连续这么久读不到回读 ⇒ NO_FEEDBACK
+    stall_n: int = 4                # 过了 t_ms 后回读连续这么多拍不动 ⇒ 舵机已停，收工
+    stall_eps: float = 1.5          # 两拍之间每个 field 变化 ≤ 这个算"不动"（回读底噪 ±1）
+    tol_joint_stall: float = 16.0   # 停住时的放宽容差：肩/腕带载下垂实测 ~11.5 field（≈3°）
+    tol_base_stall: float = 14.0    # 底座松量 ~3.7° ≈ 10 field
 
 
 @dataclass
@@ -161,7 +165,7 @@ def describe_state(fields, scfg, grip_cmd=None):
         s_az = '正前方'
     else:
         s_az = '朝%s %d°' % ('左' if az > 0 else '右', _deg(az))
-        if abs(az) > 90:
+        if abs(az) > 100:          # 90 附近是正侧方，别说成后方
             s_az += '（在车后方那一侧）'
     if abs(el) < 3:
         s_el = '水平'
@@ -188,7 +192,9 @@ def state_json(fields, scfg, grip_cmd=None):
 
 # --------------------------------------------------------------------------- 执行
 
-def _tol(i, cfg):
+def _tol(i, cfg, stall=False):
+    if stall:
+        return cfg.tol_base_stall if i == 5 else cfg.tol_joint_stall
     return cfg.tol_base if i == 5 else cfg.tol_joint
 
 
@@ -196,9 +202,10 @@ def _to_deg(i, d_field):
     return d_field / BASE_SCALE if i == 5 else d_field / FACTOR
 
 
-def residual(fb, target, cfg):
-    """超出容差的关节 → {下标: target-fb（field）}。夹爪不算。"""
-    return {i: target[i] - fb[i] for i in _CHECK_IDX if abs(target[i] - fb[i]) > _tol(i, cfg)}
+def residual(fb, target, cfg, stall=False):
+    """超出容差的关节 → {下标: target-fb（field）}。夹爪不算。stall=True 用停住时的放宽容差。"""
+    return {i: target[i] - fb[i] for i in _CHECK_IDX
+            if abs(target[i] - fb[i]) > _tol(i, cfg, stall)}
 
 
 def residual_text(res):
@@ -262,6 +269,8 @@ def run_motion(plan, link, cfg, progress=None, stats=None, scfg=None):
             last_sent = target
             resent = 0
             good = 0
+            still = 0
+            prev_fb = None
             fb_t = t0
             t_ms = kf.t_ms
             deadline = t0 + (t_ms + cfg.timeout_extra_ms) / 1000.0
@@ -286,6 +295,21 @@ def run_motion(plan, link, cfg, progress=None, stats=None, scfg=None):
                     continue
                 good = good + 1 if not residual(fb, target, cfg) else 0
                 if good >= cfg.settle_n and el_ms >= t_ms:
+                    break
+                # ★ 2026-10-31 实车：底座松量 ~3.7°、肩腕带载下垂 ~3°，舵机会停在容差外不再动；
+                #   死等到 deadline 让摇头两下花了 12s。过了 t_ms 后回读停住 stall_n 拍就收工，
+                #   残差在 tol_*_stall 内不算没到位（机械精度本来就这样），超了才记残差。
+                if prev_fb is not None and max(abs(a - b) for a, b in zip(fb, prev_fb)) <= cfg.stall_eps:
+                    still += 1
+                else:
+                    still = 0
+                prev_fb = list(fb)
+                # 还可能重发时不收工：没动的帧（丢帧）要先走重发，而不是被当成"停住了"
+                resend_window = resent < cfg.max_resend and el_ms < cfg.resend_after_ms
+                if el_ms >= t_ms and still >= cfg.stall_n and not resend_window:
+                    res = residual(fb, target, cfg, stall=True)
+                    if res:
+                        st['misses'].append((k, res))
                     break
                 if now >= deadline:
                     st['misses'].append((k, residual(fb, target, cfg)))

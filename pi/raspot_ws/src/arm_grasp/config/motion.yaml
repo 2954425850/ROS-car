@@ -55,8 +55,12 @@ exec:
   tol_base: 6             # 底座到位容差（field，1000/360 每度 ⇒ ≈2.2°）
   settle_n: 3             # 回读连续几拍在容差内算到位（回读 25Hz）
   timeout_extra_ms: 1500  # 每帧超时 = t_ms + 这个；超时不报错，记残差 ⇒ PARTIAL
-  resend_after_ms: 250    # 发出后这么久回读完全没朝目标动 ⇒ 以剩余时间重发一次（防串口丢帧）
+  resend_after_ms: 600    # 发出后这么久回读完全没朝目标动 ⇒ 重发一次（防串口丢帧）。2026-10-31 实车：250 会误重发（回读滞后~150ms+舵机起步）
   max_resend: 1
+  stall_n: 4              # 过了 t_ms 后回读连续这么多拍不动 ⇒ 舵机已停，收工（不再死等 timeout）
+  stall_eps: 1.5          # 两拍间 field 变化 ≤ 这个算不动
+  tol_joint_stall: 16     # 停住时的放宽容差。2026-10-31 实车：腕带载下垂停在差 11.5 field（≈3°）
+  tol_base_stall: 14      # 底座松量 ~3.7°≈10 field；摇头时每端停在差 ~8 field，原来每段都等满 1.75s
   moved_eps: 3            # 朝目标挪了不到这么多 field 视为"没动"
   freeze_t_ms: 100        # 取消（唤醒词）时冻结帧的 t_ms
   fb_lost_s: 1.0          # 执行中连续这么久没有可信回读 ⇒ NO_FEEDBACK
