@@ -48,3 +48,23 @@ gripper:
   张开: 240
   合上: 578
   半开: 400
+
+# ---- 执行（motion_exec.run_motion，设计 §8）。缺的键用代码默认值 ----
+exec:
+  tol_joint: 8            # p2..p5 到位容差（field，1000/240 每度 ⇒ ≈1.9°）
+  tol_base: 6             # 底座到位容差（field，1000/360 每度 ⇒ ≈2.2°）
+  settle_n: 3             # 回读连续几拍在容差内算到位（回读 25Hz）
+  timeout_extra_ms: 1500  # 每帧超时 = t_ms + 这个；超时不报错，记残差 ⇒ PARTIAL
+  resend_after_ms: 250    # 发出后这么久回读完全没朝目标动 ⇒ 以剩余时间重发一次（防串口丢帧）
+  max_resend: 1
+  moved_eps: 3            # 朝目标挪了不到这么多 field 视为"没动"
+  freeze_t_ms: 100        # 取消（唤醒词）时冻结帧的 t_ms
+  fb_lost_s: 1.0          # 执行中连续这么久没有可信回读 ⇒ NO_FEEDBACK
+  # normal_t_ms 不在这里：用 arm_grasp_server 的参数 normal_arm_t_ms（和抓取同一个还原值）
+
+# ---- 状态描述（arm/describe、Result.state_json）里的夹爪判据（p1 读回 field）----
+state:
+  grip_open_max: 300      # ≤ 这个 = 张开（张开指令 240）
+  grip_closed_min: 545    # ≥ 这个 = 合上（空爪合到底读回 559，指令 578）
+  grip_holding_min: 400   # 读回在 (400, 545) 且最近一次夹爪指令是合上 = 夹着东西
+  grip_hold_gap_max: 120  # 读回比夹爪指令小 0~120 = 被物体挡住 ⇒ 动作/冻结时保持指令值，不松爪

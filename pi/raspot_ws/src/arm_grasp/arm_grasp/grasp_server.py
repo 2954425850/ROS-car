@@ -20,7 +20,15 @@
 
 ## 不做口头确认
 用户定：说了"抓 X"就直接抓（见记忆 phase2-plan-decisions）。
+
+## 语音动作 `/arm/motion`（raspot_interfaces/action/ArmMotion）+ `/arm/describe`（2026-10-31 加）
+设计 `pi/voice-chatbot/docs/plans/2026-10-31-arm-voice-motion-design.md` §4 §8。
+spec_json → `motion_plan.plan`（纯函数）→ `motion_exec.run_motion`（逐帧发一次 + 回读确认）。
+与抓取共用 `_busy`/`_abort`/`_on_cmd`/`_on_estop`/`_set_driver_t_ms`：一个在跑另一个被拒。
+发布打 frame_id='motion'。打断规则同上；取消时额外发一帧"冻结"（目标=当前回读、t_ms=100）；
+`/arm/cmd_gate` 变 dead（复位/回中）也算人接管，零发布。
 """
+import dataclasses
 import json
 import threading
 import time
@@ -35,11 +43,12 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 
-from raspot_interfaces.action import Grasp
+from raspot_interfaces.action import ArmMotion, Grasp
 
 from arm_grasp import grasp, ltrace, observe
 from arm_grasp.collect import JOINT_NAMES, k230_host_from_result
 from arm_grasp.grasp_codes import code_for
+from arm_grasp import motion_exec, motion_plan, motion_spec
 
 OBS_WAIT_S = 5.0          # 锁框后等结果流出现这个框
 REC_MAX_AGE_S = 1.5       # 结果记录超过这么老就不用（同 observe.fresh_result）
@@ -106,6 +115,38 @@ class ServerLink:
         self.srv.publish_arm(fields)
 
 
+MOTION_FB_FRESH_S = 0.5   # 动作用的回读超过这么老算没有
+_MOTION_ABORT_TEXT = {'手柄动了机械臂，抓取让出控制权': '手柄动了机械臂，动作让出控制权'}
+
+
+class MotionLink:
+    """`motion_exec` 的 Link：spin 里查打断（含 cmd_gate 变 dead），publish 打 'motion' 来源标记。"""
+
+    def __init__(self, srv):
+        self.srv = srv
+
+    def now(self):
+        return time.monotonic()
+
+    def fb(self):
+        return self.srv.motion_fb()
+
+    def set_t_ms(self, ms):
+        return bool(self.srv._set_driver_t_ms(ms))
+
+    def spin(self, dt):
+        end = time.monotonic() + dt
+        while True:
+            self.srv.check_motion_abort()
+            rest = end - time.monotonic()
+            if rest <= 0:
+                return
+            time.sleep(min(rest, 0.02))
+
+    def publish(self, fields):
+        self.srv.publish_motion(fields)
+
+
 class GraspServer(Node):
 
     def __init__(self):
@@ -165,6 +206,7 @@ class GraspServer(Node):
                                 goal_callback=self._on_goal, cancel_callback=self._on_cancel,
                                 callback_group=cb)
         self.get_logger().info('arm_grasp_server 就绪：/arm/grasp')
+        self._init_motion(cb)
 
     # ---- 订阅 ----
 
@@ -479,6 +521,195 @@ class GraspServer(Node):
                 self._set_driver_t_ms(self.get_parameter('normal_arm_t_ms').value)
             if locked and host:
                 observe.k230_cmd(host, {'cmd': 'stop'})
+            self._busy = False
+
+    # ================================================================ 语音动作（只加）
+
+    def _init_motion(self, cb):
+        # motion.yaml 路径；空 = share/arm_grasp/config/motion.yaml（没装就用源码树）
+        self.declare_parameter('motion_config', '')
+        self._motion_lock = threading.Lock()
+        self._mfb = None                 # (fields, t) 最近一拍可信回读
+        self._grip_cmd = None            # 最近一次 /arm/command 的夹爪指令（任何来源）
+        self._estop_on = False
+        self._gate = motion_exec.CmdGate()
+        self._history = motion_exec.PoseHistory(maxlen=5)
+        self._motion_err = None
+        try:
+            path = self.get_parameter('motion_config').value or None
+            self._mcfg = motion_spec.load_config(path)
+            self._ecfg, self._scfg = motion_exec.load_runtime_config(path)
+        except Exception as e:         # noqa: BLE001 —— 配置坏了只废掉动作，不连累抓取
+            self._motion_err = 'motion.yaml 读不了：%r' % (e,)
+            self._mcfg, self._ecfg, self._scfg = None, None, motion_exec.StateConfig()
+            self.get_logger().error(self._motion_err)
+        self.create_subscription(JointState, 'arm/feedback', self._on_fb_motion, 10, callback_group=cb)
+        self.create_subscription(JointState, 'arm/command', self._on_cmd_grip, 10, callback_group=cb)
+        self.create_subscription(Bool, 'estop', self._on_estop_state, 10, callback_group=cb)
+        self.create_subscription(Bool, 'arm/cmd_gate', self._on_cmd_gate, 10, callback_group=cb)
+        self.create_service(Trigger, 'arm/describe', self._describe_srv, callback_group=cb)
+        self._as_motion = ActionServer(self, ArmMotion, 'arm/motion',
+                                       execute_callback=self._execute_motion,
+                                       goal_callback=self._on_goal, cancel_callback=self._on_cancel,
+                                       callback_group=cb)
+        self.get_logger().info('arm_grasp_server 就绪：/arm/motion /arm/describe')
+
+    def _on_fb_motion(self, msg):
+        f = list(msg.position)
+        if _stable(f):
+            with self._lock:
+                self._mfb = ([float(v) for v in f[:6]], time.monotonic())
+
+    def _on_cmd_grip(self, msg):
+        if len(msg.position) > 0:
+            self._grip_cmd = float(msg.position[0])
+
+    def _on_estop_state(self, msg):
+        self._estop_on = bool(msg.data)
+
+    def _on_cmd_gate(self, msg):
+        self._gate.on_msg(msg.data, time.monotonic())
+
+    def motion_fb(self):
+        with self._lock:
+            if self._mfb is None or time.monotonic() - self._mfb[1] > MOTION_FB_FRESH_S:
+                return None
+            return list(self._mfb[0])
+
+    def _wait_motion_fb(self, timeout):
+        end = time.monotonic() + timeout
+        fb = self.motion_fb()
+        while fb is None and time.monotonic() < end:
+            time.sleep(0.05)
+            fb = self.motion_fb()
+        return fb
+
+    def check_motion_abort(self):
+        if self._abort is None and self._gate.dead(time.monotonic()):
+            self._abort = ('ABORTED_BY_OPERATOR', '机械臂进入复位（回中），动作中止')
+        if self._abort is not None:
+            code, reason = self._abort
+            raise motion_exec.Abort(code, _MOTION_ABORT_TEXT.get(reason, reason))
+
+    def publish_motion(self, fields):
+        """取消（CANCELED）时仍允许发冻结帧；人接管/急停/复位中一条都不发。"""
+        try:
+            self.check_motion_abort()
+        except motion_exec.Abort as a:
+            if a.code != 'CANCELED':
+                raise
+        m = JointState()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.header.frame_id = 'motion'
+        m.name = list(JOINT_NAMES)
+        m.position = [float(v) for v in fields]
+        self.pub_arm.publish(m)
+
+    def _state_json(self, fb=None):
+        fb = fb if fb is not None else self.motion_fb()
+        if fb is None:
+            return ''
+        return motion_exec.state_json(fb, self._scfg, self._grip_cmd)
+
+    def _describe_srv(self, req, resp):
+        fb = self._wait_motion_fb(0.5)
+        if fb is None:
+            resp.success, resp.message = False, '读不到可信的机械臂回读（驱动没起来/臂没上电/正在复位？）'
+            return resp
+        try:
+            resp.success, resp.message = True, self._state_json(fb)
+        except Exception as e:         # noqa: BLE001
+            resp.success, resp.message = False, repr(e)
+        return resp
+
+    def _motion_feedback(self, gh, step, total, detail):
+        fb = ArmMotion.Feedback()
+        fb.step, fb.total, fb.detail = int(step), int(total), str(detail)[:200]
+        gh.publish_feedback(fb)
+
+    def _execute_motion(self, gh):
+        g = gh.request
+        res = ArmMotion.Result()
+        with self._motion_lock:
+            if self._busy:             # goal_callback 和 execute 之间被抓取抢了
+                res.ok, res.code, res.reason = False, 'BUSY', '机械臂正忙（抓取或另一个动作在跑）'
+                gh.abort()
+                return res
+            self._busy, self._abort = True, None
+        try:
+            if self._motion_err:
+                raise _Abort('ERROR', self._motion_err)
+            try:
+                spec = motion_spec.parse_spec(g.spec_json)
+            except motion_spec.SpecError as e:
+                raise _Abort('BAD_GOAL', '动作描述不合法：%s' % e)
+            summary = motion_exec.spec_summary(spec)
+            fb = self._wait_motion_fb(1.0)
+            if fb is None:
+                raise _Abort('NO_FEEDBACK', '读不到可信的机械臂回读，没动')
+            before = list(fb)
+            before[0] = motion_exec.grip_hold_value(fb[0], self._grip_cmd, self._scfg)
+            try:
+                p = motion_plan.plan(spec, before, self._history.snapshot(), self._mcfg)
+            except motion_spec.SpecError as e:
+                raise _Abort('BAD_GOAL', '动作描述不合法：%s' % e)
+            total_s = sum(k.t_ms for k in p.keyframes) / 1000.0
+            self.get_logger().info('motion%s：%s ⇒ %d 帧 %.1fs partial=%s notes=%s  %s' % (
+                '(dry)' if g.dry_run else '', summary, len(p.keyframes), total_s, p.partial,
+                p.notes, ' | '.join('%s %s %dms' % (k.label, [round(v) for v in k.fields], k.t_ms)
+                                    for k in p.keyframes)))
+            if g.dry_run:
+                res.code = motion_exec.final_code('OK', p.partial)
+                res.ok = True
+                frames = '；'.join('%s %dms' % (k.label, k.t_ms) for k in p.keyframes)
+                res.reason = 'dry-run（没动）：' + motion_exec.compose_reason(
+                    res.code, summary, p.notes,
+                    '%d 帧约 %.1fs：%s' % (len(p.keyframes), total_s, frames))
+                res.state_json = self._state_json(fb)
+                gh.succeed()
+                return res
+            if self._gate.dead(time.monotonic()):
+                raise _Abort('BUSY', '机械臂正在复位，等它结束再动')
+            if self._estop_on:
+                raise _Abort('ESTOP', '急停还按着，不能动')
+
+            ecfg = dataclasses.replace(
+                self._ecfg, normal_t_ms=int(self.get_parameter('normal_arm_t_ms').value))
+            st = {}
+            code, ereason = motion_exec.run_motion(
+                p, MotionLink(self), ecfg, stats=st, scfg=self._scfg,
+                progress=lambda i, n, d: self._motion_feedback(gh, i, n, d))
+            code = motion_exec.final_code(code, p.partial)
+            if code in motion_exec.OK_CODES:
+                self._history.commit(p.history_used, before)
+            res.ok = code in motion_exec.OK_CODES
+            res.code = code
+            res.reason = motion_exec.compose_reason(code, summary, p.notes, ereason)
+            self.get_logger().info('motion 结束：%s %s（发 %d 帧、重发 %d、未到位 %s）' % (
+                code, res.reason, st.get('published', 0), st.get('resends', 0), st.get('misses')))
+            res.state_json = self._state_json()
+            if res.ok:
+                gh.succeed()
+            elif code == 'CANCELED':
+                gh.canceled()
+            else:
+                gh.abort()
+            return res
+        except _Abort as a:
+            res.ok, res.code, res.reason = False, a.code, a.reason
+            self.get_logger().warn('motion 结束：%s %s' % (a.code, a.reason))
+            res.state_json = self._state_json()
+            if a.code == 'CANCELED':
+                gh.canceled()
+            else:
+                gh.abort()
+            return res
+        except Exception as e:         # noqa: BLE001
+            self.get_logger().error('motion 异常：%r' % (e,))
+            res.ok, res.code, res.reason = False, 'ERROR', repr(e)
+            gh.abort()
+            return res
+        finally:
             self._busy = False
 
 

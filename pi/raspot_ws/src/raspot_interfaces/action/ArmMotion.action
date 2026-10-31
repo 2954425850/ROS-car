@@ -1,0 +1,16 @@
+# 语音动作（arm_grasp/grasp_server 的 /arm/motion）。设计 2026-10-31-arm-voice-motion-design.md §4.1 §5。
+# ---- Goal ----
+string spec_json          # 结构化意图（未量化），形状见设计 §5；由 motion_spec.parse_spec 校验
+bool dry_run              # true = 只规划不动臂，返回规划结果（评测/调试用）
+---
+# ---- Result ----
+bool ok                   # code ∈ OK | PARTIAL 时为 true
+string code               # OK | PARTIAL | BAD_GOAL | BUSY | NO_FEEDBACK | CANCELED
+                          # | ABORTED_BY_OPERATOR | ESTOP | TIMEOUT | ERROR
+string reason             # 人话（中文）：做了什么 + 截断/没到位的说明
+string state_json         # 结束时状态（同 arm/describe 的 message）
+---
+# ---- Feedback ----
+int32 step
+int32 total
+string detail
