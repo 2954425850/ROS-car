@@ -10,6 +10,8 @@
   <depend>std_msgs</depend>
   <depend>rcl_interfaces</depend>
   <depend>raspot_interfaces</depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
   <test_depend>python3-pytest</test_depend>
   <export><build_type>ament_python</build_type></export>
 </package>

@@ -1,0 +1,50 @@
+# 机械臂语音动作的档位表 / 速度档 / 命名方向（设计 2026-10-31-arm-voice-motion-design.md §3 §5.1 §7）。
+# 可手调；改完要 colcon build（装到 share/arm_grasp/config/）并重启 arm-grasp 才生效。
+
+# 底座软限位（度）。用户 2026-10-31 确认 ±270°。底座 field = 度 × 1000/360，驱动钳位 ±1000。
+base_limit_deg: 270
+
+# 视线俯仰允许范围（度，下负）。超出 ⇒ 截到边上并说明「已经低到最低了」。
+el_range_deg: [-90, 90]
+
+# 每帧最短时长（ms）
+min_frame_ms: 250
+
+# 速度档 = 关节空间最大角速度（°/s）。t_ms = max(min_frame_ms, max|Δ关节°| / 档速 × 1000)
+speeds:
+  慢: 30
+  正常: 60
+  快: 120
+default_speed: 正常
+oscillate_speed: 快          # oscillate 默认「快」（spec 里给了 speed 则以 spec 为准）
+
+# 档位表。「到底」不在表里：turn = 到限位，shift/approach = 到可达边界。
+amounts:
+  turn:       {一点: 8, 一些: 20, 很多: 40}       # 度
+  shift:      {一点: 2, 一些: 5, 很多: 10}        # cm
+  approach:   {一点: 2, 一些: 5, 很多: 10}        # cm
+  oscillate:  {一点: 8, 一些: 15, 很多: 25}       # 度（单侧幅度，围绕起始姿态 ±A）
+default_amount: 一些          # 只说了方向、没说程度也没给数时用它
+oscillate_times: 3            # 没说次数时来回几次
+
+# shift/approach「到底」时沿该方向最多找多远（cm），实际挪多少由可达边界二分决定
+max_travel_cm: 60
+
+# 命名方向 → [方位 az, 俯仰 el]（度；az 左正 0=车头；el 下负 0=水平）
+directions:
+  前方: [0, -15]
+  左边: [90, -15]
+  右边: [-90, -15]
+  左前: [45, -15]
+  右前: [-45, -15]
+  上方: [0, 30]
+  地上: [0, -75]
+  脚下: [0, -75]
+  地上远处: [0, -40]
+  后方: [180, -15]
+
+# 夹爪 p1 field
+gripper:
+  张开: 240
+  合上: 578
+  半开: 400
