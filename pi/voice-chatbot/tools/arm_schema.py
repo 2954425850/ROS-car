@@ -4,7 +4,8 @@
 
 - **A（拆分）**：arm_look（toward/turn/speed）+ arm_move（shift/approach/gripper/oscillate/steps/speed）
   + arm_state + arm_home
-- **B（合一）**：arm_act（就是设计 §5 的 spec）+ arm_state + arm_home
+- **B（合一）**：arm_act（设计 §5 的 spec；单步时字段直接平铺在顶层，先后多步才用 steps）
+  + arm_state + arm_home
 
 字段与枚举严格按设计 `docs/plans/2026-10-31-arm-voice-motion-design.md` §5/§5.1。
 「何时调用 / 何时不要」全部写在 description 里 —— **不改 system_prompt**
@@ -218,20 +219,26 @@ ARM_ACT = _fn(
     "换方向看（「左边看看」「往右瞄一眼」「低下头」「抬头」「看看地上」「看前面」「再低点」「回到刚才那样」）、"
     "伸缩抬放（「往前伸点」「收回来」「举高点」「凑近点看」）、"
     "开合夹爪（「张开爪子」「合上」）、来回动（「点点头」「摇摇头」）时调用。"
-    "steps 按顺序执行，一件事就一步；「先低头再张开爪子」是两步。同一步里的几项会合成一个姿势一起到位。"
-    "每步里：toward = 整体看向某方向；turn = 在当前视线上再转一点（相对量，「再…一点」用它）；"
-    "shift = 爪子平移；approach = 沿视线凑近/退远；gripper = 夹爪；oscillate = 来回几下（单独一步）。"
+    "toward = 整体看向某方向；turn = 在当前视线上再转一点（相对量，「再…一点」用它）；"
+    "shift = 爪子平移；approach = 沿视线凑近/退远；gripper = 夹爪；oscillate = 来回几下再回原位。"
+    "一件事（或几项同时做，如「低头凑近点看」）直接填顶层字段；"
+    "一句话里要**先后**做几件事（「先低头再张开爪子」）才用 steps，每件一步，steps 的每步里写同样这些字段。"
+    "oscillate 不能和别的字段同时填。"
     "程度照用户原话选 amount；说了度数/厘米才填 degrees/cm，不要自己换算。"
-    '格式例：「往前伸5厘米」→ steps=[{"shift":[{"dir":"前","cm":5}]}]；'
-    '「先低头再张开爪子」→ steps=[{"turn":[{"dir":"下","amount":"一些"}]},{"gripper":"张开"}]。'
     + _NOT_CAR + _NOT_OTHERS,
     {
-        "steps": {"type": "array", "minItems": 1, "items": _step_schema(),
-                  "description": "按顺序执行的步骤，至少一步。"},
+        "toward": _TOWARD,
+        "turn": _TURN,
+        "shift": _SHIFT,
+        "approach": _APPROACH,
+        "gripper": _GRIPPER,
+        "oscillate": _OSCILLATE,
+        "steps": {"type": "array", "description": "有先后顺序的多步；只有一件事时不用它。",
+                  "items": _step_schema()},
         "repeat": _REPEAT,
         "speed": _SPEED,
     },
-    ["steps"],
+    [],
 )
 
 SCHEMAS_A: list[dict[str, Any]] = [ARM_LOOK, ARM_MOVE, ARM_STATE, ARM_HOME]
@@ -263,22 +270,17 @@ def to_spec(name: str, args: dict[str, Any]) -> dict[str, Any] | None:
     if args.get("repeat") is not None:
         spec["repeat"] = args["repeat"]
 
-    if name == "arm_act":
-        steps = args.get("steps")
-        if not isinstance(steps, list) or not steps:
-            raise ValueError("arm_act 缺 steps")
-        spec["steps"] = steps
+    if name in ("arm_act", "arm_move"):
+        fields = STEP_FIELDS if name == "arm_act" else MOVE_FIELDS
+        step = {k: args[k] for k in fields if args.get(k) not in (None, [], {}, "")}
+        steps = args.get("steps") or []
+        if not isinstance(steps, list):
+            raise ValueError(f"{name} 的 steps 应为数组")
+        spec["steps"] = ([step] if step else []) + list(steps)
         return spec
     if name == "arm_look":
         step = {k: args[k] for k in LOOK_FIELDS if args.get(k) not in (None, [], {}, "")}
         spec["steps"] = [step]
-        return spec
-    if name == "arm_move":
-        step = {k: args[k] for k in MOVE_FIELDS if args.get(k) not in (None, [], {}, "")}
-        steps = list(args.get("steps") or [])
-        if step:
-            steps = [step] + steps
-        spec["steps"] = steps
         return spec
     return None
 
@@ -289,6 +291,8 @@ def from_spec(variant: str, spec: dict[str, Any]) -> list[tuple[str, dict[str, A
     extra = {k: spec[k] for k in ("speed", "repeat") if k in spec}
     steps = spec["steps"]
     if v == "B":
+        if len(steps) == 1:
+            return [("arm_act", {**steps[0], **extra})]
         return [("arm_act", {"steps": steps, **extra})]
     if len(steps) == 1:
         step = steps[0]

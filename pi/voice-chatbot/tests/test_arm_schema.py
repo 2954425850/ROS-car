@@ -81,10 +81,9 @@ def test_variant_tool_sets():
 
 
 def test_required_fields():
-    assert _params("B", "arm_act")["required"] == ["steps"]
-    assert _params("B", "arm_act")["properties"]["steps"]["minItems"] == 1
     for name in ("arm_look", "arm_move"):
         assert _params("A", name)["required"] == []
+    assert _params("B", "arm_act")["required"] == []
     for v in "AB":
         assert _params(v, "arm_state")["properties"] == {}
         assert _params(v, "arm_home")["properties"] == {}
@@ -122,6 +121,20 @@ def test_enums_match_design(variant):
     assert osc["required"] == ["axis"]
     top = _params(variant, "arm_move" if variant == "A" else "arm_act")["properties"]
     assert set(top["speed"]["enum"]) == DESIGN["speed"]
+
+
+def test_B_top_level_fields():
+    """B：单步字段平铺在顶层（降低嵌套，评测里嵌套版在多轮里会把 dir/amount 拍平到步上），且与 step 里同名字段一致。"""
+    top = _params("B", "arm_act")["properties"]
+    assert set(top) == set(S.STEP_FIELDS) | {"steps", "repeat", "speed"}
+    st = _step_props("B")
+    for f in S.STEP_FIELDS:
+        assert top[f] == st[f]
+
+
+def test_B_flat_and_steps_combine_in_order():
+    spec = S.to_spec("arm_act", {"turn": [{"dir": "下"}], "steps": [{"gripper": "张开"}], "speed": "慢"})
+    assert spec == {"speed": "慢", "steps": [{"turn": [{"dir": "下"}]}, {"gripper": "张开"}]}
 
 
 def test_A_top_level_fields_same_as_step():
@@ -170,7 +183,7 @@ def test_to_spec_non_motion_is_none():
     assert S.to_spec("arm_state", {}) is None
     assert S.to_spec("car_turn", {"angle_deg": 90}) is None
     with pytest.raises(ValueError):
-        S.to_spec("arm_act", {})
+        S.to_spec("arm_act", {"steps": "张开"})
 
 
 # ---------------------------------------------------------------- corpus 引用
