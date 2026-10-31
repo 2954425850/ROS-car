@@ -254,8 +254,10 @@ def test_oscillate_frames_and_return_to_start(cur, axis, idx, times):
     assert p.keyframes[-1].fields == pytest.approx(cur)
     for k in p.keyframes:
         assert_valid(k.fields)
-        for i in range(6):            # 只动该轴
-            if i != idx:
+        # 只动该轴；点头腕到限位时允许肩/肘(p4/p5)补足，但底座/夹爪/腕旋不动
+        moving = {idx, 3, 4} if axis == '上下' else {idx}
+        for i in range(6):
+            if i not in moving:
                 assert k.fields[i] == pytest.approx(cur[i])
     vals = [k.fields[idx] for k in p.keyframes[:-1]]
     if axis == '夹爪':                                          # 开/合交替，第一下先往相反状态走
@@ -273,9 +275,22 @@ def test_nod_amplitude():
     assert not p.partial
 
 
-def test_nod_clipped_at_wrist_limit_is_reported():
-    p = P({'steps': [{'oscillate': {'axis': '上下'}}]})     # home 腕 -76.8，往下 15 会超 -90
-    assert p.partial and any('点头' in n for n in p.notes)
+def test_nod_at_wrist_limit_uses_shoulder_full_amplitude():
+    """2026-10-31 实车：home 腕 -76.8，只动腕往下只有 13°（实车 7°，用户没看出点头）。
+    现在腕到限位由肩/肘补足 ⇒ 上下都满 15°、不 partial。"""
+    p = P({'steps': [{'oscillate': {'axis': '上下'}}]})
+    el0 = gaze(HOME)[1]
+    els = [gaze(k.fields)[1] for k in p.keyframes]
+    assert els[0] == pytest.approx(el0 - 15, abs=0.5) and els[1] == pytest.approx(el0 + 15, abs=0.5)
+    assert p.keyframes[0].fields[4] != pytest.approx(HOME[4])     # 肩动了
+    assert not p.partial
+
+
+def test_nod_clipped_at_el_limit_is_reported():
+    """视线已经接近 −90：往下的那一半到不了，要报。"""
+    start = P({'steps': [{'turn': [{'dir': '下', 'degrees': 32}]}]}).keyframes[0].fields   # el ≈ −87
+    p = P({'steps': [{'oscillate': {'axis': '上下'}}]}, start)
+    assert p.partial and any('点头' in n and '往下' in n for n in p.notes)
 
 
 # ---------------------------------------------------------------- 时长

@@ -302,8 +302,24 @@ def _oscillate(osc, pose, ctx):
     else:
         a = resolve_amount('oscillate', osc.amount, None, cfg)
         if osc.axis == '上下':
-            key, (lo, hi), words = 'wrist_pitch', joint_bounds()['wrist_pitch'], ('下', '上')
-            first, second = pose.j[key] - a, pose.j[key] + a       # 点头先往下
+            # ★ 2026-10-31 实车：复位位姿腕已近 −90 限位，只动腕点头往下只有 7°，用户"没看到点头"。
+            #   改走视线求解器：先试只动腕，腕到限位时自己动肩/肘补足（同「低头」）。
+            j0 = pose.j
+            el0 = j0['shoulder'] + j0['elbow'] + j0['wrist_pitch']
+            ends = []
+            for want_el, w in ((el0 - a, '下'), (el0 + a, '上')):    # 点头先往下
+                jj, notes = solve_gaze(j0['base'], want_el, j0, cfg)
+                got = jj['shoulder'] + jj['elbow'] + jj['wrist_pitch']
+                if abs(got - want_el) > 0.5:
+                    ctx.note('点头幅度到限位了：往%s只能动 %.0f°（要 %.0f°）' % (w, abs(got - el0), a))
+                ends.append((jj, w))
+            for t in range(times):
+                for jj, w in ends:
+                    p = pose.copy()
+                    p.j = dict(jj)
+                    out.append((p, 'oscillate:上下 %d/%d %s' % (t + 1, times, w)))
+            out.append((pose.copy(), 'oscillate:上下 回原位'))
+            return out
         else:
             key, lo, hi, words = 'base', -cfg.base_limit_deg, cfg.base_limit_deg, ('左', '右')
             first, second = pose.j[key] + a, pose.j[key] - a       # 摇头先往左
