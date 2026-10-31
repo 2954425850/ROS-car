@@ -122,7 +122,9 @@ _REPEAT = {"type": "integer", "minimum": 1, "maximum": 10,
 def _step_schema() -> dict[str, Any]:
     return {
         "type": "object",
-        "description": "一步。同一步里的字段合成一个姿态；oscillate 必须单独成一步。",
+        "description": "一步。键只能是 toward/turn/shift/approach/gripper/oscillate；dir、amount、degrees、cm "
+                       "要写在 turn/shift/approach **里面**，不能直接写在步上。同一步里的字段合成一个姿态；"
+                       "oscillate 必须单独成一步。",
         "properties": {
             "toward": _TOWARD,
             "turn": _TURN,
