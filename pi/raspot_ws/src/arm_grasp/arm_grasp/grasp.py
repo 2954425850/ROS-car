@@ -16,7 +16,7 @@ I/O 全部由调用方注入（`Link` 协议）：测试注入假臂，工具注
 import math
 from collections import namedtuple
 
-from . import geom, ltrace
+from . import geom, ltrace, shot
 from .arm_kin import FIELD_HI, FIELD_LO, from_fields, to_fields
 from .reach import (NoFeasible, axis_point, enumerate_feasible,
                     feasible_alpha_intervals, path_samples, select)
@@ -59,7 +59,8 @@ GraspConfig = namedtuple('GraspConfig',
     'bias_r_m '
     's_lead_m lead_max_counts require_depth '
     'close_reach_m aim_hold_m '
-    'grip_empty_p1 grip_depth_m')
+    'grip_empty_p1 grip_depth_m '
+    'shot_dir')
 GraspConfig.__new__.__defaults__ = (
     -88.0, -45.0, 14.0, 1.0, -58.0,
     40.0, 10.0, 5.0,
@@ -161,6 +162,9 @@ GraspConfig.__new__.__defaults__ = (
     # grip_depth_m：张开爪尖扎到**目标点（ToF 最近点 = 顶面）以下**多深（米），0 = 旧行为。
     #   由 `grip_depth()` 按物体高 h 算好再传进来（grasp_server 每轮算一次），见那里。
     0.0,
+    # shot_dir：进 `close` 那一拍把"当时的全部原始输入"交给 `link.shot()`（见 shot.py）。
+    #   None = 不发（默认，既有用例不受影响）。**采集侧不做任何几何**：派生量离线算。
+    None,
 )
 
 # 合爪时爪尖沿夹爪轴**往前伸**的量（夹紧态 L4 17.7 − 张开态 16.0）
@@ -490,10 +494,29 @@ class Link:
         fb() -> list | None     最新 6 个 field（可能含 0）
         obs() -> Obs | None     自上一拍以来最新的一条观测（已去重）
         publish(fields)         发一条 /arm/command
+
+    **可选**（有就调、没有就跳过）：
+
+        shot(rec)               进 `close` 那一拍交一份快照 dict（`shot.build()` 的产物）。
+                                `cfg.shot_dir` 为 None 时根本不调。实现方负责落盘 / 抓照片。
     """
 
 
 PHASES = ('aim', 'descend', 'close', 'lift')
+
+
+def _joints_at(trace, obs, latency_s):
+    """`obs` 那张图**拍摄时刻**的 6 个 field（配关节用）。没有观测 / 查不到就 None。
+
+    和 `estimate_point` 用的是同一个时刻口径（`t_arrive − latency_s`）—— 快照里的
+    `j_obs` 必须和当时算 O 用的姿态一致，否则离线重算出来的偏差是假的。
+    """
+    if obs is None:
+        return None
+    try:
+        return list(trace.at(obs.t_arrive - latency_s, 'auto'))
+    except (ValueError, TypeError):
+        return None
 
 
 def run(cfg, link, phase='aim', log=print, initial_point=None):
@@ -547,6 +570,10 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
     j_prev_cmd = None     # 上一拍的**未补偿**关节指令（限速的起点，见 ④）
     phase_ticks = 0       # 本相已走几拍
     aim_hold = False      # 'aim' 相：已贴到目标 ⇒ 冻结 O 与 α（见 cfg.aim_hold_m）
+    # 下面两个**只给 close 快照用**（cfg.shot_dir）：进 close 时要交出去的那一刻的现场。
+    # 不放它们就没法在 advance_or_stop 里拿到"最后一个观测 / 最后一次用的 O"。
+    last_obs = None       # 最近一条**收到了**的观测（不管有没有算出 O）
+    O_u_last = None       # 最近一拍真正喂给 pick_target 的目标点（含偏置 + 下扎深）
 
     def advance_or_stop(reason):
         """本相结束：有下一相就切过去（返回 True 继续），最后一相就定稿（返回 False）。
@@ -585,6 +612,36 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
             #   清成 None、抬起相就落到 close_field(578) ⇒ "碰上东西就冻结"之后，**抬起时照样全力夹**。
             grip_hold = close_cmd
         cur = seq[k]
+        if cur == 'close' and cfg.shot_dir:
+            # ★ 进 close 的这一拍留一份现场（见 shot.py）。末段是**视觉闭眼**下扎的：
+            #   之后合爪全程不看视觉，所以这一刻是"打算去哪儿"和"物体实际在哪儿"的
+            #   唯一对照点。存的是**原始输入**（像素/深度/关节/时间戳），偏差离线算。
+            #   ⚠️ 快照坏了**绝不能**连累抓取：整个包在 try 里，只 log 不抛。
+            try:
+                f_cmd = None if j_prev_cmd is None else \
+                    to_fields(j_prev_cmd, cfg.gripper, cfg.wrist_roll)
+                rec = shot.build(
+                    phase_from=seq[k - 1], reason=reason,
+                    O=None if est.O is None else list(est.O),
+                    O_u=None if O_u_last is None else list(O_u_last),
+                    est_n=est.n, est_rejects=est.rejects,
+                    alpha=prev_alpha,
+                    f_fb=list(f_raw) if f_raw else None, f_cmd=f_cmd,
+                    f_tgt=None if tgt is None else list(tgt.fields),
+                    s_ach=rep.get('s_ach_m'), s_cmd=s_cmd, err_m=rep.get('err_m'),
+                    comps=comps,
+                    obs=last_obs,
+                    obs_age=None if last_obs is None else link.now() - last_obs.t_arrive,
+                    j_obs=_joints_at(trace, last_obs, cfg.latency_s),
+                    obs_n=rep['obs_n'], obs_bad=rep['obs_bad'],
+                    depth_refused=rep['depth_refused'],
+                    cfg=cfg, t_mono=link.now(), latency_s=cfg.latency_s)
+                rep['close_shot'] = rec
+                fn = getattr(link, 'shot', None)
+                if fn is not None:
+                    fn(rec)                    # 由调用方落盘（+ 抓照片），见 ServerLink
+            except Exception as e:             # noqa: BLE001
+                log('  [shot] 快照没做成（不影响抓取）：%r' % (e,))
         if cur == 'descend':
             # 下扎锚 = aim 收尾时的 α。之后窗口中心固定，不再逐拍游走。
             descend_alpha = prev_alpha
@@ -620,6 +677,8 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         # Once the object is grasped it moves with the gripper. The measured
         # contact point remains the lift-path anchor, not a visibility target.
         obs = None if initial_point is not None and cur == 'lift' else link.obs()
+        if obs is not None:
+            last_obs = obs          # 只给 close 快照（cfg.shot_dir）用，见上面的初始化
         if initial_point is not None and cur == 'lift':
             obs_age = None
         elif initial_point is not None and obs_age is not None:
@@ -712,6 +771,7 @@ def run(cfg, link, phase='aim', log=print, initial_point=None):
         O_u = apply_bias(est.O, cfg.bias_m, cfg.bias_r_m)
         if cfg.grip_depth_m > 0.0:      # 从顶面往下扎 d（竖直；α≈−84° 时与沿轴只差 <1%）
             O_u = (O_u[0], O_u[1], O_u[2] - cfg.grip_depth_m)
+        O_u_last = O_u                  # 只给 close 快照用
 
         # ③ 目标（按**当前相** `cur`）
         # ★★ `f_raw` = 这一拍时间对齐后的 6 个 field（回读优先）。**p1 的真值只在 `f_raw[0]`**：

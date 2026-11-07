@@ -30,6 +30,7 @@ spec_json → `motion_plan.plan`（纯函数）→ `motion_exec.run_motion`（�
 """
 import dataclasses
 import json
+import os
 import threading
 import time
 
@@ -45,7 +46,7 @@ from std_srvs.srv import Trigger
 
 from raspot_interfaces.action import ArmMotion, Grasp
 
-from arm_grasp import grasp, ltrace, observe
+from arm_grasp import collect, grasp, ltrace, observe, shot
 from arm_grasp.collect import JOINT_NAMES, k230_host_from_result
 from arm_grasp.grasp_codes import code_for
 from arm_grasp import motion_exec, motion_plan, motion_spec
@@ -71,8 +72,9 @@ def _stable(fb):
 class ServerLink:
     """`grasp.Link`：spin 里查打断标志，publish 打 'grasp' 来源标记。"""
 
-    def __init__(self, srv, want, tof, latency_s):
+    def __init__(self, srv, want, tof, latency_s, host=None):
         self.srv, self.want, self.tof, self.latency_s = srv, want, tof, latency_s
+        self.host = host
         self.follow = observe.BoxFollower(want)
         self.last_frame = None
         self._last_fb = None
@@ -113,6 +115,10 @@ class ServerLink:
 
     def publish(self, fields):
         self.srv.publish_arm(fields)
+
+    def shot(self, rec):
+        """`grasp.Link.shot` 的可选实现：进 close 那一拍落盘（+ 后台抓一张照片）。"""
+        self.srv.save_shot(rec, self.host)
 
 
 MOTION_FB_FRESH_S = 0.5   # 动作用的回读超过这么老算没有
@@ -176,6 +182,14 @@ class GraspServer(Node):
         #   （用户原话"直接固定往下多走 0.3cm"）。这是标定修正，不是兜底：
         #   h 测没测到都加。A/B：ros2 param set /arm_grasp_server grip_extra_down_m 0.0
         self.declare_parameter('grip_extra_down_m', 0.003)
+        # 预合爪快照（见 arm_grasp/shot.py）：每抓一次在 shot_dir 存一份 json（+一张照片），
+        # 事后拆"冻结时 O 不准"和"冻结后没走到位"。空串 = 关。
+        #   ros2 param set /arm_grasp_server shot_dir ''            # 关
+        #   python3 -m arm_grasp.shot ~/.local/share/arm_shots      # 看汇总
+        self.declare_parameter('shot_dir', '~/.local/share/arm_shots')
+        self.declare_parameter('shot_image', True)      # 后台抓一张（失败只告警）
+        self.declare_parameter('shot_image_timeout_s', 6.0)
+        self._shot_path = None           # 本轮快照路径，跑完回填结果
 
         cb = ReentrantCallbackGroup()
         self.fb = None
@@ -264,6 +278,59 @@ class GraspServer(Node):
         m.name = list(JOINT_NAMES)
         m.position = [float(v) for v in fields]
         self.pub_arm.publish(m)
+
+    # ---- 预合爪快照 ----
+
+    def save_shot(self, rec, host):
+        """`grasp.Link.shot` 的实现。**绝不往上抛**：快照坏了不能连累抓取。
+
+        照片在后台线程里抓：`capture_frame` 走 `k230pi.snap` 要等一个完整 GOP
+        （实测 1~3s），**不能**卡在 close 那一拍上。抓的时候臂已经停在合爪位置，
+        所以照片比快照晚一两秒不影响判读。
+        """
+        self._shot_path = None
+        d = self.get_parameter('shot_dir').value
+        if not d:
+            return
+        try:
+            path = shot.save(d, rec)
+        except Exception as e:                     # noqa: BLE001
+            self.get_logger().warn('快照写不下（不影响抓取）：%r' % (e,))
+            return
+        self._shot_path = path
+        self.get_logger().info('快照 [%s] %s' % (path, shot.summarize(rec)))
+        if host is None or not self.get_parameter('shot_image').value:
+            return
+        threading.Thread(target=self._shot_image, args=(path, host),
+                         name='arm_shot_image', daemon=True).start()
+
+    def _shot_image(self, path, host):
+        jpg = path[:-5] + '.jpg'
+        try:
+            ok = collect.capture_frame(
+                jpg, host, timeout=float(self.get_parameter('shot_image_timeout_s').value))
+        except Exception as e:                     # noqa: BLE001
+            self.get_logger().warn('快照照片失败（不影响抓取）：%r' % (e,))
+            return
+        if ok and os.path.exists(jpg):
+            shot.update(path, image=os.path.basename(jpg))
+        else:
+            self.get_logger().warn('快照照片没抓到：%s' % jpg)
+
+    def _finish_shot(self, res, rep):
+        """把本轮结果回填进快照（时间对不上/文件没了都只告警）。"""
+        path, self._shot_path = self._shot_path, None
+        if not path:
+            return
+        try:
+            shot.update(path, result={
+                'ok': bool(res.ok), 'code': res.code, 'reason': res.reason,
+                'grip_p1': rep.get('grip_p1'),
+                'descend_fallback': bool(rep.get('descend_fallback')),
+                'fallback_err_m': rep.get('fallback_err_m'),
+                'phases': [[p[0], p[1], p[2]] for p in (rep.get('phases') or [])]})
+        except Exception as e:                     # noqa: BLE001
+            self.get_logger().warn('快照回填结果失败：%r' % (e,))
 
     def make_obs(self, rec, b, tof, latency_s):
         """一条记录 + 挑中的框 → grasp.Obs。时间用拍摄时刻，深度按拍摄时刻对齐。"""
@@ -375,6 +442,7 @@ class GraspServer(Node):
         res = Grasp.Result()
         res.frame_id = 'arm_base'
         self._busy, self._abort = True, None
+        self._shot_path = None           # 上一轮若被打断没回填，别记到这一轮头上
         host = None
         locked = False
         t_ms_changed = False
@@ -391,7 +459,8 @@ class GraspServer(Node):
                 z_plane_m=0.016, require_depth=True,
                 alpha0=float(alpha0), lift_m=float(lift),
                 joint_comp=float(self.get_parameter('joint_comp').value),
-                bias_r_m=float(self.get_parameter('bias_r_mm').value) / 1000.0)
+                bias_r_m=float(self.get_parameter('bias_r_mm').value) / 1000.0,
+                shot_dir=self.get_parameter('shot_dir').value or None)
 
             # ① 锁框（臂还没动，失败可重试）
             self._feedback(gh, 'preflight', '锁框')
@@ -474,7 +543,7 @@ class GraspServer(Node):
 
             # ④ 真跑
             t_ms_changed = self._set_driver_t_ms(self.get_parameter('grasp_arm_t_ms').value)
-            link = ServerLink(self, want, self.tof, cfg.latency_s)
+            link = ServerLink(self, want, self.tof, cfg.latency_s, host=host)
             self._feedback(gh, 'aim', '开始')
             rep = grasp.run(cfg, link, phase='all',
                             log=lambda *a: self._log_run(gh, ' '.join(str(x) for x in a)))
@@ -525,6 +594,10 @@ class GraspServer(Node):
             gh.abort()
             return res
         finally:
+            # 快照回填本轮结果（离线统计靠它分组）。**放 finally**：取消/异常也要回填，
+            # 否则那条文件永远 result=null，统计里被当成"没跑完"混进去。
+            # `rep` 可能还没定义（preflight 就失败了）⇒ 用 locals() 兜。
+            self._finish_shot(res, locals().get('rep') or {})
             if t_ms_changed:
                 self._set_driver_t_ms(self.get_parameter('normal_arm_t_ms').value)
             if locked and host:
