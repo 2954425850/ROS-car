@@ -49,6 +49,7 @@ from raspot_interfaces.action import ArmMotion, Grasp
 from arm_grasp import collect, grasp, ltrace, observe, shot
 from arm_grasp.collect import JOINT_NAMES, k230_host_from_result
 from arm_grasp.grasp_codes import code_for
+from arm_grasp.health import health_payload
 from arm_grasp import motion_exec, motion_plan, motion_spec
 
 OBS_WAIT_S = 5.0          # 锁框后等结果流出现这个框
@@ -199,6 +200,11 @@ class GraspServer(Node):
         self._busy = False
         self._abort = None             # (code, reason)
         self._goal = None
+        self._t_start = time.monotonic()
+        self._t_fb = None
+        self._last_goal_wall = None
+        self.pub_health = self.create_publisher(String, '/health/arm_grasp', 10)
+        self.create_timer(1.0, self._publish_health)
 
         self.pub_arm = self.create_publisher(JointState, 'arm/command', 10)
         self.create_subscription(JointState, 'arm/feedback', self._on_fb, 10, callback_group=cb)
@@ -230,6 +236,7 @@ class GraspServer(Node):
 
     def _on_fb(self, msg):
         self.fb = list(msg.position)
+        self._t_fb = time.monotonic()
         if len(msg.position) > 0 and msg.position[0] > 0:
             self._grip_last = float(msg.position[0])
 
@@ -240,6 +247,15 @@ class GraspServer(Node):
     def _on_estop(self, msg):
         if self._busy and msg.data:
             self._abort = self._abort or ('ESTOP', '急停')
+
+    def _publish_health(self):
+        feedback_age = None if self._t_fb is None else time.monotonic() - self._t_fb
+        self.pub_health.publish(String(data=json.dumps(
+            health_payload(self._busy, time.monotonic() - self._t_start,
+                           feedback_age_s=feedback_age,
+                           last_goal_wall=self._last_goal_wall),
+            ensure_ascii=False,
+        )))
 
     def _on_rec(self, msg):
         try:
@@ -442,6 +458,7 @@ class GraspServer(Node):
         res = Grasp.Result()
         res.frame_id = 'arm_base'
         self._busy, self._abort = True, None
+        self._last_goal_wall = time.time()
         self._shot_path = None           # 上一轮若被打断没回填，别记到这一轮头上
         host = None
         locked = False
@@ -717,6 +734,7 @@ class GraspServer(Node):
                 gh.abort()
                 return res
             self._busy, self._abort = True, None
+            self._last_goal_wall = time.time()
         try:
             if self._motion_err:
                 raise _Abort('ERROR', self._motion_err)
