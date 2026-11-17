@@ -52,6 +52,7 @@ SHM_DIR = "/dev/shm/k230"
 LATEST_IDR = os.path.join(SHM_DIR, "latest-idr.h264")
 IDR_MAX_AGE = 3.0           # 关键帧超过这么久就不用（GOP=25@30fps ⇒ 正常 <1s 一张）
 STATUS_FILE = os.path.join(OUT_DIR, "resultd-status.json")
+FRAMED_STATUS = os.path.join(OUT_DIR, "framed-status.json")
 
 JPEG_QUALITY = 90
 JPEG_SOI = b"\xff\xd8\xff"      # JPEG 起始
@@ -145,6 +146,29 @@ def _count_frames_so_far(path, state):
     return state[1]
 
 
+def framed_status_payload(connected, peer, n_bytes, n_idr, wall=None):
+    return {
+        "pid": os.getpid(),
+        "connected": bool(connected),
+        "peer": peer,
+        "bytes": int(n_bytes),
+        "idr_frames": int(n_idr),
+        "wall": round(time.time() if wall is None else wall, 3),
+    }
+
+
+def _write_framed_status(connected, peer, n_bytes, n_idr):
+    try:
+        ensure_out_dir()
+        _atomic_write_fast(
+            FRAMED_STATUS,
+            json.dumps(framed_status_payload(connected, peer, n_bytes, n_idr),
+                       ensure_ascii=False).encode("utf-8"),
+        )
+    except OSError:
+        pass
+
+
 def framed():
     """常驻监听 FRAME_PORT，收板子的裸 H.264，把最新关键帧写到 LATEST_IDR。前台运行。"""
     from h264_idr import IdrExtractor
@@ -153,15 +177,22 @@ def framed():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", FRAME_PORT))
     srv.listen(2)
+    srv.settimeout(1.0)
     print("k230-framed listening on %d (idr -> %s)" % (FRAME_PORT, LATEST_IDR), flush=True)
     tmp = LATEST_IDR + ".tmp"
     while True:
-        conn, peer = srv.accept()
+        try:
+            conn, peer = srv.accept()
+        except socket.timeout:
+            _write_framed_status(False, None, 0, 0)
+            continue
         print("connect from %s:%d" % peer, flush=True)
         conn.settimeout(5.0)
         ex = IdrExtractor()
         n_bytes, t_rep, t_idle = 0, time.time(), time.time()
         t_conn, tot = time.time(), 0
+        t_status = time.time()
+        _write_framed_status(True, "%s:%d" % peer, 0, 0)
         while True:
             try:
                 d = conn.recv(65536)
@@ -185,6 +216,10 @@ def framed():
             if time.time() - t_rep >= 60.0:
                 print("60s: %.0f kB/s, %d 张关键帧" % (n_bytes / 60.0 / 1024, ex.frames), flush=True)
                 n_bytes, t_rep = 0, time.time()
+            if time.time() - t_status >= 1.0:
+                _write_framed_status(True, "%s:%d" % peer, tot, ex.frames)
+                t_status = time.time()
+        _write_framed_status(False, None, tot, ex.frames)
         conn.close()
         dur = max(0.001, time.time() - t_conn)
         print("disconnect from %s:%d  %.1fs  %d 字节（%.0f kB/s）  关键帧 %d"
