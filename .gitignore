@@ -55,3 +55,18 @@ pi/raspot_ws/src/**/docs/*.json
 !pi/raspot_ws/src/arm_grasp/docs/p3.json
 pi/raspot_ws/docs/shots/*.jpg
 pi/k230-vision/*.png
+
+# ---- STM32 固件（Keil MDK）构建产物 ----
+# 判据同上：这些是 Keil 编译/IDE "写"的，不是人 "写"的。
+# 加了之后在 stm32/ 下编译不会再弄脏工作区（git checkout/stash 不会冲掉源码以外的状态）。
+stm32/**/OBJ/
+stm32/**/*.uvguix.*
+stm32/**/*.o
+stm32/**/*.crf
+stm32/**/*.d
+stm32/**/*.lst
+stm32/**/*.axf
+stm32/**/*.hex
+stm32/**/*.___jb_*__
+# 某网盘客户端同步时到处丢的空目录
+**/.fang_cloud_tmp_dir/

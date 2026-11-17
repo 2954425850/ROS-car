@@ -1,6 +1,7 @@
 # ROS-car
 
-L150Pro 小车 + 机械臂 + K230 视觉 + 语音助手，nepu 树莓派上跑的全部代码。
+L150Pro 小车 + 机械臂 + K230 视觉 + 语音助手，nepu 树莓派上跑的全部代码，
+外加底盘/机械臂那块 STM32 的固件源码（`stm32/`）。
 
 ## 开发方式（2026-09-30 起）
 
@@ -23,6 +24,10 @@ pi/                     # 树莓派（nepu）上的东西
 ├── voice-chatbot/      # = ~/voice-chatbot 语音助手 JARVIS（含控车工具）
 ├── scripts/            # 散在 ~ 下的小车相关脚本
 └── systemd/            # systemd 单元 + udev 规则（部署要点）
+
+stm32/                  # STM32 侧（底盘那块板子，不在 Pi 上跑）
+└── v2.0-arm/           # 固件V2.0（机械臂版）STM32F407VE + Keil MDK 工程
+                        # 和 pi/l150pro_ws 的驱动是同一套协议的上下游
 ```
 
 ## 不入库的东西
