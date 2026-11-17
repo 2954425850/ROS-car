@@ -85,6 +85,7 @@ from vision.k230_state import K230State
 from car.controller import CarController
 from vision import K230Vision, K230Target
 from utils.config import Config
+from utils.heartbeat import Heartbeat, default_path
 from mcp_host import HostBridge, MCPHost
 
 # 项目根目录 —— 用来把 config 里的相对路径（提示音等）解析成绝对路径，
@@ -247,6 +248,16 @@ class ConversationManager:
     def __init__(self, config: Config):
         self._config = config
         self._state = StateMachine()
+        self._heartbeat = Heartbeat(default_path(),
+                                    status_provider=self._voice_status)
+        for _s in ConversationState:
+            self._state.on_enter(
+                _s,
+                lambda s=_s: self._heartbeat.update(
+                    s.value,
+                    busy=s in (ConversationState.THINKING, ConversationState.SPEAKING),
+                ),
+            )
 
         # Create shared audio devices
         self._mic = Microphone(config)
@@ -256,6 +267,8 @@ class ConversationManager:
         self._vad_recorder = VADRecorder(self._mic, config)
         self._wakeword = WakeWordEngine(config)
         self._asr = ASRClient(config)
+        self._asr_last_ok_wall = None
+        self._asr_last_err_wall = None
         self._tts = TTSClient(config)
         self._registry = build_default_registry()
         self._llm_context = ConversationContext(config)
@@ -405,6 +418,27 @@ class ConversationManager:
 
     # ---- Public API ----
 
+    def _recognize(self, wav: bytes) -> str:
+        try:
+            text = self._asr.recognize(wav)
+        except Exception:
+            self._asr_last_err_wall = time.time()
+            raise
+        self._asr_last_ok_wall = time.time()
+        return text
+
+    def _voice_status(self) -> dict:
+        """心跳里带上设备/引擎状态——只看线程活着会漏掉「停在 IDLE 喊不应」。"""
+        return {
+            "wakeword_ready": self._wakeword.is_ready,
+            "wakeword_thread_alive": self._wakeword.is_listening,
+            "wakeword_last_byte_age_s": self._wakeword.last_byte_age_s,
+            "mic_open": self._mic.is_open,
+            "mic_last_error": self._mic.last_error,
+            "asr_last_ok_wall": self._asr_last_ok_wall,
+            "asr_last_err_wall": self._asr_last_err_wall,
+        }
+
     def run(self) -> None:
         """Start the main loop. Blocks until shutdown() is called."""
         logger.info("=" * 40)
@@ -412,6 +446,7 @@ class ConversationManager:
         logger.info("=" * 40)
 
         self._state.transition(ConversationState.IDLE)
+        self._heartbeat.start()
 
         # Start wake word detection
         self._wakeword.start(on_detected=self._on_wake_word)
@@ -429,6 +464,7 @@ class ConversationManager:
         """Graceful shutdown."""
         logger.info("Shutting down...")
         self._stop_event.set()
+        self._heartbeat.stop()
         # ★ 先收流水线、再停监听线程（设计 §3.5）：顺序反了的话，监听线程可能正卡在
         #   on_wake() 里起新流水线，就收不干净了。
         #   本方法会被调用两次（main.py 的 signal handler + run() 的 finally），
@@ -577,7 +613,7 @@ class ConversationManager:
             return
 
         # Step 1: ASR
-        user_text = self._asr.recognize(self._pending_wav)
+        user_text = self._recognize(self._pending_wav)
         self._pending_wav = b""
         if not user_text:
             logger.warning("ASR returned empty — no speech recognized")
@@ -1058,7 +1094,7 @@ class ConversationManager:
         if len(wav_bytes) < 1000:
             logger.info("→ elicitation：录音太短或无人说话")
             return None
-        text = (self._asr.recognize(wav_bytes) or "").strip()
+        text = (self._recognize(wav_bytes) or "").strip()
         return text or None
 
     def _transition_to_idle(self) -> None:

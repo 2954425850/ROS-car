@@ -20,6 +20,7 @@ class Microphone:
         self._channels = config.get("audio.channels", 1)
         self._chunk_size = config.get("audio.chunk_size", 480)
         self._device_index = resolve_device_index(config.get("audio.device_index", None))
+        self.last_error: str | None = None
 
         self._pa = pyaudio.PyAudio()
         self._stream = self._pa.open(
@@ -37,7 +38,17 @@ class Microphone:
         Returns:
             Raw PCM bytes (int16, mono). Length = chunk_size * 2 bytes.
         """
-        return self._stream.read(self._chunk_size, exception_on_overflow=False)
+        try:
+            data = self._stream.read(self._chunk_size, exception_on_overflow=False)
+            self.last_error = None
+            return data
+        except Exception as e:                              # noqa: BLE001
+            self.last_error = repr(e)
+            raise
+
+    @property
+    def is_open(self) -> bool:
+        return self._stream is not None
 
     def close(self) -> None:
         """Stop and close the audio stream and PyAudio instance."""

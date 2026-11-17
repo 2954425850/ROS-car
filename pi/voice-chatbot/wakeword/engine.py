@@ -75,6 +75,7 @@ class WakeWordEngine:
         self._thread: threading.Thread | None = None
         self._on_detected: Callable[[], None] | None = None
         self._last_detection_time = 0.0
+        self._last_byte_mono: float | None = None
 
         self._ser: serial.Serial | None = None
         self._step = _SYNC1
@@ -166,6 +167,16 @@ class WakeWordEngine:
         """
         return self._ser is not None and self._ser.is_open
 
+    @property
+    def is_listening(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def last_byte_age_s(self):
+        if self._last_byte_mono is None:
+            return None
+        return round(time.monotonic() - self._last_byte_mono, 1)
+
     # ---- 内部 ----
 
     def _listen_loop(self) -> None:
@@ -190,6 +201,7 @@ class WakeWordEngine:
                 try:
                     waiting = self._ser.in_waiting
                     data = self._ser.read(waiting if waiting else 1)
+                    self._last_byte_mono = time.monotonic()
                 except Exception as e:
                     if not self._running:
                         break          # 是 stop() 关的串口，不是故障
