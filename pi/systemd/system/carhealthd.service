@@ -1,0 +1,23 @@
+[Unit]
+Description=整车健康守护 carhealthd（一期：只观察，不执行恢复动作）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cy
+WorkingDirectory=/home/cy/ROS-car/pi/carhealth
+RuntimeDirectory=carhealth
+RuntimeDirectoryMode=0750
+Environment=HOME=/home/cy
+Environment=PYTHONUNBUFFERED=1
+Environment=CARHEALTH_RECOVERY=off
+Environment=CARHEALTH_REPO=/home/cy/ROS-car
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/cy/ROS-car/pi/raspot_ws/install/setup.bash && exec /usr/bin/python3 -m carhealth.daemon'
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# carhealthctl：从任意目录调用 carhealth.cli。
+# readlink -f 是必须的：安装时 /usr/local/bin/carhealthctl 是软链，
+# 直接取 BASH_SOURCE 的 dirname 会得到 /usr/local/bin，PYTHONPATH 就错了。
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+exec env PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" \
+    /usr/bin/python3 -m carhealth.cli "$@"
