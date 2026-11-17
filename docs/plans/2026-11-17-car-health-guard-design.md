@@ -1,6 +1,8 @@
 # 整车健康守护（carhealth）设计
 
-> 2026-11-17 · 状态：已定稿（用户确认架构、契约、恢复阶梯、分期）
+> 2026-11-17 · 状态：已定稿（用户确认架构、契约、恢复阶梯、分期；
+> 2026-11-17 按评审意见修订：故障分类库、直接证据归因、配置漂移、
+> 迟滞、UNKNOWN 语义、RTC/写盘、覆盖缺口）
 >
 > 目标：把「各部分总是莫名其妙出故障、要靠人实时改」变成
 > 「故障可判定、可归因、可对症自愈，人只处理真正的硬件/环境问题」。
@@ -35,12 +37,16 @@
 
 1. **判定**：对每个组件区分 `OK / DEGRADED / STALE / ABSENT / BLOCKED / UNKNOWN`，
    判据是存活 + 新鲜度 + 正确性 + 环境前提，不只是进程状态。
-2. **归因**：先找根因（掉压、板子离线、网络不可达、DDS 图故障），
-   再决定动不动手；下游症状不各算各的故障。
-3. **对症恢复**：分级阶梯 + 白名单 + 冷却/预算/验证窗口，**动作中一律不动手**。
+2. **归因**：用直接证据找根因（掉压、板子离线、发布者数量为 0、DDS 绑着旧 IP），
+   不靠「症状数量」推断；下游症状不各算各的故障。
+3. **对症恢复**：先判故障类别，再选动作类别——重启单元 / 等条件恢复 /
+   给人一句物理动作 / 登记为配置缺陷。分级阶梯只是「软件状态坏了」这一类的子集，
+   **动作中一律不动手**。
 4. **取证**：结构化故障日志，能回答「刚才为什么坏了、它做了什么、为什么没修好」。
 5. **不成为新故障源**：只读探针、ROS 不可用时降级、自身被 systemd 看护。
 6. **体检**：出车前一条命令拿到 PASS/WARN/FAIL 与可执行建议。
+7. **已知故障库**：把历史故障的特征 → 结论 → 动作类别 → 给人的指令写成规则，
+   `doctor/status/why` 直接输出「是什么、该做什么」，而不只是一个 `STALE`。
 
 ### 非目标（明确不做，防止日后被顺手加上）
 
@@ -65,20 +71,27 @@
 
 ```
 pi/carhealth/
-  carhealthd          # 常驻守护（系统级 systemd，User=cy，Restart=always，WatchdogSec）
+  carhealthd          # 常驻守护（系统级 systemd，User=cy，Restart=always）
   carhealthctl        # CLI：status / doctor / history / why <组件>
   contracts.py        # 组件清单（声明式）：探针、阈值、依赖、允许动作
   probes/
-    systemd.py        # systemctl show ActiveState/SubState/NRestarts
-    ros_topic.py      # 单个只订阅 rclpy 节点，按话题统计年龄与内容
+    systemd.py        # 批量 systemctl show ActiveState/SubState/NRestarts/MemoryCurrent/CPUUsageNSec
+    ros_topic.py      # 只订阅 rclpy 节点；记录年龄、发布者数量；Image/IMU 用 raw=True
     file_status.py    # status JSON + mtime 新鲜度（沿用 k230ctl 语义）
-    net.py            # TCP 探活 / ping / 端口，不拉流
-    serial.py         # udev 节点存在性、接口号、设备身份
-    host.py           # vcgencmd get_throttled、/proc/meminfo、磁盘、温度、wifi
-  classify.py         # 状态机 + 迟滞 + 根因挂载
+    net.py            # TCP 探活 / ping / 端口，不拉流；地址未知时返回 UNKNOWN
+    udev.py           # 稳定名存在性；优先用 udevadm 读 ID_USB_INTERFACE_NUM
+    host.py           # loadavg、/proc/meminfo、磁盘、温度、wifi 信号
+    power.py          # vcgencmd get_throttled（欠压/降频/软温度位）
+    service_health.py # NRestarts 增量（崩溃循环）、内存占用
+    usb_events.py     # 内核日志里的 USB disconnect 计数（按 vid:pid）
+    dds.py            # ss -uan 里的本机绑定地址 vs 当前网卡地址（旧 IP 检测）
+    config_drift.py   # ordering cycle、should-be-enabled、udev 规则、git HEAD、build 过期
+  classify.py         # 状态机 + 迟滞 + 根因挂载（基于直接证据）
+  faults.py           # 已知故障库：特征 → 结论 + 动作类别 + 给人的指令
+  diagnose.py         # 把探针证据喂给故障库，产出 Diagnosis
   recovery.py         # 阶梯/白名单/联锁/熔断（二期启用）
   busy.py             # 动作互锁信号
-  journal.py          # JSONL 故障日志 + 滚动
+  journal.py          # JSONL 故障日志 + 滚动（带 boot_id / monotonic）
 ```
 
 部署约束：
@@ -87,8 +100,11 @@ pi/carhealth/
   voice 用心跳文件判活（避免权限与 XDG_RUNTIME_DIR 依赖）。
 - 探针一律只读：不打开串口、不拉视频流、不起 `ros2 topic echo` 子进程。
 - rclpy 不可用时只跑非 ROS 探针，相关组件标 `UNKNOWN`，进程不退出。
-- 守护自身由 `WatchdogSec` + `Restart=always` 看护；自重启也会写日志。
-- 日志写 `/home/cy/.local/state/carhealth/journal-YYYYMMDD.jsonl`，按天滚动保留 30 天。
+- 守护自身由 `Restart=always` 看护（二期加 `WatchdogSec`/sd_notify）；自重启写日志。
+- **state.json 写在 tmpfs**：单元加 `RuntimeDirectory=carhealth`，状态文件在
+  `/run/carhealth/state.json`，不磨损 SD 卡；journal 才落盘到
+  `/home/cy/.local/state/carhealth/journal-YYYYMMDD.jsonl`，按天滚动保留 30 天。
+- `doctor` 是只读一次性检查，永远用临时目录，绝不覆盖守护的 state/journal。
 
 ## 5. 健康契约
 
@@ -97,41 +113,105 @@ pi/carhealth/
 ```
 component  tof
 probe      systemd: tof-a010.service ActiveState=active
-probe      topic: /tof/status age<2s, fps>0, last_error==null
-probe      topic: /tof/depth age<2s              # 与 status 交叉验证
-probe      udev: /dev/a010 存在，USB 接口号为 00 # 接口 01 是死通道，见到也算错
+probe      topic: /tof/status age<2s, connected=true, fps>0
+probe      topic: /tof/depth age<2s（raw=True，只记到达时间）
+probe      udev: /dev/a010 存在；ID_USB_INTERFACE_NUM=="00"
+           若无 /dev/a010 但 by-id 的 *-if00-port0 在 → DEGRADED「udev 规则未装」
 blocked_by power
 recovery   restart tof-a010.service              # 静态、幂等、空闲可做
 ```
 
 `/tof/status` 现有字段（`connected/connecting/frames/fps/reconnects/age_s/
 device/port/last_error/frame_id`）即契约模板，新增心跳沿用同一形状。
+**注意：`tof_a010` 重连成功后不清 `last_error`，所以它不能当判据，只进证据。**
 
 ### 组件清单与初值阈值（现场标定）
 
 | 组件 | 存活 | 新鲜度/正确性 | 环境前提 | 互锁来源 | 允许恢复 |
 |---|---|---|---|---|---|
-| `power` | — | `vcgencmd get_throttled` 当前/历史欠压位 | — | — | 无 |
-| `chassis` | ps2-teleop 单元 | `/wheel_odom`、`/imu/data_raw` <1s；`/cmd_vel_mux` 有流量 | `/dev/l150pro` | 底盘在动 | 空闲时重启 ps2-teleop |
-| `arm` | 同上（同一串口） | `/arm/feedback` <0.5s；`/arm/online`=true；`/arm/status` 无故障位 | `/dev/l150pro` | 臂在动 / 抓取在跑 | 空闲时重启；动作中只记录 |
-| `tof` | tof-a010 单元 | `/tof/status` 契约；`/tof/depth` <2s | `/dev/a010` 接口 00 | 抓取中 | 重启单元 |
-| `k230-link` | 板子 ping | 8556 可连；`resultd-status.json` mtime<3s；`/k230/result` <3s | 板子在线、网络可达 | — | 重启 resultd / bridge |
-| `k230-video` | k230-framed 单元 | 8554 可连；最新 IDR 年龄<5s | 板子在线 | — | 重启 framed |
+| `power` | — | 当前欠压 / 进程内观察到 10 分钟内出现过欠压 / 开机以来历史位；bit1–3（降频、throttle、软温度） | — | — | 无 |
+| `battery` | `/battery_voltage` <3s | 电压 <11.5V → DEGRADED；<11.2V → 规则提示「性能明显下降」 | — | — | 无 |
+| `chassis` | ps2-teleop 单元 | `/wheel_odom` <1s；`/imu/data_raw` <1.5s（raw）；`/chassis_faults` 非零 → DEGRADED；`/dev/input/js0` 存在 | `/dev/l150pro` | 底盘在动 | 空闲时重启 ps2-teleop |
+| `arm` | 同上（同一串口） | `/arm/feedback` <0.5s；`/arm/online`=true；`/arm/status` 的 bit0/bit7 进证据与规则 | `/dev/l150pro` | 臂在动 / 抓取在跑 | 空闲时重启；动作中只记录 |
+| `tof` | tof-a010 单元 | `/tof/status` 契约；`/tof/depth` <2s（raw）；udev 接口号 00 | `/dev/a010` 或 by-id `if00` | 抓取中 | 重启单元 |
+| `grasp` | arm-grasp 单元 | `/health/arm_grasp` <3s；心跳带 `busy`、`feedback_age_s`、`last_goal_wall` | — | 抓取在跑 | 空闲时重启 |
+| `k230-link` | resultd/bridge 单元 | `resultd-status.json` mtime<7s；`/k230/result` <3s；resultd 的 `connected`/`peer` | 板子地址可知（否则 UNKNOWN） | — | 重启 resultd / bridge |
+| `k230-video` | k230-framed 单元 | framed 状态文件 <3s；最新 IDR <5s | 板子在线 | — | 重启 framed |
 | `rosbridge` | 单元 | TCP 127.0.0.1:9090 | — | — | 重启单元 |
-| `voice` | user 单元 / 心跳 mtime | 心跳<5s；busy 字段；LLM 接口可达（空闲时 60s 一次） | 网络、cookie 未过期 | 工具执行中 | 空闲时重启 |
-| `host` | — | 可用内存、swap、磁盘、SoC 温度、wifi | — | — | 无 |
+| `voice` | 心跳文件 mtime<5s | `busy_for_s`<180；`wakeword_ready`；`wakeword_thread_alive`；`mic_open`；`asr_last_ok/err` 年龄 | 网络、cookie 未过期 | 工具执行中 | 空闲时重启 |
+| `host` | — | 可用内存、swap、磁盘、SoC 温度、load1、CPU%、WiFi 信号 | — | — | 无 |
+
+不进组件、只喂故障库的探针：`service_health`（NRestarts 增量、内存、单服务 CPU%）、
+`usb_events`（USB disconnect 计数）、`dds`（旧 IP 绑定）、`config_drift`
+（ordering cycle、enabled 但 inactive、udev 规则、git HEAD、build 过期）。
 
 ### 判定规则
 
-- 迟滞：连续 2 次坏才降级，连续 5 次好才恢复。
+- 迟滞：**连续 2 次坏才降级，连续 5 次好才恢复**；`engine.py` 必须实现，
+  否则 1 秒轮询 + 0.5 秒阈值会在一次 CPU 尖峰（Pi 实测 load 17.8）里刷满日志。
 - 状态语义：`BLOCKED` 不是故障，是「环境根因压住了，等条件恢复」。
-- **根因挂载**：`power` 欠压（当前或近 10 分钟有历史位）时，`chassis/arm/tof`
-  的 STALE 统一挂 `root_cause=power`；`k230*` 在板子不可达时统一挂
-  `root_cause=board_offline`；≥3 个话题同时 STALE 且单元均 active 时，
-  先判 `root_cause=ros_graph`（DDS/网络），不逐个报组件故障。
-- 时间：年龄一律用 `time.monotonic()`；墙钟只用于日志与展示（Pi 无 RTC）。
+- **BLOCKED 不得掩盖健康组件**：先看组件自己的判据。自己全部通过 → `OK`；
+  自己失败或 `UNKNOWN` 且依赖项 `BLOCKED` → 才标 `BLOCKED` 并挂 `root_cause`。
+  欠压期间底盘完全正常，就不该显示 BLOCKED。
+- **UNKNOWN 不是故障**：探针失明（rclpy 不可用、无权限、字段读不到）时，
+  只记一条限流的 `monitor_blind` 事件，不进入组件 incident 时间线。
+- **根因用直接证据**：
+  - 欠压：当前 `uv_now`；或进程**观察到** 10 分钟内出现过欠压。
+    开机历史位只算 DEGRADED，不算 BLOCKED——医生每次新建探针，
+    否则开机后任何一次掉压都会让 doctor 永远 FAIL。
+  - ROS 图：对每个失败的话题查 `node.count_publishers(topic)`。
+    `0` → 发现层故障（`ros_discovery`，通常要整条 ROS 栈重启 / 换网络）；
+    `>0` 但无数据 → 数据通路/QoS/MTU（`ros_data_path`）。
+  - DDS 旧 IP：`ss -uan` 里本机绑定地址不在当前网卡地址集合中 → `dds_stale_ip`。
+  - 板子不可达：有地址才 ping；地址未知（resultd 无 peer 且无 `K230_HOST`）→ `UNKNOWN`，
+    **禁止回退到任何写死的旧 IP**。
+- 时间：年龄一律用 `time.monotonic()`；journal 每条同时记 `boot_id` 与 `mono`。
+  Pi 无 RTC，墙钟在 NTP 对时前不可信，`history --since` 必须能用 boot/mono 校正。
 
-## 6. 分诊与恢复阶梯
+## 6. 分诊、已知故障库与恢复阶梯
+
+**先分类，再决定动作类别。** 大多数故障的正确出路不是重启：
+
+| 故障类别 | 例子 | 正确出路 |
+|---|---|---|
+| 软件状态坏了 | 节点卡住、TCP 假连 | 重启；DDS 钉旧 IP 要整条 ROS 栈一起重启 |
+| 环境前提不满足 | 欠压、板子离线、电池低 | 等条件恢复，不动手 |
+| 只能人做的物理操作 | CP2102 USB 锁死、ToF 拖垮 K230 WiFi、换主控后 serial 变了 | 给一句明确指令（拔哪根线、换哪条规则） |
+| 配置/设计缺陷 | ordering cycle、云端空闲 20Hz 发零、JWT 60 分钟过期、改了 .py 没 build | 运行时修不了，登记进待修清单，从根上修 |
+
+### 已知故障库（一期就交付）
+
+`faults.py` 把「特征 → 结论 + 动作类别 + 给人的指令」写成纯规则；
+`diagnose.py` 用探针证据求值；`status/doctor/why` 直接展示结论与指令。
+首批规则（全部来自本项目历史故障）：
+
+| id | 特征 | 结论 / 动作类别 | 给人的指令 |
+|---|---|---|---|
+| `power.undervoltage` | `uv_now` 或进程观察到近期欠压 | 等 / 查供电 | 检查电源线、接插件、驱动板压降；换 5V/5A 线 |
+| `usb.disconnect_storm` | 10 分钟内同一 `vid:pid` disconnect ≥3 次 | 物理 | 换线/换口/检查供电；K230 24h 13 次重枚举属此类 |
+| `udev.l150pro_missing` | `/dev/l150pro` 不在，但其它 tty 有 `1a86:55d4` | 配置 | 装/改 `99-l150pro.rules`，确认 serial 匹配 |
+| `udev.tof_byid_only` | `/dev/a010` 不在，by-id `*-if00-port0` 在 | 配置 | 装 `99-tof-a010.rules`（功能不受影响，只是短名丢了） |
+| `udev.tof_channel_b` | 接口号 ≠ 00 | 物理/配置 | 插回通道 A；只按 vid/pid 匹配会抢名 |
+| `dds.stale_ip` | `ss -uan` 有本机不存在的绑定 IP | 重启整栈 | `systemctl restart` ROS 相关单元；不要只重启一个 |
+| `ros.discovery` | 失败话题 `count_publishers==0` 且单元 active | 重启整栈 / 查网络 | 先看 `ROS_DOMAIN_ID`、网卡、DDS 发现；再整栈重启 |
+| `ros.data_path` | `count_publishers>0` 但无数据 | 查 QoS/MTU/网络 | 检查 QoS 兼容、MTU 分片、WiFi 质量 |
+| `service.crash_loop` | 某单元 `NRestarts` 在 60s 内涨 ≥2 | 配置/物理 | 看 `journalctl -u`；这是被 `Restart=always` 掩盖的崩溃循环 |
+| `service.ordering_cycle` | 本次开机 journal 有 ordering cycle | 配置 | 修 unit 的 `After/Wants`；`arm-grasp` inactive (dead) 常见于此 |
+| `service.enabled_but_dead` | 应 enabled 的单元处于 inactive (dead) 且非人为 stop | 配置 | 查失败原因；`systemctl status` |
+| `build.stale` | 源码 `package.xml/setup.py` 比 install 里的新 | 配置 | `colcon build --symlink-install`，再重启服务 |
+| `k230.host_unknown` | 无 peer 且无 `K230_HOST` | 等 | 确认板子上电/连 WiFi；Pi 重启后 /tmp 清空属正常 |
+| `k230.push_stall` | framed 连着但 IDR 年龄超阈值 | 物理/网络 | 看 K230 推流与 WiFi；K230 不能主动请求 IDR |
+| `battery.low` | 电压 <11.2V | 等/换电 | 电压 11.2–12.3V 性能差近一倍，别误判成控制环路 |
+| `voice.wakeword_lost` | `wakeword_ready=false` 或线程不在 | 物理 | 唤醒模块被拔/重枚举；按路径重连已实现，仍不行就换口 |
+| `voice.mic_error` | 心跳带 `mic_last_error` | 物理 | USB 重枚举/设备被抢占；换口或重启语音助手 |
+| `voice.api_stuck` | `busy_for_s`>180 | 软件 | 看 ASR/LLM 报错；这是「400 后卡死」的历史形态 |
+| `tof.last_error_stale` | `connected=true` 但 `last_error` 非空 | 证据 | 只提示，不判故障（该字段重连后不清零） |
+
+规则是纯函数，输入是 `{probe_name: ProbeResult}` + 组件判定 + 当前时间；
+单测用固定证据表。规则命中写进 `Diagnosis`，进 state/journal/CLI，
+**不影响组件的六态判定**。
+
+### 恢复阶梯（仅「软件状态坏了」这一类）
 
 | 级别 | 动作 | 前提 | 适用 |
 |---|---|---|---|
@@ -146,6 +226,8 @@ device/port/last_error/frame_id`）即契约模板，新增心跳沿用同一形
 - 全局限流：10 分钟内自动重启总数 ≤6。
 - 开机后前 60 秒不执行任何恢复动作。
 - **动作前先写日志、后执行**，保证动作本身导致二次故障时证据仍在。
+- **「整条 ROS 栈重启」是独立动作类别**，不塞进 L1/L2：DDS 绑旧 IP 或发现层
+  故障时只重启一个单元修不好。二期实现为 `restart_stack`，动作前同样检查互锁。
 
 ### 熔断
 
@@ -161,55 +243,88 @@ device/port/last_error/frame_id`）即契约模板，新增心跳沿用同一形
 | 信号 | 判据 |
 |---|---|
 | 臂在动 | `/arm/command` 近期有流量，或 `/arm/feedback` 位姿在近期有变化 |
-| 底盘在动 | `/cmd_vel_mux` 非零，或 `/wheel_odom` 速度非零 |
-| 抓取在跑 | `/arm/grasp` action 活跃 |
-| 语音在忙 | heartbeat 文件 `busy` 字段（工具执行中） |
+| 底盘在动 | `/cmd_vel_mux` 线速度或角速度非零，或 `/wheel_odom` **线速度**或角速度非零 |
+| 抓取在跑 | `/health/arm_grasp` 的 `busy=true`（由 `GraspServer._busy` 生成） |
+| 语音在忙 | heartbeat 的 `busy` 字段（THINKING / SPEAKING / 工具执行中） |
 
-缺信号的常驻节点在第一期补 1Hz 心跳与 busy 字段：`voice`、`arm-grasp`、
-`k230-framed`。心跳格式沿用 `/tof/status` 的 JSON 形状。
+缺信号的常驻节点在第一期补 1Hz 心跳，格式沿用 `/tof/status` 的 JSON 形状：
+
+- `voice`：独立线程写文件，字段包括 `state/state_age_s/busy/busy_for_s`、
+  `wakeword_ready`、`wakeword_thread_alive`、`mic_open`、`mic_last_error`、
+  `asr_last_ok_wall`、`asr_last_err_wall`。
+  只看线程心跳会漏掉「主流水线死锁但心跳线程还在跳」和「停在 IDLE、喊它没反应
+  （USB 重枚举后麦克风/唤醒模块掉线）」；必须带上设备与引擎状态。
+- `grasp`：`/health/arm_grasp` 带 `busy`、`feedback_age_s`、`last_goal_wall`。
+  定时器心跳只能证明 executor 活着，不能证明 action 在推进；
+  所以还要看 `/arm/feedback` 是否新鲜。
+- `k230-framed`：`framed-status.json` 带 `connected/peer/bytes/idr_frames`，
+  每秒写；断连时也写。
 
 ## 8. 故障日志与 CLI
 
 只记状态变化与动作，不记每次轮询。示例：
 
 ```json
-{"ts":"2026-11-17T14:02:11.2","incident":"I-0412","component":"tof",
+{"ts":"2026-11-17T14:02:11.2","boot_id":"3f2c...","mono":8412.5,
+ "incident":"I-20261117-140211-tof","component":"tof",
  "from":"OK","to":"STALE","verdict":"STALE",
- "evidence":{"age_s":4.2,"fps":0.0,"reconnects":7,"last_error":"read timeout","dev":"/dev/a010"},
+ "evidence":{"topic:/tof/status":{"age_s":4.2,"fps":0.0,"publishers":1,
+                                 "reconnects":7,"last_error":"read timeout"},
+             "udev:a010":{"exists":true,"interface":"00"}},
  "root_cause":null,"fingerprint":"tof:stale:timeout:a1c9",
- "action":{"type":"restart_unit","target":"tof-a010.service","result":"ok","took_s":3.1},
- "interlock":{"arm_busy":false,"chassis_busy":false,"grasp":false,"voice_busy":false}}
+ "diagnosis":[{"id":"usb.disconnect_storm","action_class":"human",
+               "hint":"ToF 10 分钟内重枚举 3 次：换线/换口/查供电"}],
+ "action":null,
+ "interlock":{"arm":false,"chassis":false,"grasp":false,"voice":false}}
 ```
 
-根因事件单独成条（`power`、`board_offline`、`net_unreachable`、`ros_graph`），
-下游 incident 通过 `root_cause` 引用，避免一次掉压产生七条独立告警。
+- 根因事件单独成条（`power`、`board`、`dds`、`config_drift`），下游 incident
+  通过 `root_cause` 引用，避免一次掉压产生七条独立告警。
+- **每条都带 `boot_id` 与 `mono`**：Pi 无 RTC，NTP 对时前墙钟可能错。
+  `history --since` 对当前 boot 的事件用 `mono` 过滤，跨 boot 的事件才用墙钟。
+- `state.json` 在 `/run/carhealth/`；journal 在 `~/.local/state/carhealth/`。
 
 CLI：
 
 ```
-carhealthctl status            # 表格：组件/状态/年龄/根因/最近动作
+carhealthctl status            # 表格：组件/状态/持续/根因/结论 + 指令
 carhealthctl status --json
-carhealthctl doctor            # 出车体检：PASS/WARN/FAIL + 人话建议
+carhealthctl doctor            # 出车体检：PASS/WARN/FAIL + 人话指令
 carhealthctl history --since 1h
-carhealthctl why tof           # 最近一次异常的完整证据链
+carhealthctl why tof           # 最近一次异常的完整证据 + 命中的故障规则
 ```
 
-`doctor` 检查项：udev 节点、开机以来欠压次数、ROS 图连通性、K230 IP 可达、
-API key 与 cookie 寿命、磁盘、时间同步、必要端口。
+`doctor` 分两段：
+1. **运行时**：若 `carhealthd` 正在跑且 state.json <10s，直接读它的结果，
+   不再自己起 ROS 节点（FastDDS 在这台 Pi 上发现慢，3 秒容易误判）；
+   守护没在跑才自建探针，warmup 默认 8 秒。
+2. **配置漂移**：ordering cycle、should-enabled 但 inactive、udev 规则是否安装、
+   git 分支/HEAD、build 是否比源码旧、USB 重枚举计数、时间同步、磁盘。
+
+`doctor` 永远用临时目录，不覆盖守护状态。
 
 ## 9. 分期与验收
 
 ### 第一期：只观察，不动手
 
-交付：`carhealth` 包、全部探针、分类器、日志、CLI、三个节点的心跳/busy 字段、
+交付：`carhealth` 包、全部探针、分类器与**迟滞**、已知故障库（`faults.py`）、
+配置漂移体检、JSONL 日志（boot_id/mono）、CLI、三个节点的心跳、
 以 `recovery=off` 常驻的 systemd 单元、单测与故障注入脚本。
+
+覆盖除六态判定外还必须包含：主机 load/CPU/内存/温度/WiFi、各单元
+`NRestarts`/内存/CPU、USB disconnect 计数、DDS 旧 IP、`/battery_voltage`、
+`/chassis_faults`、`/arm/status`、PS2 `js0`、配置漂移。
 
 验收（硬性）：
 
-1. 跑 2–3 次真实使用，每次掉数据/掉连接都能在日志中找到带证据的 incident。
+1. 跑 2–3 次真实使用，每次掉数据/掉连接都能在日志中找到带证据的 incident，
+   且 `why` 能给出结论与指令，而不只是 STALE。
 2. `doctor` 对人为故障全部判对：拔 ToF、`systemctl stop k230-bridge`、
-   伪造欠压位、K230 IP 指向不可达、杀掉 voice。
-3. 全程自动动作次数 = 0。
+   伪造欠压位、K230 IP 指向不可达、杀掉 voice、伪造旧 IP 绑定、
+   制造 build 过期。
+3. 欠压历史位**不得**让 doctor 永久 FAIL；欠压期间健康的底盘/臂**不得**显示 BLOCKED。
+4. 单次坏采样不开 incident（迟滞生效）；UNKNOWN 不产生组件 incident。
+5. 全程自动动作次数 = 0。
 
 ### 第二期：连接层与单节点恢复
 
@@ -229,10 +344,18 @@ API key 与 cookie 寿命、磁盘、时间同步、必要端口。
 
 ## 10. 测试策略
 
-- 探针单测：假 status 文件、假 systemd 输出、假 udev 路径、假 monotonic 时钟。
-- 分类器真值表：每个组件 × 每种探针组合 → 期望状态与根因。
-- 恢复策略单测：冷却、预算、验证升级、熔断开合、互锁拦截。
-- 现场故障注入：`tools/inject_fault.sh`（停单元、停心跳、伪造欠压、伪 IP）。
+- 探针单测：假 status 文件、假 systemd 输出、假 udev/udevadm、假 ss/journalctl、
+  假 monotonic 时钟。
+- 分类器真值表：每个组件 × 每种探针组合 → 期望状态与根因；重点覆盖
+  「字段缺失 ≠ 合格」「BLOCKED 不压健康组件」「UNKNOWN 不计故障」。
+- 迟滞真值表：1 坏仍 OK、2 坏才 STALE、4 好仍 STALE、5 好才 OK。
+- 故障库规则表：每条规则一组命中/不命中证据。
+- 变异自检：写完关键判据后，故意改坏实现（去掉字段缺失检查、去掉迟滞、
+  让 BLOCKED 短路），确认对应测试变红，再改回。只靠
+  `ModuleNotFoundError` 的「红」不算验证。
+- 恢复策略单测（二期）：冷却、预算、验证升级、熔断开合、互锁拦截。
+- 现场故障注入：`tools/inject_fault.sh`（停单元、停心跳、伪造欠压、伪 IP、
+  伪造旧 DDS 绑定、touch 源码制造 build 过期）。
 - CI 不依赖硬件。
 
 ## 11. 风险与对策
@@ -240,15 +363,38 @@ API key 与 cookie 寿命、磁盘、时间同步、必要端口。
 | 风险 | 对策 |
 |---|---|
 | 话题 QoS 不匹配导致误判 | 每话题声明 QoS；sensor 类用 BEST_EFFORT |
-| DDS 图故障导致全体 UNKNOWN | 先判 `ros_graph` 根因，不逐个报故障 |
-| 时钟跳变 | 年龄用 monotonic；doctor 检查时间同步 |
+| DDS 图故障导致全体 UNKNOWN | `count_publishers` 直接区分发现层/数据通路，不逐个报故障 |
+| 守护自己也在图的另一半里 | 自己收不到数据时，优先查 `ss` 旧 IP 与发布者数量，不把「我也看不见」当成「组件坏了」 |
+| 时钟跳变 / Pi 无 RTC | 年龄用 monotonic；journal 带 boot_id+mono；`history --since` 用 boot 校正 |
 | 日志膨胀 | 按天滚动，保留 30 天 |
-| 守护自己挂掉 | systemd `Restart=always` + `WatchdogSec` |
+| 每秒写 SD 卡 | state.json 在 `/run/carhealth`（tmpfs），磁盘只留 journal |
+| 守护自己挂掉 | systemd `Restart=always`；二期加 sd_notify |
 | 白名单误伤运动 | 互锁为唯一开关；ps2-teleop/arm-grasp 二期只观察 |
 | 重启循环 | 指纹熔断 + 全局限流 + 开机静默期 |
+| CPU 尖峰造成抖动噪音 | 连续 2 坏才降级 / 5 好才恢复；`doctor` 不自己抢 ROS 图 |
+| 规则误报 | 规则只给建议、不改六态；每条规则有命中/不命中单测 |
 
 ## 12. 未决事项
 
 - 告警通道：本期只做本地日志；云端/语音/手机推送在第三期按需加，不影响架构。
 - nav2 / SLAM / 建图会话的健康模型在第三期单独设计（它们不是 systemd 单元）。
-- 阈值初值需第一期真实数据标定后才固化。
+- 阈值初值需第一期真实数据标定后才固化；IDR 5s 阈值需现场确认 GOP 间隔。
+- 云端链路（frp 是否在线、rosbridge 客户端数）第一期为可选探针，不阻塞验收。
+- `arm-grasp` 的 `/health/arm_grasp` 定时器只能证明 executor 活着；
+  要证明 action 在推进，必须同时看 `/arm/feedback` 新鲜度（已列入契约）。
+- 若 Pi 上没有 journal 读权限（`adm`/`systemd-journal` 组），
+  USB/ordering-cycle 探针会返回 UNKNOWN，不会误报；需在安装步骤里确认权限。
+
+## 修订记录
+
+- 2026-11-17 评审后修订：
+  - 恢复动作按故障类别拆分，新增已知故障库；一期交付 `faults.py`。
+  - 根因改为直接证据（`count_publishers`、`ss` 旧 IP），去掉「≥3 症状」推断。
+  - 新增配置漂移体检与 USB / DDS / 服务资源 / 电池 / 底盘故障位 / load/WiFi 覆盖。
+  - 欠压历史位不再让 doctor 永久 FAIL；欠压期间健康组件不再被 BLOCKED 掩盖。
+  - 补迟滞；UNKNOWN 不再进 incident。
+  - ToF 接口号改用 `udevadm`，并支持 by-id 兜底。
+  - K230 地址未知时判 UNKNOWN，删除写死的旧回退 IP。
+  - state.json 移到 `/run`；journal 带 boot_id/mono。
+  - `doctor` 优先复用守护状态，warmup 8s；临时目录隔离。
+  - 语音/抓取心跳补设备与引擎状态，不再只证明线程活着。
