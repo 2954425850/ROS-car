@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from .busy import BusyState, compute
-from .classify import attach_graph_root_cause, evaluate
+from .classify import attach_graph_root_cause, evaluate, fingerprint
 from .diagnose import diagnose
 from .faults import FaultContext
 from .journal import Journal
@@ -155,8 +155,74 @@ class Engine:
         return states
 
     def _record_transitions(self, states, now: float) -> None:
-        # 详细实现见 Task 11。
-        pass
+        for name, cur in states.items():
+            prev = self._prev.get(name)
+            prev_v = prev.verdict if prev else None
+            fp = fingerprint(name, cur.verdict, cur.root_cause, list(cur.failing))
+
+            # 失明不是组件故障：只记限流的 monitor_blind，不进 incident 时间线。
+            if cur.verdict is Verdict.UNKNOWN:
+                self._record_blind(name, cur)
+                continue
+
+            if cur.verdict is Verdict.OK:
+                info = self._incidents.pop(name, None)
+                if info is not None:
+                    self._journal.record({
+                        "event": "incident_close",
+                        "incident": info["id"],
+                        "component": name,
+                        "from": prev_v.value if prev_v else "UNKNOWN",
+                        "to": "OK",
+                        "duration_s": round(now - info["started"], 1),
+                        "fingerprint": info["fingerprint"],
+                    })
+                continue
+
+            info = self._incidents.get(name)
+            if info is None:
+                info = {
+                    "id": "I-%s-%s" % (
+                        time.strftime("%Y%m%d-%H%M%S", time.localtime(self._wall())), name),
+                    "started": now,
+                    "fingerprint": fp,
+                }
+                self._incidents[name] = info
+                event = "incident_open"
+            elif info["fingerprint"] != fp:
+                info["fingerprint"] = fp
+                event = "incident_update"
+            else:
+                continue
+
+            self._journal.record({
+                "event": event,
+                "incident": info["id"],
+                "component": name,
+                "from": prev_v.value if prev_v else "UNKNOWN",
+                "to": cur.verdict.value,
+                "reason": cur.reason,
+                "root_cause": cur.root_cause,
+                "fingerprint": fp,
+                "failing": list(cur.failing),
+                "diagnoses": [asdict(d) for d in cur.diagnoses],
+                "evidence": cur.evidence,
+                "interlock": asdict(self.last_busy),
+                "action": None,
+            })
+
+    def _record_blind(self, name: str, cur: ComponentState) -> None:
+        wall = self._wall()
+        if wall - self._last_blind_wall < 300:
+            return
+        self._last_blind_wall = wall
+        self._journal.record({
+            "event": "monitor_blind",
+            "component": name,
+            "reason": cur.reason,
+            "evidence": cur.evidence,
+            "action": None,
+        })
 
     def _write_state(self, states) -> None:
         now = self._clock()
