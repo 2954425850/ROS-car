@@ -1,6 +1,8 @@
 import os
 import subprocess
 
+import pytest
+
 from carhealth.probes.config_drift import (
     ConfigDriftProbe, build_stale_packages, parse_ordering_cycles,
 )
@@ -12,6 +14,7 @@ def test_parse_ordering_cycles():
     assert parse_ordering_cycles("nothing") == 0
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 路径分隔符与测试假路径不一致")
 def test_build_stale_packages_uses_source_vs_install_mtime():
     mtimes = {
         "/repo/pi/raspot_ws/src/arm_grasp/setup.py": 200.0,

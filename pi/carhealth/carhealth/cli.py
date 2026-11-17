@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from .engine import default_state_dir
+from .engine import default_journal_dir, default_state_dir
 from .journal import Journal
 
 STATE_STALE_S = 10.0
@@ -107,13 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_status)
 
     h = sub.add_parser("history", help="查看故障时间线")
-    h.add_argument("--journal-dir", default=str(default_state_dir()))
+    h.add_argument("--journal-dir", default=str(default_journal_dir()))
     h.add_argument("--since", default="1h", help="1h / 30m / 2d / all")
     h.set_defaults(func=cmd_history)
 
     w = sub.add_parser("why", help="某组件最近一次异常的完整证据")
     w.add_argument("component")
-    w.add_argument("--journal-dir", default=str(default_state_dir()))
+    w.add_argument("--journal-dir", default=str(default_journal_dir()))
     w.set_defaults(func=cmd_why)
 
     return p

@@ -1,6 +1,15 @@
 from carhealth.probes.host import HostProbe, parse_cpu_stat
 
 
+class _FakeStat:
+    f_bavail = 50
+    f_blocks = 100
+
+
+def _fake_statvfs(path):
+    return _FakeStat()
+
+
 def test_parse_cpu_stat():
     total, idle = parse_cpu_stat("cpu 100 0 100 800 0 0 0 0 0 0\ncpu0 ...\n")
     assert total == 1000
@@ -38,7 +47,8 @@ def test_host_evidence_from_fake_files(tmp_path):
         " wlan0: 0000   45.  -55.  -256        0      0      0      0      0\n"
     )
     r = HostProbe(meminfo=str(mem), thermal=str(thermal), disk_path=str(tmp_path),
-                  wireless=str(wireless), getloadavg=lambda: (1.5, 1.2, 1.0)).poll()
+                  wireless=str(wireless), getloadavg=lambda: (1.5, 1.2, 1.0),
+                  statvfs=_fake_statvfs).poll()
     assert r.ok is True
     assert r.evidence["mem_available_mb"] == 1024.0
     assert r.evidence["soc_temp_c"] == 55.0
@@ -51,7 +61,8 @@ def test_host_evidence_from_fake_files(tmp_path):
 def test_missing_files_leave_fields_absent(tmp_path):
     r = HostProbe(meminfo=str(tmp_path / "nope"), thermal=str(tmp_path / "nope2"),
                   disk_path=str(tmp_path), wireless=str(tmp_path / "nope3"),
-                  getloadavg=lambda: (_ for _ in ()).throw(OSError("n/a"))).poll()
+                  getloadavg=lambda: (_ for _ in ()).throw(OSError("n/a")),
+                  statvfs=_fake_statvfs).poll()
     assert "mem_available_mb" not in r.evidence
     assert "soc_temp_c" not in r.evidence
     assert "wifi_link" not in r.evidence

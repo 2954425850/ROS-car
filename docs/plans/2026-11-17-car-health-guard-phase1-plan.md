@@ -1172,6 +1172,15 @@ git commit -m "feat(health): 组件契约与阈值"
 from carhealth.probes.host import HostProbe, parse_cpu_stat
 
 
+class _FakeStat:
+    f_bavail = 50
+    f_blocks = 100
+
+
+def _fake_statvfs(path):
+    return _FakeStat()
+
+
 def test_parse_cpu_stat():
     total, idle = parse_cpu_stat("cpu 100 0 100 800 0 0 0 0 0 0\ncpu0 ...\n")
     assert total == 1000
@@ -1209,7 +1218,8 @@ def test_host_evidence_from_fake_files(tmp_path):
         " wlan0: 0000   45.  -55.  -256        0      0      0      0      0\n"
     )
     r = HostProbe(meminfo=str(mem), thermal=str(thermal), disk_path=str(tmp_path),
-                  wireless=str(wireless), getloadavg=lambda: (1.5, 1.2, 1.0)).poll()
+                  wireless=str(wireless), getloadavg=lambda: (1.5, 1.2, 1.0),
+                  statvfs=_fake_statvfs).poll()
     assert r.ok is True
     assert r.evidence["mem_available_mb"] == 1024.0
     assert r.evidence["soc_temp_c"] == 55.0
@@ -1222,7 +1232,8 @@ def test_host_evidence_from_fake_files(tmp_path):
 def test_missing_files_leave_fields_absent(tmp_path):
     r = HostProbe(meminfo=str(tmp_path / "nope"), thermal=str(tmp_path / "nope2"),
                   disk_path=str(tmp_path), wireless=str(tmp_path / "nope3"),
-                  getloadavg=lambda: (_ for _ in ()).throw(OSError("n/a"))).poll()
+                  getloadavg=lambda: (_ for _ in ()).throw(OSError("n/a")),
+                  statvfs=_fake_statvfs).poll()
     assert "mem_available_mb" not in r.evidence
     assert "soc_temp_c" not in r.evidence
     assert "wifi_link" not in r.evidence
@@ -1341,6 +1352,12 @@ def parse_wireless(text: str) -> dict:
     return {}
 
 
+def _default_getloadavg():
+    """os.getloadavg 是 Unix-only；Windows 上 import 时不能直接取属性。"""
+    fn = getattr(os, "getloadavg", None)
+    return fn() if fn is not None else (0.0, 0.0, 0.0)
+
+
 class HostProbe:
     name = "host"
     interval_s = 5.0
@@ -1348,13 +1365,13 @@ class HostProbe:
     def __init__(self, meminfo: str = "/proc/meminfo", disk_path: str = "/",
                  thermal: str = "/sys/class/thermal/thermal_zone0/temp",
                  wireless: str = "/proc/net/wireless", stat_path: str = "/proc/stat",
-                 getloadavg=os.getloadavg, clock=time.monotonic):
+                 getloadavg=None, clock=time.monotonic):
         self.meminfo = meminfo
         self.disk_path = disk_path
         self.thermal = thermal
         self.wireless = wireless
         self.stat_path = stat_path
-        self._getloadavg = getloadavg
+        self._getloadavg = getloadavg or _default_getloadavg
         self._clock = clock
         self._prev_cpu = None
 
@@ -1370,11 +1387,12 @@ class HostProbe:
             ev["swap_free_mb"] = round(values.get("SwapFree", 0) / 1024.0, 1)
         except (OSError, KeyError, ValueError, IndexError):
             pass
-        try:
-            st = os.statvfs(self.disk_path)
-            ev["disk_free_pct"] = round(100.0 * st.f_bavail / st.f_blocks, 1)
-        except OSError:
-            pass
+        if self._statvfs is not None:
+            try:
+                st = self._statvfs(self.disk_path)
+                ev["disk_free_pct"] = round(100.0 * st.f_bavail / st.f_blocks, 1)
+            except (OSError, AttributeError):     # Windows 没有 os.statvfs
+                pass
         try:
             with open(self.thermal, "r", encoding="utf-8") as f:
                 ev["soc_temp_c"] = round(int(f.read().strip()) / 1000.0, 1)
@@ -2759,6 +2777,8 @@ def test_probe_without_ss_is_unknown():
 import os
 import subprocess
 
+import pytest
+
 from carhealth.probes.config_drift import (
     ConfigDriftProbe, build_stale_packages, parse_ordering_cycles,
 )
@@ -2770,6 +2790,7 @@ def test_parse_ordering_cycles():
     assert parse_ordering_cycles("nothing") == 0
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 路径分隔符与测试假路径不一致")
 def test_build_stale_packages_uses_source_vs_install_mtime():
     mtimes = {
         "/repo/pi/raspot_ws/src/arm_grasp/setup.py": 200.0,
@@ -4560,7 +4581,7 @@ import sys
 import time
 from pathlib import Path
 
-from .engine import default_state_dir
+from .engine import default_journal_dir, default_state_dir
 from .journal import Journal
 
 STATE_STALE_S = 10.0
@@ -4658,13 +4679,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_status)
 
     h = sub.add_parser("history", help="查看故障时间线")
-    h.add_argument("--journal-dir", default=str(default_state_dir()))
+    h.add_argument("--journal-dir", default=str(default_journal_dir()))
     h.add_argument("--since", default="1h", help="1h / 30m / 2d / all")
     h.set_defaults(func=cmd_history)
 
     w = sub.add_parser("why", help="某组件最近一次异常的完整证据")
     w.add_argument("component")
-    w.add_argument("--journal-dir", default=str(default_state_dir()))
+    w.add_argument("--journal-dir", default=str(default_journal_dir()))
     w.set_defaults(func=cmd_why)
 
     return p

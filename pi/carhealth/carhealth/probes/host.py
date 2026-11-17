@@ -38,6 +38,12 @@ def parse_wireless(text: str) -> dict:
     return {}
 
 
+def _default_getloadavg():
+    """os.getloadavg 是 Unix-only；Windows 上 import 时不能直接取属性。"""
+    fn = getattr(os, "getloadavg", None)
+    return fn() if fn is not None else (0.0, 0.0, 0.0)
+
+
 class HostProbe:
     name = "host"
     interval_s = 5.0
@@ -45,13 +51,14 @@ class HostProbe:
     def __init__(self, meminfo: str = "/proc/meminfo", disk_path: str = "/",
                  thermal: str = "/sys/class/thermal/thermal_zone0/temp",
                  wireless: str = "/proc/net/wireless", stat_path: str = "/proc/stat",
-                 getloadavg=os.getloadavg, clock=time.monotonic):
+                 getloadavg=None, statvfs=None, clock=time.monotonic):
         self.meminfo = meminfo
         self.disk_path = disk_path
         self.thermal = thermal
         self.wireless = wireless
         self.stat_path = stat_path
-        self._getloadavg = getloadavg
+        self._getloadavg = getloadavg or _default_getloadavg
+        self._statvfs = statvfs or getattr(os, "statvfs", None)
         self._clock = clock
         self._prev_cpu = None
 
@@ -67,11 +74,12 @@ class HostProbe:
             ev["swap_free_mb"] = round(values.get("SwapFree", 0) / 1024.0, 1)
         except (OSError, KeyError, ValueError, IndexError):
             pass
-        try:
-            st = os.statvfs(self.disk_path)
-            ev["disk_free_pct"] = round(100.0 * st.f_bavail / st.f_blocks, 1)
-        except OSError:
-            pass
+        if self._statvfs is not None:
+            try:
+                st = self._statvfs(self.disk_path)
+                ev["disk_free_pct"] = round(100.0 * st.f_bavail / st.f_blocks, 1)
+            except (OSError, AttributeError):     # Windows 没有 os.statvfs
+                pass
         try:
             with open(self.thermal, "r", encoding="utf-8") as f:
                 ev["soc_temp_c"] = round(int(f.read().strip()) / 1000.0, 1)
