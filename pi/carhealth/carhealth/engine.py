@@ -1,0 +1,188 @@
+"""轮询探针 -> 判定 -> 状态迁移 -> 写 state.json。
+
+一期不包含任何恢复动作；`journal` 里 action 恒为 null。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+
+from .busy import BusyState, compute
+from .classify import attach_graph_root_cause, evaluate
+from .diagnose import diagnose
+from .faults import FaultContext
+from .journal import Journal
+from .types import ComponentSpec, ComponentState, ProbeResult, Verdict
+
+
+def default_state_dir() -> Path:
+    env = os.environ.get("CARHEALTH_STATE_DIR")
+    if env:
+        return Path(env)
+    run = Path("/run/carhealth")
+    if os.access(run, os.W_OK):
+        return run
+    return Path.home() / ".local/state/carhealth"
+
+
+def default_journal_dir() -> Path:
+    env = os.environ.get("CARHEALTH_JOURNAL_DIR")
+    if env:
+        return Path(env)
+    return Path.home() / ".local/state/carhealth"
+
+
+@dataclass
+class EngineConfig:
+    state_dir: Path
+    journal_dir: Path
+    interval_s: float = 1.0
+    bad_after: int = 2          # 连续几次坏才降级
+    good_after: int = 5         # 连续几次好才恢复
+
+
+class Engine:
+    def __init__(self, specs, probes, config: EngineConfig,
+                 clock=time.monotonic, wall=time.time):
+        self.specs = tuple(specs)
+        self.probes = dict(probes)
+        self.config = config
+        self._clock = clock
+        self._wall = wall
+        self._results: dict[str, ProbeResult] = {}
+        self._last_poll: dict[str, float] = {}
+        self._committed: dict[str, ComponentState] = {}
+        self._prev: dict[str, ComponentState] = {}
+        self._bad: dict[str, int] = {}
+        self._good: dict[str, int] = {}
+        self._incidents: dict[str, dict] = {}
+        self._journal = Journal(config.journal_dir, clock=wall)
+        self.last_busy = BusyState(False, False, False, False)
+        self.global_diagnoses = ()
+        self._last_blind_wall = 0.0
+        self.closer = None
+        Path(config.state_dir).mkdir(parents=True, exist_ok=True)
+
+    @property
+    def journal(self) -> Journal:
+        return self._journal
+
+    def close(self) -> None:
+        if self.closer is not None:
+            try:
+                self.closer()
+            except Exception:                               # noqa: BLE001
+                pass
+
+    def _poll_due(self) -> None:
+        now = self._clock()
+        for name, probe in self.probes.items():
+            last = self._last_poll.get(name)
+            if last is not None and now - last < getattr(probe, "interval_s", 1.0):
+                continue
+            try:
+                result = probe.poll()
+            except Exception as e:                          # noqa: BLE001
+                result = ProbeResult(ok=None, error=repr(e))
+            self._results[name] = result
+            self._last_poll[name] = now
+
+    def _commit(self, spec, ev, now: float) -> ComponentState:
+        """迟滞：≥2 次坏才降级，≥5 次好才恢复。首次观测直接采用，避免开机空窗。"""
+        name = spec.name
+        prev = self._committed.get(name)
+        if prev is None:
+            return self._state_from(spec, ev, now)
+
+        if ev.verdict is Verdict.OK:
+            self._good[name] = self._good.get(name, 0) + 1
+            self._bad[name] = 0
+            if prev.verdict is Verdict.OK or self._good[name] < self.config.good_after:
+                return replace(prev, updated=now)
+            return self._state_from(spec, ev, now)
+
+        if (ev.verdict, ev.root_cause) == (prev.verdict, prev.root_cause):
+            self._bad[name] = 0
+            self._good[name] = 0
+            return replace(prev, updated=now, reason=ev.reason,
+                           evidence=ev.evidence, failing=ev.failing_reasons)
+
+        self._bad[name] = self._bad.get(name, 0) + 1
+        self._good[name] = 0
+        if self._bad[name] < self.config.bad_after:
+            return replace(prev, updated=now)
+        return self._state_from(spec, ev, now)
+
+    @staticmethod
+    def _state_from(spec, ev, now: float) -> ComponentState:
+        return ComponentState(
+            name=spec.name, display=spec.display, verdict=ev.verdict,
+            reason=ev.reason, evidence=ev.evidence, root_cause=ev.root_cause,
+            failing=ev.failing_reasons, diagnoses=(), since=now, updated=now,
+        )
+
+    def run_once(self) -> dict[str, ComponentState]:
+        self._poll_due()
+
+        evals = {}
+        for spec in self.specs:
+            evals[spec.name] = evaluate(spec, self._results, evals)
+        evals = attach_graph_root_cause(evals, self.specs)
+
+        now = self._clock()
+        states = {spec.name: self._commit(spec, evals[spec.name], now)
+                  for spec in self.specs}
+
+        ctx = FaultContext(self._results, evals, now)
+        diag = diagnose(ctx)
+        for name, state in states.items():
+            state.diagnoses = tuple(diag.get(name, ()))
+        self.global_diagnoses = tuple(diag.get(None, ()))
+
+        voice_result = self._results.get("file:voice-heartbeat")
+        self.last_busy = compute(
+            self._results,
+            voice_result.evidence if voice_result and voice_result.ok else {},
+        )
+        self._record_transitions(states, now)
+        self._prev = states
+        self._committed = states
+        self._write_state(states)
+        return states
+
+    def _record_transitions(self, states, now: float) -> None:
+        # 详细实现见 Task 11。
+        pass
+
+    def _write_state(self, states) -> None:
+        now = self._clock()
+        payload = {
+            "wall": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(self._wall())),
+            "wall_ts": round(self._wall(), 3),
+            "pid": os.getpid(),
+            "interval_s": self.config.interval_s,
+            "busy": asdict(self.last_busy),
+            "diagnoses_global": [asdict(d) for d in self.global_diagnoses],
+            "components": {
+                name: {
+                    "display": st.display,
+                    "verdict": st.verdict.value,
+                    "reason": st.reason,
+                    "root_cause": st.root_cause,
+                    "failing": list(st.failing),
+                    "diagnoses": [asdict(d) for d in st.diagnoses],
+                    "since_s": round(now - st.since, 1),
+                    "evidence": st.evidence,
+                }
+                for name, st in states.items()
+            },
+        }
+        path = Path(self.config.state_dir) / "state.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, default=str),
+                       encoding="utf-8")
+        os.replace(tmp, path)
