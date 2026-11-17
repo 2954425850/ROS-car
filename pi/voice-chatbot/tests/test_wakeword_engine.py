@@ -299,3 +299,10 @@ def test_stop_interrupts_backoff_wait(monkeypatch):
     )
     assert engine._thread is None, "stop() 之后 _thread 没清掉"
     assert not engine.is_ready, "stop() 之后串口还开着"
+
+
+def test_status_properties_before_start():
+    """carhealth 心跳用这两个属性判断唤醒模块是否可用/线程是否在。"""
+    engine = WakeWordEngine(_FakeConfig(**{"wakeword.port": "/dev/fake"}))
+    assert engine.is_listening is False
+    assert engine.last_byte_age_s is None
