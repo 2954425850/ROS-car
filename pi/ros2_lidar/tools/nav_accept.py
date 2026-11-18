@@ -201,7 +201,7 @@ def main():
         if len(pair) == 2 and all(l['ok'] for l in pair):
             rounds_ok += 1
     succeeded = sum(1 for l in legs if l['ok'])
-    errs = [l['err_xy'] for l in legs if l['err_xy'] is not None]
+    errs = [l['err_xy'] for l in legs if l['ok'] and l['err_xy'] is not None]
     summary = {
         'route': {'A': A, 'B': B},
         'rounds_requested': args.rounds,

@@ -15,7 +15,7 @@ echo "== sync $SRC -> $DST"
 mkdir -p "$DST"
 # maps/ is kept (posegraph/data/last_pose.json are Pi-only); the tracked
 # map files are overwritten by the repo copies.
-rsync -a "$SRC/" "$DST/"
+rsync -a --exclude '__pycache__' "$SRC/" "$DST/"
 
 echo "== syntax checks"
 for f in "$DST"/tools/*.py; do python3 -m py_compile "$f"; done

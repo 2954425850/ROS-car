@@ -23,6 +23,7 @@ Parameters
 import json
 import math
 import os
+import time
 
 import rclpy
 from geometry_msgs.msg import PoseWithCovarianceStamped
@@ -52,6 +53,7 @@ class PosePersist(Node):
 
         self.got_pose = False
         self.last_saved = None
+        self.start_t = time.monotonic()   # delays use monotonic, not ROS time
         self.last_save_t = 0.0
         self.attempts = 0
         self.last_attempt = 0.0
@@ -61,7 +63,7 @@ class PosePersist(Node):
 
     def on_pose(self, msg):
         self.got_pose = True
-        now = self.get_clock().now().nanoseconds * 1e-9
+        now = time.monotonic()
         if now - self.last_save_t < 1.0:
             return
         p = msg.pose.pose
@@ -89,9 +91,9 @@ class PosePersist(Node):
     def tick(self):
         if self.got_pose or self.attempts >= self.max_attempts:
             return
-        now = self.get_clock().now().nanoseconds * 1e-9
+        now = time.monotonic()
         if self.attempts == 0:
-            if now < self.publish_delay:
+            if now - self.start_t < self.publish_delay:
                 return
         else:
             if now - self.last_attempt < self.retry_period:

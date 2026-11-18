@@ -182,7 +182,7 @@ global_costmap:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 2.0
         inflation_radius: 0.7
-      always_send_full_costmap: true
+      always_send_full_costmap: false
       footprint: '[[-0.30,-0.20],[0.30,-0.20],[0.30,0.20],[-0.30,0.20]]'
 map_saver:
   ros__parameters:

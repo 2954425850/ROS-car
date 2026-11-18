@@ -95,7 +95,15 @@ RPP 严格跟随路径；**没有加禁行区/硬性横向距离**（按修订�
 6. 如果 planner 插件加载失败（`SmacPlannerHybrid` 名字不对），把
    `nav2_params.yaml` 里的 `plugin` 在
    `nav2_smac_planner::SmacPlannerHybrid` 和 `nav2_smac_planner/SmacPlannerHybrid`
-   之间换一下；如果 composition 起不来，加 `use_composition:=false`。
+   之间换一下；RPP 同理：
+   `nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController` ↔
+   `.../RegulatedPurePursuitController`。如果 composition 起不来，加
+   `use_composition:=false`。
+
+> 注：`bond_timeout=10 s` 只改了 navigation 的 lifecycle manager（失败发生在
+> behavior_server 这一侧）；localization 的 manager 仍是官方默认 4 s，因为
+> map_server/amcl 一直稳定。若它也出现心跳丢失，需要复制
+> `localization_launch.py` 单独改。
 
 ## 资源实测（2026-11-18，干净重启、静止）
 
