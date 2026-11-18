@@ -35,7 +35,8 @@ class PowerProbe:
 
     def _read(self) -> str | None:
         if self._fake is not None:
-            return self._fake
+            # CLI 的 --fake-throttled 允许只写 0x1；补上真实 vcgencmd 的格式。
+            return self._fake if "throttled" in self._fake else "throttled=" + self._fake
         try:
             r = self._runner(["vcgencmd", "get_throttled"], capture_output=True,
                              text=True, timeout=2)

@@ -53,10 +53,16 @@ class RosTopicStore:
         self._lock = threading.Lock()
         self._recs: dict[str, _Record] = {}
         self._publisher_count = None
+        self._blind: str | None = None
 
     def set_publisher_counter(self, fn) -> None:
         """rclpy 后端注入 node.count_publishers；没有后端时为 None。"""
         self._publisher_count = fn
+
+    def set_blind(self, reason: str) -> None:
+        """后端起不来（没 source ROS / rclpy 缺失）时，话题探针必须是 UNKNOWN，
+        不能把「我看不见」伪装成「组件没数据」。"""
+        self._blind = reason
 
     def record(self, topic: str, payload: dict | None = None) -> None:
         with self._lock:
@@ -74,6 +80,8 @@ class RosTopicStore:
             return None
 
     def snapshot(self, topic: str) -> ProbeResult:
+        if self._blind is not None:
+            return ProbeResult(ok=None, error=self._blind)
         publishers = self._publishers(topic)
         with self._lock:
             rec = self._recs.get(topic)

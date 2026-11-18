@@ -22,6 +22,14 @@ def test_never_seen_topic_has_none_age():
     assert r.evidence["count"] == 0
 
 
+def test_blind_store_returns_unknown_not_stale():
+    store = RosTopicStore(clock=lambda: 1.0)
+    store.set_blind("rclpy 不可用")
+    r = TopicProbe("topic:/x", "/x", store).poll()
+    assert r.ok is None
+    assert "rclpy" in r.error
+
+
 def test_publisher_count_is_included():
     store = RosTopicStore(clock=lambda: 1.0)
     store.set_publisher_counter(lambda topic: 0 if topic == "/x" else 3)

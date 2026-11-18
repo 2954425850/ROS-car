@@ -91,6 +91,10 @@ def build_probes(ros: bool = True, board_host: str | None = None,
         backend = RosNodeBackend(store)
         if backend.start():
             closer = backend.stop
+        else:
+            store.set_blind(backend.reason or "ROS 后端未启动")
+    else:
+        store.set_blind("ROS 后端未启用（--no-ros）")
     return ProbeBundle(probes=probes, closer=closer)
 
 

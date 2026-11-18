@@ -29,6 +29,8 @@ def test_ros_false_does_not_import_rclpy():
     bundle = build_probes(ros=False, board_host="127.0.0.1")
     try:
         assert bundle.closer is None
+        # 没有后端时必须标 UNKNOWN，不能把「看不见」当成「没数据」。
+        assert bundle.probes["topic:/tof/status"].poll().ok is None
     finally:
         if bundle.closer:
             bundle.closer()

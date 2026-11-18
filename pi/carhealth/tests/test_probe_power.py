@@ -12,6 +12,13 @@ def test_undervoltage_now_blocks():
     assert r.evidence["uv_recent"] is True
 
 
+def test_fake_bare_hex_is_accepted():
+    """CLI 的 --fake-throttled 0x1 不带 throttled= 前缀。"""
+    r = PowerProbe(fake_output="0x1").poll()
+    assert r.ok is True
+    assert r.evidence["uv_now"] is True
+
+
 def test_history_bit_alone_is_not_recent():
     """历史位只在开机后置位、时间未知；doctor 每次新建探针，
     绝不能因此永远判 FAIL。"""
