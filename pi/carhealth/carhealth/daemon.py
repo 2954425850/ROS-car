@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
-"""carhealthd：常驻健康守护。一期只观察、只记录。"""
+"""carhealthd：常驻健康守护。默认只观察；CARHEALTH_RECOVERY=on 时启用二期自愈。"""
 
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
+from pathlib import Path
 
 from .engine import default_journal_dir, default_state_dir
+from .recovery import RecoveryConfig
 from .registry import build_engine
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="整车健康守护（一期：只观察）")
+    p = argparse.ArgumentParser(description="整车健康守护")
     p.add_argument("--state-dir", default=str(default_state_dir()))
     p.add_argument("--journal-dir", default=None)
     p.add_argument("--interval", type=float, default=1.0)
     p.add_argument("--once", action="store_true", help="跑一轮就退出（验收用）")
     p.add_argument("--no-ros", action="store_true", help="不启动 rclpy 后端")
+    p.add_argument("--no-recovery", action="store_true", help="强制只观察，不执行恢复动作")
     return p.parse_args(argv)
+
+
+def _recovery_enabled(args) -> bool:
+    if args.no_recovery:
+        return False
+    return os.environ.get("CARHEALTH_RECOVERY", "off").strip().lower() in (
+        "1", "on", "true", "yes")
 
 
 def _loop(engine, interval_s: float, stop) -> None:
@@ -30,10 +41,15 @@ def _loop(engine, interval_s: float, stop) -> None:
 
 
 def _default_factory(args):
+    recovery = RecoveryConfig(
+        enabled=_recovery_enabled(args),
+        kill_switch=Path(args.state_dir) / "recovery-off",
+    )
     return build_engine(state_dir=args.state_dir,
                         journal_dir=args.journal_dir or str(default_journal_dir()),
                         ros=not args.no_ros,
-                        interval_s=args.interval)
+                        interval_s=args.interval,
+                        recovery=recovery)
 
 
 def main(argv=None, engine_factory=None) -> int:

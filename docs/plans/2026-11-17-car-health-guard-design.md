@@ -336,14 +336,32 @@ carhealthctl why tof           # 最近一次异常的完整证据 + 命中的�
 4. 单次坏采样不开 incident（迟滞生效）；UNKNOWN 不产生组件 incident。
 5. 全程自动动作次数 = 0。
 
-### 第二期：连接层与单节点恢复
+### 第二期：自愈层（2026-11-18 已实现）
 
-交付：`recovery.py`、白名单、冷却/预算/验证窗口、互锁、熔断；dry-run 先跑一段时间。
-首批白名单：rosbridge、k230-resultd、k230-bridge、k230-framed、tof-a010、voice。
-`ps2-teleop`、`arm-grasp` 仍只观察，现场验证联锁后再加。
+交付（现场按真实故障收敛，而不是全量阶梯）：
 
-验收：逐个 `kill -9` 白名单单元 → 20s 内自愈；伪造「臂在动」→ 零动作；
-反复注入同指纹 → 熔断打开并落 `NEEDS_HUMAN`；伪造欠压 → 零动作。
+- `recovery.py`：白名单动作 + 互锁 + 冷却（120–600s）+ 全局预算（10 分钟 3 次）
+  + 动作后 30s 验证 + 连续失败 2 次熔断 30 分钟。
+- `CARHEALTH_RECOVERY=on` 启用；`carhealthctl recovery off` 写
+  `/run/carhealth/recovery-off` 作为 kill switch。
+- 特权动作统一走 root-owned `/usr/local/sbin/carhealth-recover`，
+  sudoers 只放行这一条命令；守护本身仍以 `cy` 运行。
+- 首批动作（全部来自现场故障）：
+  1. `wifi_powersave_off`：WiFi 省电 on → `iwconfig wlan0 power off`（不重启，忙时也允许）
+  2. `ros_daemon_stop`：仅 DDS 旧 IP socket 残留、组件健康 → 停 `ros2 daemon`
+  3. `restart_stack`：换网/IP 变化或 ROS 图故障导致组件 BLOCKED → 停旧 daemon +
+     按依赖顺序重启 `ps2-teleop/tof-a010/arm-grasp/k230-*/rosbridge` + voice；
+     **互锁全清**才执行
+  4. `restart_voice`：`voice.wakeword_lost` 持续 ≥60s 且语音不忙
+- 网络变化检测：`dds` 探针的 `current_ips` 变化写 `network_changed`，
+  180s 内作为 `restart_stack` 的触发条件。
+
+明确不做：单点停服务不自动重启（避免掩盖崩溃循环）、欠压/板子离线不重启、
+不重启 Pi/K230、不写配置文件/不改 K230 SD、不运行抓取/臂指令。
+
+验收：重开 WiFi 省电 → 自动关闭；换网段 → `network_changed` + 互锁清空后
+`restart_stack` 且组件恢复；臂运动中触发 → `recovery_deferred`；连续失败 →
+熔断；`recovery off` 后零动作。
 
 ### 第三期：编排与长期
 

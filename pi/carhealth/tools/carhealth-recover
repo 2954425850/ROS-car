@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# carhealth 特权动作入口。root-owned，sudoers 只放行这一条命令。
+# 只接受固定子命令，不接受任意参数；所有动作都在下面写死。
+set -u
+
+IWCONFIG="$(command -v iwconfig || echo /usr/sbin/iwconfig)"
+SYSTEMCTL="/usr/bin/systemctl"
+RUNUSER="$(command -v runuser || echo /usr/sbin/runuser)"
+UNIT_CY="$(id -u cy)"
+ROS_UNITS=(ps2-teleop tof-a010 arm-grasp k230-resultd k230-bridge k230-framed rosbridge)
+
+restart_voice() {
+    "$RUNUSER" -u cy -- env XDG_RUNTIME_DIR="/run/user/$UNIT_CY" \
+        "$SYSTEMCTL" --user restart voice-chatbot
+}
+
+case "${1:-}" in
+    wifi-powersave-off)
+        "$IWCONFIG" wlan0 power off
+        ;;
+    ros-daemon-stop)
+        pkill -f 'ros2cli.daemon' 2>/dev/null || true
+        ;;
+    restart-ros-stack)
+        pkill -f 'ros2cli.daemon' 2>/dev/null || true
+        fail=0
+        for unit in "${ROS_UNITS[@]}"; do
+            "$SYSTEMCTL" restart "$unit" || fail=1
+        done
+        restart_voice || fail=1
+        exit "$fail"
+        ;;
+    restart-voice)
+        restart_voice
+        ;;
+    *)
+        echo "unknown action: ${1:-}" >&2
+        exit 2
+        ;;
+esac

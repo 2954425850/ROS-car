@@ -68,6 +68,11 @@ def test_cpu_rules():
     assert "host.cpu_high" not in hits(ctx(host={"cpu_pct": 40.0}))
 
 
+def test_wifi_powersave_rule():
+    assert "host.wifi_powersave" in hits(ctx(wifi={"power_save": True}))
+    assert "host.wifi_powersave" not in hits(ctx(wifi={"power_save": False}))
+
+
 def test_gateway_latency_rule():
     assert "host.gateway_latency" in hits(
         ctx(**{"net:gateway": {"rtt_avg_ms": 141.0}}))

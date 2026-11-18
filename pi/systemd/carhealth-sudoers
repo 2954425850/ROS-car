@@ -1,0 +1,4 @@
+# carhealthd 自动恢复：只放行一个 root-owned 脚本，脚本内部只接受固定子命令。
+# 安装：sudo install -m 0440 pi/systemd/carhealth-sudoers /etc/sudoers.d/carhealth
+# 校验：sudo visudo -cf /etc/sudoers.d/carhealth
+cy ALL=(root) NOPASSWD: /usr/local/sbin/carhealth-recover

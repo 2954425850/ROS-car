@@ -5963,3 +5963,23 @@ git commit -m "test(health): 一期故障注入脚本与验收记录"
 - 换到 OPPO 后仍慢（ASR 25s/TTS 14s）：WiFi **省电模式 on**，网关 RTT 425ms/最大 1s；
   `iwconfig wlan0 power off` 后 33.6ms/46ms。已用 NetworkManager 持久化
   `wifi.powersave=2` + `99-wifi-powersave-off.conf`；规则提示也加了这一条。
+
+## 二期自愈（2026-11-18 现场追加）
+
+一期验收当天连续遇到四类"诊断得出但还要人动手"的故障，用户要求直接自愈。
+已实现：
+
+- 新文件：`carhealth/recovery.py`、`carhealth/probes/wifi.py`、
+  `tests/test_recovery.py`、`tests/test_probe_wifi.py`、
+  `tools/carhealth-recover`、`pi/systemd/carhealth-sudoers`。
+- 动作：`wifi_powersave_off` / `ros_daemon_stop` / `restart_stack` /
+  `restart_voice`；互锁、冷却、全局预算、30s 验证、连续失败 2 次熔断。
+- 网络变化：`dds` 探针 `current_ips` 改变写 `network_changed`；
+  180s 内作为 `restart_stack` 触发。
+- kill switch：`carhealthctl recovery off` → `/run/carhealth/recovery-off`。
+- `EngineConfig.recovery` 默认关闭（测试/一期行为不变）；systemd 单元
+  `CARHEALTH_RECOVERY=on` 才启用。
+- network_changed / recovery_attempt / recovery_result / recovery_verify /
+  recovery_deferred 全部进 journal；`state.json` 带 `recovery` 快照。
+- 本地测试：161 passed / 1 skipped（新增 recovery 10 个、wifi probe 3 个、
+  engine 集成 2 个、faults 1 个）。

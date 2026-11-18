@@ -1,6 +1,8 @@
 import json
 
 from carhealth.engine import Engine, EngineConfig
+from carhealth.journal import Journal
+from carhealth.recovery import RecoveryRequest
 from carhealth.types import Check, ComponentSpec, ProbeResult, Verdict
 
 
@@ -208,3 +210,56 @@ def test_interlock_is_written_into_incident(tmp_path):
         tmp_path=tmp_path)
     eng.run_once()
     assert _events(tmp_path)[0]["interlock"]["chassis"] is True
+
+
+class FakeRecovery:
+    def __init__(self, request=None):
+        self.request = request
+        self.executed = []
+
+    def observe(self, **kw):
+        return None
+
+    def decide(self, **kw):
+        return self.request
+
+    def execute(self, req, now):
+        self.executed.append(req)
+        return {"action": req.action, "rc": 0, "output": "ok",
+                "reason": req.reason, "targets": list(req.targets)}
+
+    def snapshot(self):
+        return {"enabled": True}
+
+
+def test_network_change_is_journaled(tmp_path):
+    class DdsProbe:
+        interval_s = 0.0
+
+        def __init__(self):
+            self.ips = ["10.0.0.1"]
+
+        def poll(self):
+            return ProbeResult(ok=True, evidence={"current_ips": list(self.ips)})
+
+    probe = DdsProbe()
+    cfg = EngineConfig(state_dir=tmp_path / "state", journal_dir=tmp_path / "journal")
+    eng = Engine((), {"dds": probe}, cfg, clock=lambda: 100.0,
+                 wall=lambda: 1000.0)
+    eng.run_once()
+    probe.ips = ["10.0.0.2"]
+    eng.run_once()
+    events = Journal(cfg.journal_dir).read()
+    assert any(e["event"] == "network_changed" for e in events)
+
+
+def test_recovery_request_is_executed_and_journaled(tmp_path):
+    recovery = FakeRecovery(RecoveryRequest("wifi_powersave_off", "测试"))
+    cfg = EngineConfig(state_dir=tmp_path / "state", journal_dir=tmp_path / "journal")
+    eng = Engine((), {}, cfg, clock=lambda: 100.0, wall=lambda: 1000.0,
+                 recovery=recovery)
+    eng.run_once()
+    assert len(recovery.executed) == 1
+    events = Journal(cfg.journal_dir).read()
+    names = [e["event"] for e in events]
+    assert "recovery_attempt" in names and "recovery_result" in names

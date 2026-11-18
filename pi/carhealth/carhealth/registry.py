@@ -12,6 +12,7 @@ from .contracts import (
     VOICE_HEARTBEAT_PATHS, build_specs,
 )
 from .engine import Engine, EngineConfig, default_journal_dir, default_state_dir
+from .recovery import RecoveryConfig
 from .probes.config_drift import ConfigDriftProbe
 from .probes.dds import DdsProbe
 from .probes.file_status import FileStatusProbe
@@ -24,6 +25,7 @@ from .probes.service_health import ServiceHealthProbe
 from .probes.systemd import SystemdCache, UnitProbe
 from .probes.udev import UdevProbe
 from .probes.usb_events import UsbEventsProbe
+from .probes.wifi import WifiProbe
 
 UNITS = ("ps2-teleop", "tof-a010", "k230-resultd", "k230-bridge",
          "k230-framed", "rosbridge", "arm-grasp")
@@ -78,6 +80,7 @@ def build_probes(ros: bool = True, board_host: str | None = None,
     probes["net:rosbridge"] = TcpProbe("net:rosbridge", ROSBRIDGE_ADDR[0],
                                        ROSBRIDGE_ADDR[1])
     probes["net:gateway"] = GatewayLatencyProbe()
+    probes["wifi"] = WifiProbe()
 
     probes["usb"] = UsbEventsProbe()
     probes["dds"] = DdsProbe()
@@ -103,7 +106,7 @@ def build_probes(ros: bool = True, board_host: str | None = None,
 def build_engine(state_dir=None, journal_dir=None, ros: bool = True,
                  board_host: str | None = None, fake_throttled: str | None = None,
                  interval_s: float = 1.0, systemd_runner=subprocess.run,
-                 repo: str | None = None) -> Engine:
+                 repo: str | None = None, recovery=None) -> Engine:
     state_dir = Path(state_dir) if state_dir else default_state_dir()
     journal_dir = Path(journal_dir) if journal_dir else default_journal_dir()
     bundle = build_probes(ros=ros, board_host=board_host,
@@ -111,6 +114,7 @@ def build_engine(state_dir=None, journal_dir=None, ros: bool = True,
                           systemd_runner=systemd_runner, repo=repo)
     engine = Engine(build_specs(), bundle.probes,
                     EngineConfig(state_dir=state_dir, journal_dir=journal_dir,
-                                 interval_s=interval_s))
+                                 interval_s=interval_s,
+                                 recovery=recovery or RecoveryConfig()))
     engine.closer = bundle.closer
     return engine

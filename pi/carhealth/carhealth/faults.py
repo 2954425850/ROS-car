@@ -182,6 +182,11 @@ RULES = (
          lambda c: ((_number(ev(c, "host").get("wifi_signal_dbm"), 0) < -75)
                     or (_number(ev(c, "host").get("wifi_link"), 99) < 30))),
 
+    Rule("host.wifi_powersave", "WiFi 省电模式开着", "wifi_powersave_off",
+         "会自动关闭；省电会让网关 RTT 到 400ms+，云端 ASR/TTS 超时",
+         ("host",),
+         lambda c: ev(c, "wifi").get("power_save") is True),
+
     Rule("host.gateway_latency", "WiFi 网关延迟高（信号满格也会这样）", "human",
          "网关 RTT 平均 >50ms 或最大 >200ms：先关 WiFi 省电"
          "（sudo iwconfig wlan0 power off），再换 5G/AP、靠近路由或改用有线；"

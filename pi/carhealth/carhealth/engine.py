@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from .busy import BusyState, compute
@@ -16,6 +16,7 @@ from .classify import attach_graph_root_cause, evaluate, fingerprint
 from .diagnose import diagnose
 from .faults import FaultContext
 from .journal import Journal
+from .recovery import Recovery, RecoveryConfig
 from .types import ComponentSpec, ComponentState, ProbeResult, Verdict
 
 
@@ -43,11 +44,14 @@ class EngineConfig:
     interval_s: float = 1.0
     bad_after: int = 2          # 连续几次坏才降级
     good_after: int = 5         # 连续几次好才恢复
+    # 默认关闭，测试/一期行为不变；daemon 按 CARHEALTH_RECOVERY=on 打开。
+    recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
 
 
 class Engine:
     def __init__(self, specs, probes, config: EngineConfig,
-                 clock=time.monotonic, wall=time.time):
+                 clock=time.monotonic, wall=time.time,
+                 recovery: Recovery | None = None):
         self.specs = tuple(specs)
         self.probes = dict(probes)
         self.config = config
@@ -61,6 +65,10 @@ class Engine:
         self._good: dict[str, int] = {}
         self._incidents: dict[str, dict] = {}
         self._journal = Journal(config.journal_dir, clock=wall)
+        self.recovery = recovery or Recovery(config.recovery, clock=clock)
+        self._last_ips: list[str] | None = None
+        self._network_changed_at: float | None = None
+        self._last_deferred_wall = 0.0
         self.last_busy = BusyState(False, False, False, False)
         self.global_diagnoses = ()
         self._last_blind_wall = 0.0
@@ -148,11 +156,68 @@ class Engine:
             self._results,
             voice_result.evidence if voice_result and voice_result.ok else {},
         )
+        self._detect_network_change(now)
+        verify = self.recovery.observe(states=states, diag=diag, now=now)
+        if verify is not None:
+            self._journal.record({"event": "recovery_verify", **verify})
+
         self._record_transitions(states, now)
         self._prev = states
         self._committed = states
         self._write_state(states)
+        self._maybe_recover(states, diag, now)
         return states
+
+    def _detect_network_change(self, now: float) -> None:
+        result = self._results.get("dds")
+        if result is None or result.ok is not True:
+            return
+        ips = list(result.evidence.get("current_ips") or ())
+        if not ips:
+            return
+        if self._last_ips is not None and set(ips) != set(self._last_ips):
+            self._network_changed_at = now
+            self._journal.record({
+                "event": "network_changed",
+                "from": self._last_ips,
+                "to": ips,
+                "action": None,
+            })
+        self._last_ips = ips
+
+    def _maybe_recover(self, states, diag, now: float) -> None:
+        network_changed = (self._network_changed_at is not None
+                           and now - self._network_changed_at < 180.0)
+        request = self.recovery.decide(
+            states=states, diag=diag, busy=self.last_busy,
+            network_changed=network_changed, now=now,
+        )
+        if request is None:
+            return
+        if request.deferred:
+            wall = self._wall()
+            if wall - self._last_deferred_wall < 60.0:
+                return
+            self._last_deferred_wall = wall
+            self._journal.record({
+                "event": "recovery_deferred",
+                "action": request.action,
+                "reason": request.reason,
+                "detail": request.detail,
+                "targets": list(request.targets),
+                "interlock": asdict(self.last_busy),
+            })
+            return
+
+        self._journal.record({
+            "event": "recovery_attempt",
+            "action": request.action,
+            "reason": request.reason,
+            "targets": list(request.targets),
+            "interlock": asdict(self.last_busy),
+        })
+        result = self.recovery.execute(request, now)
+        self._journal.record({"event": "recovery_result", **result})
 
     def _record_transitions(self, states, now: float) -> None:
         for name, cur in states.items():
@@ -232,6 +297,7 @@ class Engine:
             "pid": os.getpid(),
             "interval_s": self.config.interval_s,
             "busy": asdict(self.last_busy),
+            "recovery": self.recovery.snapshot(),
             "diagnoses_global": [asdict(d) for d in self.global_diagnoses],
             "components": {
                 name: {

@@ -11,7 +11,7 @@ RuntimeDirectory=carhealth
 RuntimeDirectoryMode=0750
 Environment=HOME=/home/cy
 Environment=PYTHONUNBUFFERED=1
-Environment=CARHEALTH_RECOVERY=off
+Environment=CARHEALTH_RECOVERY=on
 Environment=CARHEALTH_REPO=/home/cy/ROS-car
 ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/cy/ROS-car/pi/raspot_ws/install/setup.bash && exec /usr/bin/python3 -m carhealth.daemon'
 Restart=always

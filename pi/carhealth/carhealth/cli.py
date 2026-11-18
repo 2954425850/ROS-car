@@ -43,10 +43,20 @@ def cmd_status(args) -> int:
         return 0
 
     busy = payload.get("busy", {})
+    recovery = payload.get("recovery") or {}
     print("carhealthd pid=%s  wall=%s  状态年龄=%.0fs"
           % (payload.get("pid"), payload.get("wall"), age))
     print("互锁: 臂=%s 底盘=%s 抓取=%s 语音=%s"
           % (busy.get("arm"), busy.get("chassis"), busy.get("grasp"), busy.get("voice")))
+    paused = (Path(args.state_dir) / "recovery-off").exists()
+    print("自动恢复: %s%s" % (
+        "开启" if recovery.get("enabled") else "关闭",
+        "（手动暂停中）" if paused else ""))
+    last = recovery.get("last_action")
+    if last:
+        print("最近自动动作: %s rc=%s %s" % (
+            last.get("action"), last.get("rc"),
+            (last.get("output") or "")[:100]))
     print()
     print("%-12s %-9s %-6s %-14s %s" % ("组件", "状态", "持续", "根因", "原因"))
     for name, c in payload.get("components", {}).items():
@@ -183,6 +193,24 @@ def cmd_doctor(args, engine_factory=None, sleeper=time.sleep) -> int:
         return worst
 
 
+def cmd_recovery(args) -> int:
+    """手动暂停/恢复自动动作。daemon 每轮检查这个文件是否存在。"""
+    flag = Path(args.state_dir) / "recovery-off"
+    if args.action == "off":
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.write_text(
+            "paused by carhealthctl at %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"),
+            encoding="utf-8")
+    elif args.action == "on":
+        try:
+            flag.unlink()
+        except FileNotFoundError:
+            pass
+    print("自动恢复：%s" % (
+        "暂停（kill switch 存在）" if flag.exists() else "开启"))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="carhealthctl")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -214,6 +242,11 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--fake-throttled", default=None,
                    help="测试/验收用：伪造 vcgencmd 输出，如 0x50000")
     d.set_defaults(func=cmd_doctor)
+
+    r = sub.add_parser("recovery", help="开启/暂停自动恢复（kill switch）")
+    r.add_argument("action", choices=("on", "off", "status"))
+    r.add_argument("--state-dir", default=str(default_state_dir()))
+    r.set_defaults(func=cmd_recovery)
 
     return p
 
