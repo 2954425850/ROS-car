@@ -23,12 +23,17 @@
 """
 from __future__ import annotations
 
+import glob
 import os
 
 try:
     import yaml
 except ImportError:                    # pragma: no cover
     yaml = None
+
+# 这两个目录做成模块常量，**只为可测**：单测把它们指到 tmp 目录就能离线跑。
+BY_ID_DIR = "/dev/serial/by-id"
+SYSFS_USB = "/sys/bus/usb/devices"
 
 # 本机工作区的源码配置（这台 Pi 上就是这个路径）
 REPO_YAML = "/home/cy/ROS-car/pi/raspot_ws/src/tof_a010/config/tof.yaml"
@@ -91,28 +96,61 @@ def _warn_if_shadowed(used):
         pass
 
 
+def _ftdi_bus_hint():
+    """报告总线上 FTDI(0403) 设备的处境，**只报告，不兜底**。
+
+    ★ 2026-11-18 事故（删掉"裸 /dev/ttyUSB0 兜底"的由来）：
+      A010 的 FTDI 适配器开机就枚举失败（内核 `usb 2-2: can't set config #1,
+      error -32`），既没有 `Meta_Sense` 的 by-id，也没生成 ttyUSB。
+      旧代码此时会兜底到**裸 `/dev/ttyUSB0`** —— 而那个口当时是 RPLIDAR 的
+      CP2102，它的 DTR 线就是雷达电机的开关。于是每 ~20 秒：
+      开串口 ⇒ DTR 拉高 ⇒ 雷达停转 ⇒ 关串口 ⇒ 又转起来。
+      表现是"雷达转一会儿停三四秒再转"，而雷达本体、驱动、内核日志全都没毛病，
+      极难查。**串口只能按身份定位，绝不能按位置兜底。**
+    """
+    devs = []
+    for vid in glob.glob(os.path.join(SYSFS_USB, "*/idVendor")):
+        try:
+            with open(vid, "r", encoding="ascii", errors="ignore") as f:
+                if f.read().strip() != "0403":
+                    continue
+        except OSError:
+            continue
+        base = os.path.dirname(vid)
+        devs.append((os.path.basename(base),
+                     bool(glob.glob(os.path.join(base, "*", "tty[A-Z]*")))))
+    if not devs:
+        return "总线上没有 FTDI(0403) 设备（模块没插？）"
+    if not any(has_tty for _, has_tty in devs):
+        return ("总线上有 FTDI(0403) 设备（%s）却没生成 ttyUSB —— 多半是 USB 枚举失败"
+                "（`dmesg | grep -i usb` 里找 `can't set config`）。**拔插一下**；"
+                "authorized 翻转 / unbind-rebind 实测无效"
+                % "、".join(name for name, _ in devs))
+    return "总线上 FTDI 设备：%s" % "、".join(
+        "%s（%s）" % (name, "有 tty" if has_tty else "无 tty") for name, has_tty in devs)
+
+
 def resolve_device(cfg):
     """把配置里的 `device` 变成一个**真的存在**的路径。返回 `(path, 说明)`。
 
-    ★ 为什么要兜底：`/dev/ttyUSB*` 的序号会随插拔漂移，所以配置里想写 `/dev/a010`
-      （自定义 udev 规则）。但那条规则要 root 装，**不该成为跑起来的前提**。
+    查找顺序（**只认身份，不认位置**）：配置名 → `Meta_Sense` 的 by-id 通道 A。
+    都找不到就原样返回 `want`（多半是个不存在的路径），让调用方**只报错、不开串口**。
 
     `/dev/serial/by-id/...-if00-port0` 是 udev **自带**的稳定名（不用写任何规则），
     而 `if00` 正是 FT2232 的**通道 A** = 数据口（通道 B 是 `if01`）。
-    所以顺序是：配置名 → by-id 的通道 A → 裸 /dev/ttyUSB0。
+
+    ⚠️ 曾经还有一条"裸 `/dev/ttyUSB0`"兜底，**已删除**：`/dev/ttyUSB*` 的序号随
+     插拔漂移，兜底开到的可能是**任何一个**串口设备。2026-11-18 就开到 RPLIDAR 的
+     雷达适配器上，把雷达的电机反复停转（详见 `_ftdi_bus_hint()`）。
     """
     want = cfg.get("device") or "/dev/a010"
     if os.path.exists(want):
         return want, "配置指定"
-    by_id = "/dev/serial/by-id"
-    if os.path.isdir(by_id):
-        import glob as _glob
-        hits = sorted(_glob.glob(os.path.join(by_id, "*Meta_Sense_*if00*")))
+    if os.path.isdir(BY_ID_DIR):
+        hits = sorted(glob.glob(os.path.join(BY_ID_DIR, "*Meta_Sense_*if00*")))
         if hits:
             return hits[0], "by-id 通道 A（udev 自带，已自动兜底）"
-    if os.path.exists("/dev/ttyUSB0"):
-        return "/dev/ttyUSB0", "裸 /dev/ttyUSB0（**没找到 by-id，建议查一下**）"
-    return want, "不存在（模块没插？）"
+    return want, "不存在：%s；%s" % (want, _ftdi_bus_hint())
 
 
 def load(path=None):
