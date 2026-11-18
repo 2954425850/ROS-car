@@ -76,9 +76,15 @@ def test_wifi_powersave_rule():
 def test_gateway_latency_rule():
     assert "host.gateway_latency" in hits(
         ctx(**{"net:gateway": {"rtt_avg_ms": 141.0}}))
+    assert "host.gateway_latency" in hits(
+        ctx(**{"net:gateway": {"rtt_avg_ms": 20.0, "rtt_mdev_ms": 120.0}}))
     assert "host.gateway_latency" not in hits(
         ctx(**{"net:gateway": {"rtt_avg_ms": 3.9, "rtt_max_ms": 10.0,
-                               "loss_pct": 0.0}}))
+                               "rtt_mdev_ms": 5.0, "loss_pct": 0.0}}))
+    # 单次尖峰不报，避免正常网络抖动就提示
+    assert "host.gateway_latency" not in hits(
+        ctx(**{"net:gateway": {"rtt_avg_ms": 20.0, "rtt_max_ms": 300.0,
+                               "rtt_mdev_ms": 10.0, "loss_pct": 0.0}}))
 
 
 def test_asr_error_rule():

@@ -188,12 +188,12 @@ RULES = (
          lambda c: ev(c, "wifi").get("power_save") is True),
 
     Rule("host.gateway_latency", "WiFi 网关延迟高（信号满格也会这样）", "human",
-         "网关 RTT 平均 >50ms 或最大 >200ms：先关 WiFi 省电"
+         "网关 RTT 平均 >60ms 或抖动 >80ms：先关 WiFi 省电"
          "（sudo iwconfig wlan0 power off），再换 5G/AP、靠近路由或改用有线；"
          "否则云端 ASR/TTS 会超时",
          ("host",),
-         lambda c: ((_number(ev(c, "net:gateway").get("rtt_avg_ms"), 0) > 50)
-                    or (_number(ev(c, "net:gateway").get("rtt_max_ms"), 0) > 200)
+         lambda c: ((_number(ev(c, "net:gateway").get("rtt_avg_ms"), 0) > 60)
+                    or (_number(ev(c, "net:gateway").get("rtt_mdev_ms"), 0) > 80)
                     or (_number(ev(c, "net:gateway").get("loss_pct"), 0) >= 20))),
 
     Rule("service.memory_high", "有服务内存占用过高", "human",
