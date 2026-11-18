@@ -12,17 +12,17 @@ pi/k230ctl     命令行（唯一入口）
 
 ```bash
 # 1) 拍一张照片（成功时 stdout 只有一行路径，方便 shell 取用）
-IMG=$(/home/cy/k230-vision/pi/k230ctl snap)
+IMG=$(~/ROS-car/pi/k230-vision/pi/k230ctl snap)
 echo "$IMG"                     # /tmp/k230/snap-20260918-081234.jpg
 # 稳定路径始终指向最近一张：/tmp/k230/latest.jpg
 #   ⚠️ 注意：/tmp 是**开机清空**的（实测 /usr/lib/tmpfiles.d/tmp.conf 里是 `D /tmp ... 30d`），
 #   所以重启后这两个文件会消失，要等下一次 snap / 下一条结果才回来。
 
 # 2) 看最近一条视觉结果（K230 的 KPU 推理结果）
-/home/cy/k230-vision/pi/k230ctl result --json
+~/ROS-car/pi/k230-vision/pi/k230ctl result --json
 
 # 3) 看状态（resultd 在不在、连没连上、照片有没有）
-/home/cy/k230-vision/pi/k230ctl status
+~/ROS-car/pi/k230-vision/pi/k230ctl status
 ```
 
 `k230ctl snap --help` 看全部参数。
@@ -94,8 +94,8 @@ WiFi 是异步换的，失败自动回滚且**不落盘**；结果看 `k230ctl c
 
 | 症状 | 先看这个 |
 |---|---|
-| `SNAP FAILED: 没抓到可用的 JPEG（中间产物 0 字节）` | K230 的 RTSP 起手偶发死掉。`snap` 已自动重试 3 次；仍失败就查 `ping 192.168.1.112` 和 8554 端口 |
-| `result` 说「还没有收到任何结果」 | `systemctl status k230-resultd`；再看板子能不能到 `192.168.1.108` |
+| `SNAP FAILED: 没抓到可用的 JPEG（中间产物 0 字节）` | K230 的 RTSP 起手偶发死掉。`snap` 已自动重试 3 次；仍失败就查 `k230ctl status` 里的板子地址和 8554 端口 |
+| `result` 说「还没有收到任何结果」 | `systemctl status k230-resultd`；再看板子能不能到 Pi 当前 IP（`k230ctl config` 的 `result_host`） |
 | `status` 报「状态文件 Ns 没更新」 | 守护进程死了（或端口被别的进程占了）：`journalctl -u k230-resultd -n 50` |
 | 照片是花屏 | 看 stderr 有没有 `WARN 只攒到 N 帧`；有的话说明没跨过 IDR，抬高 `--min-frames` 或先给板子接个视频接收端 |
 
