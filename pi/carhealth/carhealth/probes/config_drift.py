@@ -47,6 +47,8 @@ class ConfigDriftProbe:
         self.units = tuple(units)
         self._runner = runner
         self._clock = clock
+        self._ordering = None
+        self._ordering_retry = 0.0
 
     def _run(self, cmd, timeout=5):
         try:
@@ -57,12 +59,20 @@ class ConfigDriftProbe:
     def poll(self) -> ProbeResult:
         ev: dict = {"errors": []}
 
-        r = self._run(["journalctl", "-b", "--no-pager", "-g", "ordering cycle",
-                       "-o", "cat"])
-        if r is not None and r.returncode == 0:
-            ev["ordering_cycles"] = parse_ordering_cycles(r.stdout)
-        else:
-            ev["errors"].append("journalctl 不可读")
+        # `journalctl -g` 在全量 boot 日志上可能超过 5s，而且「没有匹配」会返回 1
+        # （不是错误）。改成有界的最近 5000 行 + Python 过滤，并在本次启动内缓存：
+        # ordering cycle 是开机事件，不需要每次轮询都重扫。
+        now = self._clock()
+        if self._ordering is None and now >= self._ordering_retry:
+            r = self._run(["journalctl", "-b", "-n", "5000", "--no-pager", "-o", "cat"],
+                          timeout=10)
+            if r is not None and r.returncode == 0:
+                self._ordering = parse_ordering_cycles(r.stdout)
+            else:
+                self._ordering_retry = now + 300
+                ev["errors"].append("journalctl 不可读（5 分钟后重试）")
+        if self._ordering is not None:
+            ev["ordering_cycles"] = self._ordering
 
         dead = []
         for unit in self.units:

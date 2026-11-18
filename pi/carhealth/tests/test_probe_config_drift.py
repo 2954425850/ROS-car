@@ -14,6 +14,28 @@ def test_parse_ordering_cycles():
     assert parse_ordering_cycles("nothing") == 0
 
 
+def test_ordering_scan_is_bounded_and_cached(tmp_path):
+    calls = []
+
+    def runner(cmd, **kw):
+        if cmd[0] == "journalctl":
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "ordering cycle here\n", "")
+        if cmd[0] == "systemctl":
+            return subprocess.CompletedProcess(
+                cmd, 0, "ActiveState=active\nUnitFileState=enabled\n", "")
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, "main\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    p = ConfigDriftProbe(repo=str(tmp_path), rules_dir=str(tmp_path),
+                         packages=[], units=[], runner=runner)
+    p.poll()
+    p.poll()
+    assert len(calls) == 1, "同一 boot 内只该扫一次 journal"
+    assert "-n" in calls[0] and "5000" in calls[0]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows 路径分隔符与测试假路径不一致")
 def test_build_stale_packages_uses_source_vs_install_mtime():
     mtimes = {
