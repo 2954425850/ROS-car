@@ -12,6 +12,17 @@
     k230ctl pt U V [--size S]       指定一个点（归一化），板子自动开方框并跟住
     k230ctl box L T R B             直接给一个归一化框
 
+    k230ctl config [--json]         看板子当前 WiFi SSID / 接收端地址（8558）
+    k230ctl config --result-host H --push-host H
+                                    改地址（落 config_remote.json，重启后仍生效）
+    k230ctl config --wifi-ssid S --wifi-pass P
+                                    换 WiFi（失败板子自动回滚；换网后 IP 可能变）
+    k230ctl config --clear          删远程配置（重启后回到 config_local）
+
+    k230ctl switch-net --ssid NEW [--password P] [--new-host IP]
+                                    换 WiFi 时把 K230 的 WiFi + 指向一起迁过去
+                                    （默认转到后台；日志 /tmp/k230/switch-net-*.log）
+
 `snap` 成功时把最终 JPEG 的路径打到 stdout（退出码 0），失败打原因到 stderr（退出码 1）。
 默认输出「只有一行路径」，方便 shell 直接取用：  IMG=$(k230ctl snap)
 """
@@ -142,6 +153,99 @@ def cmd_box(args):
     return _send({"box": [args.l, args.t, args.r, args.b]}, args)
 
 
+def _print_config(r):
+    c = r.get("config") or {}
+    print("board %s" % r.get("ip"))
+    print("  wifi_ssid     = %s  (%s)"
+          % (c.get("wifi_ssid"),
+             "password set" if c.get("wifi_pass_set") else "NO password"))
+    print("  push_host     = %s" % c.get("push_host"))
+    print("  result_host   = %s" % c.get("result_host"))
+    ob = c.get("obstacle_host")
+    print("  obstacle_host = %s"
+          % ("(follow result_host)" if ob is None else ob))
+    rk = r.get("remote_keys") or []
+    print("remote override: %s" % (", ".join(rk) if rk else "(none)"))
+    la = r.get("last_apply")
+    if la:
+        print("last_apply: t=%s ok=%s %s"
+              % (la.get("t"), la.get("ok"), la.get("detail") or ""))
+
+
+def cmd_config(args):
+    if args.clear:
+        payload = {"cmd": "config_clear"}
+    else:
+        payload = {"cmd": "config_set"}
+        if args.wifi_ssid is not None:
+            payload["wifi_ssid"] = args.wifi_ssid
+        if args.wifi_pass is not None:
+            payload["wifi_pass"] = args.wifi_pass
+        if args.push_host is not None:
+            payload["push_host"] = args.push_host
+        if args.result_host is not None:
+            payload["result_host"] = args.result_host
+        if args.obstacle_host is not None:
+            # 空串 = 跟随 result_host（显式写出来，别靠"没给这个参数"）
+            payload["obstacle_host"] = args.obstacle_host or None
+        if len(payload) == 1:            # 什么都没给 -> 只查
+            payload = {"cmd": "config_get"}
+    try:
+        r = k230pi.send_config(payload, host=args.host)
+    except k230pi.ConfigError as e:
+        print("CONFIG FAILED: %s" % e, file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(r, ensure_ascii=False))
+        return 0 if r.get("ok") else 1
+    if not r.get("ok"):
+        print("err: %s" % r.get("err"), file=sys.stderr)
+        return 1
+    if payload["cmd"] == "config_get":
+        _print_config(r)
+    else:
+        print("ok%s" % (" —— %s" % r["note"] if r.get("note") else ""))
+        accepted = r.get("accepted") or []
+        if accepted:
+            print("accepted: %s" % ", ".join(accepted))
+    return 0
+
+
+def cmd_switch_net(args):
+    """Pi 换 WiFi 时，把 K230 的 WiFi 与指向地址一起迁过去。
+
+    **默认后台执行**：换 WiFi 会把 SSH（或本地终端所在的那条会话）一起断掉，
+    前台跑的话进程会跟着死。为什么不用 SSH_CONNECTION 判断：`sudo` 默认会
+    清掉这个环境变量，判断不可靠 —— 与其猜，不如默认安全，真要盯着就 --foreground。
+    """
+    import switchnet
+    pw = args.password if args.password is not None \
+        else os.environ.get("K230_WIFI_PASS")
+    if args.foreground:
+        return switchnet.run(ssid=args.ssid, password=pw,
+                             new_host=args.new_host, timeout=args.timeout,
+                             pi_timeout=args.pi_timeout, iface=args.iface,
+                             hidden=args.hidden,
+                             no_pi_switch=args.no_pi_switch,
+                             board_host=args.board_host,
+                             board_new_host=args.board_new_host, log=print)
+    try:
+        hint = switchnet.permission_hint()
+    except switchnet.SwitchError:
+        hint = None
+    if hint:
+        # **不往下走**：先把板子弄到新网、Pi 却换不过去 = 两边失联。
+        print("nmcli 的 network-control 权限是 %r（不是 yes）—— 现在换 WiFi 多半会失败。\n"
+              "请用 `sudo k230ctl switch-net ...` 重跑（sudo 下这个检查会通过）。"
+              % hint, file=sys.stderr)
+        return 1
+    log_path = switchnet.detach(sys.argv[1:])
+    print("已在后台执行（换 WiFi 会断开当前连接）。日志：%s" % log_path)
+    print("跟踪进度：tail -f %s" % log_path)
+    print("完成后看：k230ctl config")
+    return 0
+
+
 def cmd_status(args):
     st = k230pi.read_status()
     age = k230pi.status_age_s()
@@ -247,6 +351,48 @@ def main(argv=None):
     bx.add_argument("b", type=float)
     bx.add_argument("--json", action="store_true")
     bx.set_defaults(func=cmd_box)
+
+    cf = sub.add_parser(
+        "config", help="查看/修改板子的 WiFi 与接收端地址（8558，落 config_remote.json）")
+    cf.add_argument("--wifi-ssid", help="要连的 WiFi 名")
+    cf.add_argument("--wifi-pass",
+                    help="WiFi 密码（8..63 字符；开放网络给空串）")
+    cf.add_argument("--push-host", help="推流(8555)/结果(8556)/避障(8559)的目标 IP")
+    cf.add_argument("--result-host", help="结构化结果上报目标 IP")
+    cf.add_argument("--obstacle-host", default=None,
+                    help='避障数据目标 IP；空串 = 跟随 result_host')
+    cf.add_argument("--clear", action="store_true",
+                    help="删掉远程配置（运行时不变，重启后回到 config_local）")
+    cf.add_argument("--host", default=None, help="K230 地址（默认自动发现）")
+    cf.add_argument("--json", action="store_true")
+    cf.set_defaults(func=cmd_config)
+
+    sn = sub.add_parser(
+        "switch-net",
+        help="Pi 换 WiFi 时，把 K230 的 WiFi 和指向地址一起迁过去")
+    sn.add_argument("--ssid", required=True,
+                    help="目标 WiFi 名（Pi 和 K230 都要连的那个）")
+    sn.add_argument("--password",
+                    help="目标 WiFi 密码（也可用环境变量 K230_WIFI_PASS；"
+                         "不给则只改 SSID，密码沿用板子现有的）")
+    sn.add_argument("--new-host",
+                    help="Pi 在目标网的固定 IP（有 DHCP 保留就给，最稳；"
+                         "不给就切完后在新网扫描找板子）")
+    sn.add_argument("--board-host", help="K230 当前（旧网）地址，默认自动发现")
+    sn.add_argument("--board-new-host",
+                    help="K230 在目标网的地址（DHCP 保留时可用，省掉扫描；"
+                         "非 /24 网段或扫描被隔离时也该给）")
+    sn.add_argument("--iface", help="Pi 的 WiFi 接口名（默认自动取已连接的）")
+    sn.add_argument("--hidden", action="store_true", help="目标 WiFi 是隐藏 SSID")
+    sn.add_argument("--no-pi-switch", action="store_true",
+                    help="Pi 由你自己换网，本命令只安排 K230、之后等 Pi 换过去")
+    sn.add_argument("--timeout", type=float, default=90.0,
+                    help="在新网找板子的时限（秒，默认 90）")
+    sn.add_argument("--pi-timeout", type=float, default=25.0,
+                    help="等 Pi 拿到新地址的时限（秒，默认 25）")
+    sn.add_argument("--foreground", action="store_true",
+                    help="前台跑（SSH 会随换网断开；本地终端才这么用）")
+    sn.set_defaults(func=cmd_switch_net)
 
     a = ap.parse_args(argv)
     return a.func(a)

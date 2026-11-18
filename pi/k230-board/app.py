@@ -106,6 +106,26 @@ MicroPython 的 _thread 在这块板子上与 MPP 的配合没验证过，**不�
 不能被下一帧的检测器覆盖掉。`{"cmd": "auto"}` 可以切回检测器驱动
 （2026-09-19 加的；在那之前只能重启，这句注释当时写的就是"没有切回来的命令"，已过期）。
 
+## 远程配置入口：Pi 改板子的 WiFi / 指向地址（8558）
+
+`configrx.py` 监听 `config.CONFIG_PORT`（默认 8558），**一次连接一行 JSON**：
+
+    {"cmd": "config_get"}                          # 看当前 WiFi SSID / 三个地址
+    {"cmd": "config_set", "result_host": "..."}    # 只改给的那几项
+    {"cmd": "config_clear"}                        # 删远程配置，重启回 config_local
+
+可设：`wifi_ssid` / `wifi_pass` / `push_host` / `result_host` / `obstacle_host`。
+落盘到 `config_remote.json`（**远程 > config_local**，下次上电仍生效）。
+
+**回 ok 只代表"收到并校验通过"**：
+- 地址类：收到就落盘，主循环里**立刻重指**（关旧 socket，下一轮连新地址）；
+- WiFi 换网是**阻塞**的（`netup.reconnect`），**失败自动回滚**到旧网络 ——
+  不回滚的话，SSID 写错一个字板子就永久失联，只能拔卡。
+  凭据**连上之后才落盘**（坏网络永远不会被写进去）。
+  真实结果看下一次 `config_get` 的 `last_apply`。
+
+⚠️ 这条入口只在**板子还连着网**时有用；已经离线就只剩拔卡改 `config_local.py`。
+
 ## 避障数据：给雷达补盲区（8559）
 
 `obstacles.py` 每 10 Hz 把**这一帧的检测结果**编成「障碍物语义」推给 Pi：
@@ -217,6 +237,8 @@ from targets import (TargetRx, template_crop_side as tside,
 from faces import FaceRecognizer, FaceDB
 import ulab.numpy as np        # 录入去重用（np.dot 两条已归一化特征 = 余弦）
 from watchdog import Watchdog
+from configrx import ConfigRx  # 8558：Pi 远程改 WiFi / 指向地址
+import remote_cfg              # config_remote.json 的读写（WiFi 切换失败要回滚文件）
 
 INFER_HZ = 10.0                 # 推理 + 上报节拍（计划两块都是 0.1 s）
 STATS_MS = 30000                # 30 s 一行 STATS，给长稳测试留证据
@@ -251,6 +273,86 @@ def _obstacles_payload(objs, frame_no, ts_ms, tick_ms=None):
                           zones, bottom_min, h_min)
     free = obstacles.free_zones(objs, zones, bottom_min, h_min)
     return obstacles.encode(obs, free, frame_no, ts_ms, tick_ms=tick_ms)
+
+
+def _apply_remote_config(changes, cfg_rx, pusher, r_pi, r_obs):
+    """应用一条远程配置，返回 True 表示推流目标变了。
+
+    地址类立刻重指（关旧 socket，主循环下一轮连新地址）——它们在 ConfigRx
+    里已经落盘。WiFi 换网**阻塞**，**连上之后才落盘**：失败就回滚到旧网络、
+    一个字都不写，免得下次上电去连那个根本连不上的网（见 configrx.py 文件头）。
+
+    ⚠️ 换 WiFi 最长要 `15s(新网) + 15s(回滚)`，所以调用点在主循环的非推理区
+    （`rx.poll()` 旁边），**绝不能**放进 10 Hz 那段 —— 那会把整条循环拖住。
+    """
+    applied = []
+    net_changed = False
+
+    # ---- 地址类 ----
+    for jk, ck in (("push_host", "PUSH_HOST"),
+                   ("result_host", "RESULT_HOST"),
+                   ("obstacle_host", "OBSTACLE_HOST")):
+        if jk in changes:
+            setattr(config, ck, changes[jk])
+            applied.append(jk)
+
+    if "push_host" in changes:
+        pusher.close()
+        pusher.host = config.PUSH_HOST
+        net_changed = True
+
+    if "result_host" in changes:
+        r_pi.close()
+        r_pi.host = config.RESULT_HOST
+        r_pi._last_fail = None          # 别等 2s 退避窗口，立刻重连
+    if "result_host" in changes or "obstacle_host" in changes:
+        if r_obs is not None:
+            r_obs.close()
+            r_obs.host = config.OBSTACLE_HOST or config.RESULT_HOST
+            r_obs._last_fail = None
+
+    # ---- WiFi（会阻塞；失败只回滚网络，不写盘）----
+    ok = True
+    detail = None
+    if "wifi_ssid" in changes or "wifi_pass" in changes:
+        ssid = changes.get("wifi_ssid", config.WIFI_SSID)
+        pw = changes.get("wifi_pass", config.WIFI_PASS)
+        print("CONFIG wifi -> ssid=%r 换网中（失败自动回滚）" % ssid)
+        try:
+            ok, detail = netup.reconnect(ssid, pw)
+        except BaseException as e:
+            # 配置出错不能把整条视觉管线拖崩（同人脸加载那套原则）
+            ok, detail = False, "reconnect raised %s: %s" % (type(e).__name__, e)
+        if ok:
+            config.WIFI_SSID = ssid
+            config.WIFI_PASS = pw
+            applied.append("wifi")
+            # **连上了才落盘** —— 程序顺序就是"先证明这个网能用，再记住它"。
+            # 只写 Pi 真正给的那几项，没给的那项继续跟 config_local。
+            wifi_changes = {}
+            for k in ("wifi_ssid", "wifi_pass"):
+                if k in changes:
+                    wifi_changes[k] = changes[k]
+            try:
+                remote_cfg.save(wifi_changes)
+            except BaseException as e:
+                detail = "%s (但落盘失败: %s —— 本次生效，重启后会丢)" % (detail, e)
+                print("CONFIG wifi save FAILED: %s" % e)
+        # 换网（成功或回滚）后旧 socket 全废了，关掉让主循环立刻重建
+        pusher.close()
+        r_pi.close()
+        r_pi._last_fail = None
+        if r_obs is not None:
+            r_obs.close()
+            r_obs._last_fail = None
+        net_changed = True
+        print("CONFIG wifi %s: %s" % ("OK" if ok else "FAILED", detail))
+
+    if cfg_rx is not None:
+        cfg_rx.last_apply = {"t": int(time.time()), "ok": ok, "detail": detail}
+    if applied:
+        print("CONFIG applied: %s" % ",".join(applied))
+    return net_changed
 
 
 def main():
@@ -312,6 +414,11 @@ def main():
           "{\"cmd\":\"stop\"|\"auto\"|\"follow\",\"who\":\"id1\"} / "
           "{\"cmd\":\"enroll\"|\"forget\",\"id\":\"u001\"})"
           % config.TARGET_PORT)
+
+    # 远程配置入口（8558）：Pi 改 WiFi / 指向地址。同样必须在 netup 之后 bind。
+    cfg_rx = ConfigRx(config.CONFIG_PORT)
+    print("CONFIGRX OK port=%d  ({\"cmd\":\"config_get\"|\"config_set\"|"
+          "\"config_clear\"})" % config.CONFIG_PORT)
 
     # ---- 人脸：检测/对齐/特征/活体 + 特征库。**建在 Camera 之前**（同 Detector/Tracker）----
     # ⚠️ 加载失败**不能拖垮整个 app** —— 禁掉人脸、其余照常。
@@ -466,6 +573,15 @@ def main():
 
             # 2b) 外部目标框入口（非阻塞；只有人来命令时才有活）
             rx.poll()
+
+            # 2c) 远程配置入口（8558）。收/校验/落盘在 poll 里做（非阻塞），
+            #     **应用**在这里做：换 WiFi 会阻塞几十秒，所以不能放进 3) 的 10 Hz 块。
+            cfg_rx.poll()
+            _kind, _payload = cfg_rx.take()
+            if _kind == "set":
+                if _apply_remote_config(_payload, cfg_rx,
+                                        pusher, r_pi, r_obs):
+                    t_push_retry = time.ticks_ms()   # 新目标立刻重连，别等 10s 退避
 
             # 3) 10 Hz：推理 + 上报（同一节拍，见文件头"偏离"）
             now = time.ticks_ms()
@@ -845,6 +961,10 @@ def main():
             rx.close()
         except Exception as e:
             print("app: rx.close EXC", e)
+        try:
+            cfg_rx.close()
+        except Exception as e:
+            print("app: cfg_rx.close EXC", e)
         try:
             if fdb is not None:
                 n = fdb.flush()      # 退出前把增量入库的改动落盘

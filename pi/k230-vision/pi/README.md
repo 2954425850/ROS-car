@@ -61,6 +61,35 @@ journalctl -u k230-resultd -f
    无接收端时板子主循环被拖慢，结果只有 **~0.9 Hz**；有接收端时回到 **~9.5 Hz**。
    所以「结果怎么半天才来一条」通常不是 Pi 侧的问题，是板子那边没人收视频。
 
+## 改板子的 WiFi / 上报地址（8558）
+
+`k230ctl config` 系列，不用拔卡：
+
+```bash
+./k230ctl config                                      # 看当前值
+./k230ctl config --result-host 10.64.35.7 --push-host 10.64.35.7
+./k230ctl config --wifi-ssid MyWiFi --wifi-pass 'secret123'
+./k230ctl config --clear                              # 删远程配置（重启后回 config_local）
+```
+
+板子把值写进 `/sdcard/k230vision/config_remote.json`，**优先于 `config_local.py`**。
+WiFi 是异步换的，失败自动回滚且**不落盘**；结果看 `k230ctl config` 的 `last_apply`。
+细节与边界（板子已离线时无解、无鉴权）见
+`../docs/K230-Pi端对接说明.md` §4。
+
+## Pi 换 WiFi（K230 一起迁）
+
+```bash
+./k230ctl switch-net --ssid NewWiFi --new-host 10.64.35.7   # Pi 有固定 IP：最稳
+./k230ctl switch-net --ssid NewWiFi --password '...'         # IP 未知：新网扫描找板子
+```
+
+先在旧网把 K230 安排好，再切 Pi，最后在新网验证结果流 —— 顺序不能反（Pi 离开旧网
+就够不到板子了）。**默认后台执行**（换网会断 SSH），进度看
+`/tmp/k230/switch-net-*.log`，结果看 `/tmp/k230/switch-net-status.json`。
+失败与硬件前提（K230 只支持 2.4GHz、访客网隔离）见
+`../docs/K230-Pi端对接说明.md` §5。
+
 ## 排查
 
 | 症状 | 先看这个 |

@@ -27,6 +27,8 @@ RTSP_URL = "rtsp://%s:%d/%s" % (K230_HOST, RTSP_PORT, RTSP_SESSION)
 
 RESULT_PORT = 8556          # 与 K230 侧 config.py 的 RESULT_PORT 一致
 TARGET_PORT = 8557          # 与 K230 侧 config.py 的 TARGET_PORT 一致
+CONFIG_PORT = 8558          # 与 K230 侧 config.py 的 CONFIG_PORT 一致（改 WiFi/地址）
+CONFIG_TIMEOUT = 5.0        # 回 ok 只代表"收到并通过校验"；换网在板子主循环里异步做
 # ⚠️ 要盖过板子那边的 FOLLOW_TIMEOUT_MS（8s）：`cmd=follow` 是**锁上之后**才回 ok 的，
 # 中间那 8 秒都在等正脸。超时给短了会把"还没锁上"误判成"板子没响应"。
 TARGET_TIMEOUT = 10.0
@@ -81,6 +83,10 @@ class SnapError(RuntimeError):
 
 class TargetError(RuntimeError):
     """给 K230 发目标命令失败（连不上 / 没应答 / 应答不是 JSON）。"""
+
+
+class ConfigError(RuntimeError):
+    """给 K230 发配置命令失败（连不上 / 没应答 / 应答不是 JSON）。"""
 
 
 def ensure_out_dir():
@@ -542,14 +548,11 @@ def rtsp_url():
     return "rtsp://%s:%d/%s" % (board_host(), RTSP_PORT, RTSP_SESSION)
 
 
-def send_target(payload, host=None, port=TARGET_PORT, timeout=TARGET_TIMEOUT):
-    """给 K230 发一条目标命令（**一次连接一条**），返回它的应答 dict。
+def _request(payload, port, timeout, exc, host=None):
+    """给 K230 发一条一行 JSON 命令（**一次连接一条**），返回应答 dict。
 
     板子那边的约定：连接 → 发一行 JSON → 收一行 JSON → 关。没有长连接。
-
-    ⚠️ 板子**一收到就回 ok**（targets.TargetRx.poll），follow/enroll 的真实结果要看
-    8556 结果流（follow：objs 里出现 src=track；enroll：`enroll` 字段）。
-    （这里原来写"follow 锁上之后才回 ok"，与板子代码不符，2026-10-21 更正。）
+    失败一律抛 `exc`（TargetError / ConfigError）。
     """
     import socket
     host = host or board_host()
@@ -557,7 +560,7 @@ def send_target(payload, host=None, port=TARGET_PORT, timeout=TARGET_TIMEOUT):
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
     except OSError as e:
-        raise TargetError("连不上 K230 %s:%d —— %s" % (host, port, e))
+        raise exc("连不上 K230 %s:%d —— %s" % (host, port, e))
     buf = b""
     try:
         sock.sendall(line)
@@ -568,18 +571,44 @@ def send_target(payload, host=None, port=TARGET_PORT, timeout=TARGET_TIMEOUT):
                 break
             buf += chunk
     except OSError as e:
-        raise TargetError("发完命令没收到应答 —— %s" % e)
+        raise exc("发完命令没收到应答 —— %s" % e)
     finally:
         try:
             sock.close()
         except OSError:
             pass
     if not buf.strip():
-        raise TargetError("K230 没回应答（连接被关？）")
+        raise exc("K230 没回应答（连接被关？）")
     try:
         return json.loads(buf.split(b"\n")[0].decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as e:
-        raise TargetError("应答不是 JSON: %r" % buf[:80])
+        raise exc("应答不是 JSON: %r" % buf[:80])
+
+
+def send_target(payload, host=None, port=TARGET_PORT, timeout=TARGET_TIMEOUT):
+    """给 K230 发一条目标命令（**一次连接一条**），返回它的应答 dict。
+
+    ⚠️ 板子**一收到就回 ok**（targets.TargetRx.poll），follow/enroll 的真实结果要看
+    8556 结果流（follow：objs 里出现 src=track；enroll：`enroll` 字段）。
+    （这里原来写"follow 锁上之后才回 ok"，与板子代码不符，2026-10-21 更正。）
+    """
+    return _request(payload, port, timeout, TargetError, host)
+
+
+def send_config(payload, host=None, port=CONFIG_PORT, timeout=CONFIG_TIMEOUT):
+    """给 K230 发一条配置命令（8558，**一次连接一条**），返回它的应答 dict。
+
+    ⚠️ **ok 只代表"收到、校验通过、已落盘"**（configrx.ConfigRx.poll）。
+       改 WiFi 时真正的换网在板子主循环里异步做，失败会自动回滚；
+       结果看下一次 `get_config()` 的 `last_apply`。
+       换网成功后板子的 IP 可能变 —— 用 `board_host()` 重新发现，别写死。
+    """
+    return _request(payload, port, timeout, ConfigError, host)
+
+
+def get_config(host=None, timeout=CONFIG_TIMEOUT):
+    """读板子当前的 WiFi SSID 与接收端地址（密码只回是否已设置）。"""
+    return send_config({"cmd": "config_get"}, host=host, timeout=timeout)
 
 
 PEOPLE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "people.json")

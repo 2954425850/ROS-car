@@ -18,6 +18,11 @@
 **/config_local.py
 !**/config_local.py.example
 
+# K230 远程配置：Pi 经 8558（configrx.py）下发后板子自己写出的文件。
+# 是**机器生成**的，且可能含 WiFi 密码 —— 不入库。见 pi/k230-board/remote_cfg.py。
+**/config_remote.json
+**/config_remote.json.new
+
 # ---- Python ----
 __pycache__/
 *.py[cod]

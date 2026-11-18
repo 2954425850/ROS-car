@@ -83,3 +83,72 @@ def ensure(timeout_s=20):
         pass
     time.sleep(0.5)
     return connect(timeout_s)
+
+
+def creds():
+    """当前在用的 (ssid, password)。"""
+    return (_SSID, _PASS)
+
+
+def _drop():
+    """断开并把状态清干净，供 reconnect 用。
+
+    `disconnect()` 之后 WLAN 不是立刻回到"未连接"。**必须等到 is_up() 真的变 False**
+    再 connect —— 否则新一次 connect() 可能被旧连接吞掉：以为换网成功，
+    实际上还在旧网上（那是最坏的结果：回滚也没触发，下次上电才发现）。
+    """
+    try:
+        _wlan.disconnect()
+    except Exception:
+        pass
+    t0 = time.time()
+    while time.time() - t0 < 5 and is_up():
+        time.sleep(0.2)
+    time.sleep(0.5)
+
+
+def reconnect(ssid, password, timeout_s=15):
+    """换 WiFi（SSID/密码）并重连；**失败自动回滚到原来的网络**。
+
+    返回 `(ok, detail)`：
+
+        (True,  "unchanged")                      —— 跟现在一样，什么都没做
+        (True,  "connected 10.64.35.109")         —— 换过去了（IP 可能变了）
+        (False, "new wifi failed -> reverted to X") —— 新网连不上，已回到旧网
+        (False, "new wifi failed AND rollback failed ...") —— 两头都没连上（要救援）
+
+    ## 为什么要回滚（这不是可选项）
+
+    远程换 WiFi 最危险的失败模式是：**新 SSID 写错一个字，板子从此不在任何网上**，
+    网络入口全部消失，只能拔卡。回滚把"换错"变成"白折腾一次"：
+    这里把 WLAN 拉回旧网络，调用方（app.py）则**只在成功后才写盘** ——
+    坏凭据根本不会进 config_remote.json，下次上电不受影响。
+
+    ## 代价
+
+    这个函数会**阻塞**：新网最多等 `timeout_s`，回滚再最多等 `timeout_s`。
+    期间没有推流、没有上报。它是显式的配置命令，不是常态路径，可以接受；
+    但**绝不能**放在 10 Hz 那段里（见 app.py 主循环的节流约定）。
+
+    ⚠️ **未在真机上验证过换网路径**（2026-11-18 写代码时板子没在线）。
+    第一次现场使用时盯着串口：成功应看到 `WIFI OK <新IP>`，
+    失败应看到回滚后的 `WIFI OK <旧IP>`。
+    """
+    global _SSID, _PASS
+    old = (_SSID, _PASS)
+    if (ssid, password) == old:
+        return (True, "unchanged")
+
+    _SSID, _PASS = ssid, password
+    _drop()
+    if connect(timeout_s):
+        return (True, "connected %s" % ip())
+
+    # 新网失败 -> 回滚。**用旧凭据再连一次**，成功了板子就还在网上。
+    _SSID, _PASS = old
+    _drop()
+    if connect(timeout_s):
+        print("WIFI ROLLBACK OK -> %s (%s)" % (ip(), old[0]))
+        return (False, "new wifi failed -> reverted to %s" % old[0])
+    print("WIFI ROLLBACK FAILED —— 板子现在不在网上，只能拔卡改 config_local.py")
+    return (False, "new wifi failed AND rollback failed (old=%s)" % old[0])

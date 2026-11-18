@@ -14,6 +14,15 @@
 仓库是**公开**的，而这里有 WiFi 密码和局域网地址。所以 `config.py`（入库）
 只留 `REPLACE_ME` 占位符，真值放本文件（`.gitignore` 里已排除）。
 
+## 和 config_remote.json 的关系（2026-11-18）
+
+Pi 可以通过 8558 远程改 WiFi 与地址（`k230ctl config ...`），那些值落在
+同目录的 `config_remote.json` 里，**优先级高于本文件**。所以：
+
+- 本文件仍是"出厂/人工"真值，推荐照旧写全；
+- 远程改过的项会盖住本文件里的同名项，直到 `k230ctl config --clear`（重启生效）；
+- 排查"我明明改了这个文件怎么没生效"时，先看板上有没有 `config_remote.json`。
+
 ## ⚠️ 没有这个文件会怎样
 
 板子连不上 WiFi → `app.py` 一直打 `WIFI FAILED, retry` → **不进主循环**：

@@ -6,10 +6,12 @@
 本仓库是**公开**的，所以 WiFi 凭据与局域网地址不入库，拆到同目录的
 `config_local.py` 里：
 
-    本文件（入库）     占位符 + 与机器无关的参数（分辨率/阈值/端口号…）
-    config_local.py    真值：WiFi SSID/密码、各主机地址 —— **不入库**（见 .gitignore）
+    本文件（入库）       占位符 + 与机器无关的参数（分辨率/阈值/端口号…）
+    config_local.py      真值：WiFi SSID/密码、各主机地址 —— **人写，不入库**
+    config_remote.json   Pi 经 8558 下发的覆盖值 —— **机器生成，不入库**
 
-覆盖机制就是文件**末尾**那句 `from config_local import *`。
+覆盖机制就是文件**末尾**那句 `from config_local import *`；之后还会读
+`config_remote.json` 再覆盖一遍（**远程 > 本地**，见文件末尾那段）。
 
 ⚠️ **板上必须有 config_local.py**，否则连不上 WiFi。症状是 app.py 一直打
 `WIFI FAILED, retry`，**看起来像板子坏了，其实只是配置文件缺了**（见
@@ -194,6 +196,11 @@ TRACK_IOU_MIN = 0.3     # 与检测框的 IoU 下限（暂定）
 TARGET_PORT = 8557
 TARGET_SIZE = 0.12      # 只给点时，默认方框边长占画面宽度的比例
 
+# ---- 远程配置入口（configrx.py，2026-11-18）----
+# 让 Pi 改 WiFi 与各接收端地址，不用拔卡。协议见 configrx.py 文件头。
+# 与 8557（目标框）分开：一个是"跟什么"，一个是"板子自己怎么联网/往哪发"。
+CONFIG_PORT = 8558
+
 # 「跟着某个人」（cmd=follow）等正脸等多久。超时就放弃，且**不动 det_auto** ——
 # 人不在画面里不该把板子自带的自动锁定废掉。
 FOLLOW_TIMEOUT_MS = 8000
@@ -254,10 +261,63 @@ try:
 except ImportError:
     _LOCAL_OK = False
 
-if (not _LOCAL_OK) or WIFI_SSID == "REPLACE_ME":
+
+# ============================================================================
+# 远程配置覆盖（2026-11-18）—— **必须在 config_local 之后**
+# ============================================================================
+#
+# Pi 通过 8558（configrx.py）下发的那几项，落在同目录的
+# `config_remote.json`（**机器生成**，不入库）。这里读它并覆盖同名项。
+#
+# **优先级：远程 > config_local > 本文件的默认值。**
+# 撤销远程配置：删掉板上这个文件（或 Pi 跑 `k230ctl config --clear`），重启即可。
+#
+# 为什么远程配置单独一个 JSON 而不是让 Pi 重写 config_local.py：
+# config_local.py 是**人**写的、带注释、可能有别的键；脚本重写会把这些一起抹掉。
+# 详见 remote_cfg.py 文件头。
+REMOTE_CFG_FILE = "/sdcard/k230vision/config_remote.json"
+_REMOTE_APPLIED = []
+try:
+    try:
+        import ujson as _cfgjson
+    except ImportError:
+        import json as _cfgjson          # PC 上 import config 做检查时用
+    try:
+        with open(REMOTE_CFG_FILE) as _f:
+            _rd = _cfgjson.loads(_f.read())
+    except OSError:
+        _rd = None                       # 没有远程配置 —— 常态
+    # 逐项显式覆盖（不用 globals() 写字典：MicroPython 上没必要冒这个险）
+    if isinstance(_rd, dict):
+        if "wifi_ssid" in _rd:
+            WIFI_SSID = _rd["wifi_ssid"]
+            _REMOTE_APPLIED.append("WIFI_SSID")
+        if "wifi_pass" in _rd:
+            WIFI_PASS = _rd["wifi_pass"]
+            _REMOTE_APPLIED.append("WIFI_PASS")
+        if "push_host" in _rd:
+            PUSH_HOST = _rd["push_host"]
+            _REMOTE_APPLIED.append("PUSH_HOST")
+        if "result_host" in _rd:
+            RESULT_HOST = _rd["result_host"]
+            _REMOTE_APPLIED.append("RESULT_HOST")
+        if "obstacle_host" in _rd:
+            OBSTACLE_HOST = _rd["obstacle_host"]
+            _REMOTE_APPLIED.append("OBSTACLE_HOST")
+except Exception as _e:
+    print("!!! config_remote.json 读取失败（%s），忽略（按 config_local 跑）" % _e)
+
+if _REMOTE_APPLIED:
+    print("CONFIG remote overrides: %s (%s)"
+          % (",".join(_REMOTE_APPLIED), REMOTE_CFG_FILE))
+
+
+# 真值缺了才报 —— 只缺 config_local.py 但远程配置补全了全部三样，不算故障。
+if WIFI_SSID == "REPLACE_ME" or PUSH_HOST == "REPLACE_ME" or RESULT_HOST == "REPLACE_ME":
     print("!!! ------------------------------------------------------------")
-    print("!!! config_local.py 缺失，或没覆盖 WIFI_SSID/WIFI_PASS")
+    print("!!! 环境真值没配全（WiFi 或接收端地址仍是 REPLACE_ME）")
     print("!!! 板子将连不上 WiFi（且看起来像硬件故障）。")
-    print("!!! 把 config_local.py 放到 /sdcard/k230vision/ 下再上电。")
-    print("!!! 该文件不入库；模板见 pi/k230-board/config_local.py.example")
+    print("!!! 补法一：把 config_local.py 放到 /sdcard/k230vision/ 下再上电")
+    print("!!!         （模板见 pi/k230-board/config_local.py.example，不入库）")
+    print("!!! 补法二：让 Pi 通过 8558 下发（落 config_remote.json；板子得先在线）")
     print("!!! ------------------------------------------------------------")

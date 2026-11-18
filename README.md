@@ -31,6 +31,9 @@ pi/                     # 树莓派（nepu）上的东西
 - `k230-board/config_local.py` —— K230 的 **WiFi 密码**与局域网地址。
   `config.py` 入库、只留 `REPLACE_ME` 占位符，末尾 `from config_local import *` 覆盖过去。
   只入库 `config_local.py.example`。**板子上没有这个文件就连不上 WiFi**（见下）。
+- `k230-board/config_remote.json` —— Pi 经 **8558** 下发到板子上的覆盖值
+  （`k230ctl config ...` 生成，含 WiFi 密码）。**机器生成，不入库**；
+  优先级高于 `config_local.py`。`k230ctl config --clear` 可删。
 - `logs/`、`build/`、`install/`、`log/`、`__pycache__/`、`*.tar.gz`
 - `*.raw` / `*.bin` —— 抓图原始数据
 
