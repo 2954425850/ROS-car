@@ -30,7 +30,24 @@ def test_probe_reads_default_gateway():
     r = GatewayLatencyProbe(runner=runner).poll()
     assert r.ok is True
     assert r.evidence["gateway"] == "192.168.1.1"
-    assert r.evidence["rtt_avg_ms"] == 141.130
+    assert r.evidence["rtt_avg_ms"] == 141.1
+
+
+def test_single_spike_is_smoothed():
+    fast = PING.replace("3.896/141.130/321.789/133.362", "3.0/10.0/12.0/2.0")
+    slow = PING.replace("3.896/141.130/321.789/133.362", "3.0/400.0/500.0/300.0")
+    outputs = iter([fast, slow, fast, fast, fast])
+
+    def runner(cmd, **kw):
+        out = ("default via 192.168.1.1 dev wlan0\n"
+               if cmd[0] == "ip" else next(outputs))
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+    probe = GatewayLatencyProbe(runner=runner)
+    for _ in range(5):
+        r = probe.poll()
+    assert r.evidence["rtt_avg_ms"] == 10.0
+    assert r.evidence["samples"] == 5
 
 
 def test_no_gateway_is_unknown():

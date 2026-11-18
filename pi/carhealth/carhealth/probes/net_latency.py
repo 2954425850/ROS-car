@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import subprocess
 import time
+from collections import deque
 
 from ..types import ProbeResult
 
@@ -38,6 +39,9 @@ class GatewayLatencyProbe:
     def __init__(self, runner=subprocess.run, clock=time.monotonic):
         self._runner = runner
         self._clock = clock
+        # 单次 ping 的尖峰很常见（尤其手机热点）；规则看 5 次中位数。
+        self._avg_hist: deque[float] = deque(maxlen=5)
+        self._mdev_hist: deque[float] = deque(maxlen=5)
 
     def _gateway(self) -> str | None:
         try:
@@ -63,4 +67,13 @@ class GatewayLatencyProbe:
             return ProbeResult(ok=None, error="ping 网关失败: %r" % (e,))
         ev = {"gateway": gateway}
         ev.update(parse_ping(r.stdout))
+        if "rtt_avg_ms" in ev:
+            self._avg_hist.append(ev["rtt_avg_ms"])
+            ev["rtt_avg_ms"] = round(
+                sorted(self._avg_hist)[len(self._avg_hist) // 2], 1)
+        if "rtt_mdev_ms" in ev:
+            self._mdev_hist.append(ev["rtt_mdev_ms"])
+            ev["rtt_mdev_ms"] = round(
+                sorted(self._mdev_hist)[len(self._mdev_hist) // 2], 1)
+        ev["samples"] = len(self._avg_hist)
         return ProbeResult(ok=True, evidence=ev)
