@@ -5924,3 +5924,34 @@ git commit -m "test(health): 一期故障注入脚本与验收记录"
 **类型一致性：** `Evaluation.evidence` / `ComponentState.evidence` 都是 `dict[probe名, dict]`；`ComponentState.diagnoses` 与 `Diagnosis` 同型；所有组件名、探针名在 Task 4 的 `known_probes` 与 Task 12 的装配中一致；`fingerprint` 在 Task 2 定义、Task 11 使用；`FaultContext` 在 Task 9A 定义、Task 10 使用。
 
 **测试数量核对（执行时以实际收集数为准，不以此处数字为准）：** 计划里写的 passed 数是估算；新增/修改测试后先跑一次 `pytest --collect-only -q` 核对，再更新 Expected。
+
+---
+
+## 现场修订（2026-11-18，Pi 实测）
+
+### CPU 实测与 1Hz 驱动摘要
+
+- 守护直接订阅 `/tof/depth`(30Hz)、`/imu`(50Hz)、`/arm/feedback`(25Hz)、
+  `/wheel_odom`(50Hz)、`/chassis_faults` 等话题时：**稳定 28% CPU / 76MB RSS**。
+- 去掉 `/tof/depth`、`/imu`、`/arm/feedback` 后：**18.4%**，仍偏高。
+- 最终方案：驱动节点新增 **1Hz `/health/driver` JSON 摘要**
+  （`raspot_teleop/driver_health.py` + `l150pro_driver_node.health_tick`），
+  包含 `arm_online/arm_estop/arm_status/ctrl_live/arm_cmd_age_s/chassis_faults/
+  battery_voltage/seen55/seen56/feedback_age_s/telemetry_age_s/cmd_age_s/
+  cmd_vx/cmd_wz/odom_vx/odom_wz`。
+- 守护只订阅 `/health/driver`、`/tof/status`、`/health/arm_grasp`、`/k230/result`：
+  **1.0% CPU / 71MB RSS**（10 秒窗口）。
+- 契约随之调整：`battery`/`chassis`/`arm` 改看 `/health/driver` 字段；
+  `busy.py` 用 `cmd_*`/`odom_*`/`arm_cmd_age_s` 判互锁。
+- 这是 `/tof/status` 契约模式的推广：**节点自己汇总高频数据，守护只读低频摘要**。
+  以后新增组件优先走这个模式，不要把 25/50Hz 话题直接塞给守护。
+
+### 现场发现
+
+- Pi 5 上 `vcgencmd` 读不到 `/dev/vcio`：设备是 `root:video`，而 `cy` 不在
+  `video` 组。已加故障规则 `power.probe_unavailable`（动作类别 `fix_config`，
+  指令：`sudo usermod -aG video cy` 后重新登录/重启服务）。
+- `/etc/udev/rules.d` 缺 `99-tof-a010.rules`：ToF 走 by-id 兜底仍能工作，
+  `tof` 正确判 DEGRADED 并给出 `udev.tof_byid_only` 指令。
+- 现场 `arm-grasp`/`voice`/`k230-framed` 仍是旧代码，`/health/arm_grasp`、
+  语音心跳、framed 状态文件不存在 → 对应组件 STALE，符合“部署未完成”的预期。

@@ -36,6 +36,7 @@
 0xAA 由本节点 25Hz 恒频发送（=链路保活，固件 200ms 看门狗兜底）。
 注意: 串口独占——旧 l150pro-driver / 云端驱动节点与本节点不可同时运行。
 """
+import json
 import signal
 import threading
 import time
@@ -46,10 +47,11 @@ from rclpy.node import Node
 from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, JointState
-from std_msgs.msg import Bool, Float32, Float32MultiArray, Int16MultiArray, Int32
+from std_msgs.msg import Bool, Float32, Float32MultiArray, Int16MultiArray, Int32, String
 from std_srvs.srv import Trigger
 from tf2_ros import TransformBroadcaster
 
+from .driver_health import build_driver_health
 from .odometry import OdomIntegrator
 from .protocol import (ARM_BASE_MAX, ARM_FLAG_KEEP_GRIPPER, ARM_FLAG_REHOME,
                        ARM_GRIP_MAX, ARM_JOINT_MAX, ARM_JOINT_NAMES,
@@ -92,6 +94,8 @@ class SerialState:
         self.ctrl_live = False   # 0x56 byte19: 1 = 固件在 INIT_READY，正在消费 0xAC
         self.seen55 = False
         self.seen56 = False
+        self.last55_mono = None
+        self.last56_mono = None
 
 
 class RxWorker(threading.Thread):
@@ -149,6 +153,7 @@ class RxWorker(threading.Thread):
                             st.voltage_mv = d['voltage_mv']
                             st.faults = d['faults']
                             st.seen55 = True
+                            st.last55_mono = time.monotonic()
                         else:
                             st.joints = d['joints']
                             st.base = d['base']
@@ -159,6 +164,7 @@ class RxWorker(threading.Thread):
                             st.online = bool(d['status'] & 0x01)
                             st.estop_fb = bool(d['status'] & 0x80)
                             st.seen56 = True
+                            st.last56_mono = time.monotonic()
             except Exception as e:
                 print(f'[l150pro] 解析异常: {e}', flush=True)
                 buf.clear()
@@ -277,6 +283,8 @@ class L150ProDriverNode(Node):
         self.pub_driver_fault = self.create_publisher(Int16MultiArray, 'driver_fault', 10)
         self.pub_yaw_loop = self.create_publisher(Float32MultiArray, 'yaw_loop', 10)
         self.pub_raw55 = self.create_publisher(Float32MultiArray, 'chassis/raw55', 10)
+        # 1Hz 健康摘要：carhealth 只订阅这一条，避免在守护里订阅 25/50Hz 话题。
+        self.pub_health = self.create_publisher(String, '/health/driver', 10)
         self.tf_bc = TransformBroadcaster(self)
 
         # 串口线程（喂陀螺/积分里程计）与 chassis_tick（闭环 step）共用
@@ -304,9 +312,15 @@ class L150ProDriverNode(Node):
         #   两个订阅方都与速率无关，已核过：`ps2_teleop.on_fb`（镜像回读进目标 + 1s 操作守卫）、
         #   `arm_recorder.on_fb`（阈值阶跃检测）。
         self.create_timer(1.0 / 25.0, self.feedback_tick)
+        self.create_timer(1.0, self.health_tick)
 
         self.tw = Twist()
         self.tw_time = 0.0
+        self.last_cmd_vx = 0.0
+        self.last_cmd_wz = 0.0
+        self.last_odom_vx = 0.0
+        self.last_odom_wz = 0.0
+        self.arm_cmd_time = 0.0
         self.estop = False
         self.ctrl_ever   = False    # 见过固件报 control-live 吗（老固件恒不报 → 不门）
         self.ctrl_ok_at  = 0.0      # 最近一次看到 control-live 的时刻
@@ -341,6 +355,7 @@ class L150ProDriverNode(Node):
 
     def on_arm(self, msg):
         now = time.monotonic()
+        self.arm_cmd_time = now
         if self.estop:
             return
         with self.state.lock:
@@ -455,6 +470,7 @@ class L150ProDriverNode(Node):
                 track_eff=float(self.get_parameter('track_eff').value),
                 wheel_scale=float(self.get_parameter('wheel_scale').value),
                 yaw_source=str(self.get_parameter('odom_yaw_source').value))
+            self.last_odom_vx, self.last_odom_wz = vx, wz
             x, y = self.odom.x, self.odom.y
             qz, qw = self.odom.quaternion_z_w()
 
@@ -573,6 +589,7 @@ class L150ProDriverNode(Node):
         ym.data = [float(diag[0]), float('nan') if diag[1] is None else float(diag[1]),
                    float(diag[2]), float(diag[3])]
         self.pub_yaw_loop.publish(ym)
+        self.last_cmd_vx, self.last_cmd_wz = vx, wz
         self.seq_aa = (self.seq_aa + 1) & 0xFF
         self.rx.send(build_chassis(int(round(vx * 1000)), 0, int(round(wz * 1000)),
                                    0x03 if self.estop else 0x01, self.seq_aa))
@@ -691,6 +708,41 @@ class L150ProDriverNode(Node):
         if not seen55 and (now - self.t_start) > 5.0 and not self.no55_warned:
             self.get_logger().warn('5 秒未收到底盘遥测 0x55（串口没通？）')
             self.no55_warned = True
+
+    def health_tick(self):
+        """1Hz 汇总。carhealth 只订阅这一条，避免在守护里订阅 25/50Hz 话题。"""
+        now = time.monotonic()
+        with self.state.lock:
+            online = self.state.online
+            estop = self.state.estop_fb
+            status56 = self.state.status56
+            ctrl_live = self.state.ctrl_live
+            faults = self.state.faults
+            voltage_mv = self.state.voltage_mv
+            seen55 = self.state.seen55
+            seen56 = self.state.seen56
+            last55 = self.state.last55_mono
+            last56 = self.state.last56_mono
+        payload = build_driver_health(
+            arm_online=online,
+            arm_estop=estop,
+            arm_status=status56,
+            ctrl_live=ctrl_live,
+            arm_cmd_age_s=(None if self.arm_cmd_time <= 0
+                           else now - self.arm_cmd_time),
+            chassis_faults=faults,
+            battery_voltage=voltage_mv / 1000.0,
+            seen55=seen55,
+            seen56=seen56,
+            feedback_age_s=(None if last56 is None else now - last56),
+            telemetry_age_s=(None if last55 is None else now - last55),
+            cmd_age_s=(None if self.tw_time <= 0 else now - self.tw_time),
+            cmd_vx=self.last_cmd_vx,
+            cmd_wz=self.last_cmd_wz,
+            odom_vx=self.last_odom_vx,
+            odom_wz=self.last_odom_wz,
+        )
+        self.pub_health.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
     def shutdown(self):
         for _ in range(3):

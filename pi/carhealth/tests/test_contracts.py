@@ -23,10 +23,8 @@ def test_every_check_has_known_level_and_probe_name():
         "file:resultd-status", "file:framed-status", "file:latest-idr",
         "file:voice-heartbeat",
         "net:board", "net:rosbridge",
-        "topic:/tof/status", "topic:/tof/depth", "topic:/wheel_odom",
-        "topic:/imu/data_raw", "topic:/arm/feedback", "topic:/arm/online",
-        "topic:/k230/result", "topic:/health/arm_grasp",
-        "topic:/battery_voltage", "topic:/chassis_faults",
+        "topic:/tof/status", "topic:/health/driver", "topic:/k230/result",
+        "topic:/health/arm_grasp",
     }
     for spec in build_specs():
         assert spec.display
@@ -69,4 +67,4 @@ def test_tof_reports_by_id_fallback_as_degraded():
 def test_battery_component_warns_below_threshold():
     battery = {s.name: s for s in build_specs()}["battery"]
     fields = {(c.probe, c.field, c.op, c.value) for c in battery.checks}
-    assert ("topic:/battery_voltage", "data", "gt", 11.5) in fields
+    assert ("topic:/health/driver", "battery_voltage", "gt", 11.5) in fields

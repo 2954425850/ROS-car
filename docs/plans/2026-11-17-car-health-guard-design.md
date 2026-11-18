@@ -105,6 +105,13 @@ pi/carhealth/
   `/run/carhealth/state.json`，不磨损 SD 卡；journal 才落盘到
   `/home/cy/.local/state/carhealth/journal-YYYYMMDD.jsonl`，按天滚动保留 30 天。
 - `doctor` 是只读一次性检查，永远用临时目录，绝不覆盖守护的 state/journal。
+- **高频话题不进守护**：2026-11-18 Pi 实测，carhealth 直接订阅
+  `/tof/depth`(30Hz)、`/imu`(50Hz)、`/arm/feedback`(25Hz)、`/wheel_odom`(50Hz)
+  等话题时，rclpy 每条消息的固定开销让守护稳定吃 28% CPU；只去掉三个后仍有
+  18%。最终由驱动节点新增 1Hz `/health/driver` 摘要（含臂/底盘/电池/命令/里程计
+  的最近值与年龄），守护只订阅 `/health/driver`、`/tof/status`、
+  `/health/arm_grasp`、`/k230/result`，实测 **1.0% CPU / 71MB RSS**。
+  这也是 `/tof/status` 契约模式的推广：节点自己汇总，守护只读摘要。
 
 ## 5. 健康契约
 
@@ -130,9 +137,9 @@ device/port/last_error/frame_id`）即契约模板，新增心跳沿用同一形
 | 组件 | 存活 | 新鲜度/正确性 | 环境前提 | 互锁来源 | 允许恢复 |
 |---|---|---|---|---|---|
 | `power` | — | 当前欠压 / 进程内观察到 10 分钟内出现过欠压 / 开机以来历史位；bit1–3（降频、throttle、软温度） | — | — | 无 |
-| `battery` | `/battery_voltage` <3s | 电压 <11.5V → DEGRADED；<11.2V → 规则提示「性能明显下降」 | — | — | 无 |
-| `chassis` | ps2-teleop 单元 | `/wheel_odom` <1s；`/imu/data_raw` <1.5s（raw）；`/chassis_faults` 非零 → DEGRADED；`/dev/input/js0` 存在 | `/dev/l150pro` | 底盘在动 | 空闲时重启 ps2-teleop |
-| `arm` | 同上（同一串口） | `/arm/feedback` <0.5s；`/arm/online`=true；`/arm/status` 的 bit0/bit7 进证据与规则 | `/dev/l150pro` | 臂在动 / 抓取在跑 | 空闲时重启；动作中只记录 |
+| `battery` | `/health/driver` <3s | `battery_voltage` <11.5V → DEGRADED；<11.2V → 规则提示「性能明显下降」 | — | — | 无 |
+| `chassis` | ps2-teleop 单元 | `/health/driver` <2s；`telemetry_age_s` <1s；`chassis_faults` 非零 → DEGRADED；`/dev/input/js0` 存在 | `/dev/l150pro` | 底盘在动 | 空闲时重启 ps2-teleop |
+| `arm` | 同上（同一串口） | `/health/driver` 的 `feedback_age_s` <0.5s；`arm_online`=true；`arm_estop`=false | `/dev/l150pro` | 臂在动 / 抓取在跑 | 空闲时重启；动作中只记录 |
 | `tof` | tof-a010 单元 | `/tof/status` 契约；`/tof/depth` <2s（raw）；udev 接口号 00 | `/dev/a010` 或 by-id `if00` | 抓取中 | 重启单元 |
 | `grasp` | arm-grasp 单元 | `/health/arm_grasp` <3s；心跳带 `busy`、`feedback_age_s`、`last_goal_wall` | — | 抓取在跑 | 空闲时重启 |
 | `k230-link` | resultd/bridge 单元 | `resultd-status.json` mtime<7s；`/k230/result` <3s；resultd 的 `connected`/`peer` | 板子地址可知（否则 UNKNOWN） | — | 重启 resultd / bridge |
@@ -243,8 +250,8 @@ device/port/last_error/frame_id`）即契约模板，新增心跳沿用同一形
 
 | 信号 | 判据 |
 |---|---|
-| 臂在动 | `/arm/command` 近期有流量，或 `/arm/feedback` 位姿在近期有变化 |
-| 底盘在动 | `/cmd_vel_mux` 线速度或角速度非零，或 `/wheel_odom` **线速度**或角速度非零 |
+| 臂在动 | `/health/driver` 的 `arm_cmd_age_s` <1.5s，或抓取在跑 |
+| 底盘在动 | `/health/driver` 的 `cmd_vx/cmd_wz`（命令）或 `odom_vx/odom_wz`（实测）非零，且对应年龄新鲜 |
 | 抓取在跑 | `/health/arm_grasp` 的 `busy=true`（由 `GraspServer._busy` 生成） |
 | 语音在忙 | heartbeat 的 `busy` 字段（THINKING / SPEAKING / 工具执行中） |
 

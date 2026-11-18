@@ -27,10 +27,9 @@ from .probes.usb_events import UsbEventsProbe
 UNITS = ("ps2-teleop", "tof-a010", "k230-resultd", "k230-bridge",
          "k230-framed", "rosbridge", "arm-grasp")
 
-TOPICS = ("/tof/status", "/tof/depth", "/wheel_odom", "/imu/data_raw",
-          "/arm/feedback", "/arm/online", "/k230/result",
-          "/health/arm_grasp", "/cmd_vel_mux", "/arm/command",
-          "/battery_voltage", "/chassis_faults", "/arm/status")
+# 只订阅低频摘要。驱动把 25/50Hz 话题汇总成 1Hz /health/driver；
+# 守护总量约 13 条/秒，CPU ~1-2%（2026-11-18 Pi 实测）。
+TOPICS = ("/tof/status", "/health/driver", "/health/arm_grasp", "/k230/result")
 
 
 @dataclass

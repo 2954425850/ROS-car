@@ -128,7 +128,8 @@ def test_default_state_dir_respects_env(monkeypatch, tmp_path):
 def test_busy_is_computed_and_written(tmp_path):
     eng, _ = make(
         [FakeProbe("p", {"age_s": 0.1}),
-         FakeProbe("topic:/cmd_vel_mux", {"age_s": 0.1, "linear_x": 0.3, "angular_z": 0.0})],
+         FakeProbe("topic:/health/driver", {
+             "age_s": 0.1, "cmd_age_s": 0.1, "cmd_vx": 0.3, "cmd_wz": 0.0})],
         tmp_path=tmp_path)
     eng.run_once()
     assert eng.last_busy.chassis is True
@@ -202,7 +203,8 @@ def test_fingerprint_change_emits_update(tmp_path):
 def test_interlock_is_written_into_incident(tmp_path):
     eng, _ = make(
         [FakeProbe("p", {"age_s": 9.0}),
-         FakeProbe("topic:/cmd_vel_mux", {"age_s": 0.1, "linear_x": 0.3, "angular_z": 0.0})],
+         FakeProbe("topic:/health/driver", {
+             "age_s": 0.1, "cmd_age_s": 0.1, "cmd_vx": 0.3, "cmd_wz": 0.0})],
         tmp_path=tmp_path)
     eng.run_once()
     assert _events(tmp_path)[0]["interlock"]["chassis"] is True

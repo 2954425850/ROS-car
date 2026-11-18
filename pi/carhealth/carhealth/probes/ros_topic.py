@@ -16,6 +16,12 @@ _TOF_FIELDS = ("connected", "connecting", "frames", "fps", "reconnects",
                "age_s", "device", "port", "last_error", "frame_id")
 _ARM_HEALTH_FIELDS = ("busy", "pid", "uptime_s", "state", "feedback_age_s",
                       "last_goal_wall")
+_DRIVER_HEALTH_FIELDS = (
+    "arm_online", "arm_estop", "arm_status", "ctrl_live", "arm_cmd_age_s",
+    "chassis_faults", "battery_voltage", "seen55", "seen56",
+    "feedback_age_s", "telemetry_age_s", "cmd_age_s",
+    "cmd_vx", "cmd_wz", "odom_vx", "odom_wz",
+)
 
 
 def _pick(data: dict, fields) -> dict:
@@ -30,25 +36,8 @@ def arm_health_evidence(data: dict) -> dict:
     return _pick(data, _ARM_HEALTH_FIELDS)
 
 
-def bool_evidence(value: bool) -> dict:
-    return {"data": bool(value)}
-
-
-def float_evidence(value: float) -> dict:
-    return {"data": round(float(value), 3)}
-
-
-def int_evidence(value: int) -> dict:
-    return {"data": int(value)}
-
-
-def twist_evidence(linear_x: float, angular_z: float) -> dict:
-    return {"linear_x": round(float(linear_x), 3),
-            "angular_z": round(float(angular_z), 3)}
-
-
-def odom_evidence(linear_x: float, angular_z: float = 0.0) -> dict:
-    return twist_evidence(linear_x, angular_z)
+def driver_health_evidence(data: dict) -> dict:
+    return _pick(data, _DRIVER_HEALTH_FIELDS)
 
 
 @dataclass
@@ -124,12 +113,8 @@ class RosNodeBackend:
     def start(self) -> bool:
         try:
             import rclpy
-            from geometry_msgs.msg import Twist
-            from nav_msgs.msg import Odometry
             from rclpy.executors import SingleThreadedExecutor
-            from rclpy.qos import qos_profile_sensor_data
-            from sensor_msgs.msg import Image, Imu, JointState
-            from std_msgs.msg import Bool, Float32, Int32, String
+            from std_msgs.msg import String
         except Exception as e:                              # noqa: BLE001
             self.reason = "rclpy/消息包不可用: %s" % e
             return False
@@ -156,45 +141,11 @@ class RosNodeBackend:
 
             node.create_subscription(String, "/k230/result",
                                      lambda m: self._store.record("/k230/result", {}), 10)
-            # 高频/大消息只记到达时间，不反序列化：Pi 本来就容易过载。
-            node.create_subscription(
-                Image, "/tof/depth",
-                lambda m: self._store.record("/tof/depth", {}),
-                qos_profile_sensor_data, raw=True)
-            node.create_subscription(
-                Imu, "/imu/data_raw",
-                lambda m: self._store.record("/imu/data_raw", {}), 10, raw=True)
-            node.create_subscription(
-                JointState, "/arm/feedback",
-                lambda m: self._store.record("/arm/feedback", {}), 10, raw=True)
-            node.create_subscription(
-                JointState, "/arm/command",
-                lambda m: self._store.record("/arm/command", {}), 10, raw=True)
-
-            node.create_subscription(
-                Bool, "/arm/online",
-                lambda m: self._store.record("/arm/online", bool_evidence(m.data)), 10)
-            node.create_subscription(
-                Float32, "/battery_voltage",
-                lambda m: self._store.record(
-                    "/battery_voltage", float_evidence(m.data)), 10)
-            node.create_subscription(
-                Int32, "/chassis_faults",
-                lambda m: self._store.record(
-                    "/chassis_faults", int_evidence(m.data)), 10)
-            node.create_subscription(
-                Int32, "/arm/status",
-                lambda m: self._store.record("/arm/status", int_evidence(m.data)), 10)
-            node.create_subscription(
-                Odometry, "/wheel_odom",
-                lambda m: self._store.record(
-                    "/wheel_odom",
-                    odom_evidence(m.twist.twist.linear.x, m.twist.twist.angular.z)), 10)
-            node.create_subscription(
-                Twist, "/cmd_vel_mux",
-                lambda m: self._store.record(
-                    "/cmd_vel_mux",
-                    twist_evidence(m.linear.x, m.angular.z)), 10)
+            # ★ 只订阅契约真正用到的低/中频话题。
+            # ★ 2026-11-18 Pi 实测：直接订阅 25/50Hz 话题时，rclpy 每条消息的固定
+            #   开销让守护稳定吃 18~28% CPU。驱动节点现在自己发 1Hz /health/driver
+            #   摘要；守护只订阅低/中频话题，总量约 13 条/秒。
+            sub_json("/health/driver", driver_health_evidence)
 
             self._executor = SingleThreadedExecutor()
             self._executor.add_node(node)

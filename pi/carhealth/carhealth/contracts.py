@@ -60,10 +60,10 @@ def build_specs() -> tuple[ComponentSpec, ...]:
         )),
 
         ComponentSpec("battery", "电池", (
-            Check("topic:/battery_voltage", "lt", 3.0, field="age_s", level=Verdict.STALE,
-                  reason="/battery_voltage 超过 3s 没有数据"),
-            Check("topic:/battery_voltage", "gt", 11.5, field="data", level=Verdict.DEGRADED,
-                  reason="电池电压 <11.5V"),
+            Check("topic:/health/driver", "lt", 3.0, field="age_s", level=Verdict.STALE,
+                  reason="/health/driver 超过 3s 没有数据"),
+            Check("topic:/health/driver", "gt", 11.5, field="battery_voltage",
+                  level=Verdict.DEGRADED, reason="电池电压 <11.5V"),
         )),
 
         ComponentSpec("chassis", "底盘", (
@@ -72,24 +72,27 @@ def build_specs() -> tuple[ComponentSpec, ...]:
                   reason="底盘板串口 /dev/l150pro 不存在"),
             Check("udev:js0", "eq", True, field="exists", level=Verdict.ABSENT,
                   reason="PS2 接收器 /dev/input/js0 不存在"),
-            Check("topic:/wheel_odom", "lt", 1.0, field="age_s", level=Verdict.STALE,
-                  reason="/wheel_odom 超过 1s 没有数据"),
-            Check("topic:/imu/data_raw", "lt", 1.5, field="age_s", level=Verdict.STALE,
-                  reason="/imu/data_raw 超过 1.5s 没有数据"),
-            Check("topic:/battery_voltage", "lt", 3.0, field="age_s", level=Verdict.STALE,
-                  reason="/battery_voltage 超过 3s 没有数据"),
-            Check("topic:/chassis_faults", "eq", 0, field="data", level=Verdict.DEGRADED,
-                  reason="底盘固件报告故障位（check /chassis_faults 与驱动日志）"),
+            Check("topic:/health/driver", "lt", 2.0, field="age_s", level=Verdict.STALE,
+                  reason="/health/driver 超过 2s 没有数据"),
+            Check("topic:/health/driver", "lt", 1.0, field="telemetry_age_s",
+                  level=Verdict.STALE, reason="底盘遥测 0x55 超过 1s 没有数据"),
+            Check("topic:/health/driver", "eq", 0, field="chassis_faults",
+                  level=Verdict.DEGRADED,
+                  reason="底盘固件报告故障位（看 /chassis_faults 与驱动日志）"),
         ), blocked_by=("power",)),
 
         ComponentSpec("arm", "机械臂", (
             _unit("ps2-teleop"),
             Check("udev:l150pro", "eq", True, field="exists", level=Verdict.ABSENT,
                   reason="底盘/臂共用串口 /dev/l150pro 不存在"),
-            Check("topic:/arm/feedback", "lt", 0.5, field="age_s", level=Verdict.STALE,
-                  reason="/arm/feedback 超过 0.5s 没有数据"),
-            Check("topic:/arm/online", "eq", True, field="data", level=Verdict.STALE,
-                  reason="机械臂未 READY（/arm/online=false）"),
+            Check("topic:/health/driver", "lt", 2.0, field="age_s", level=Verdict.STALE,
+                  reason="/health/driver 超过 2s 没有数据"),
+            Check("topic:/health/driver", "lt", 0.5, field="feedback_age_s",
+                  level=Verdict.STALE, reason="机械臂回读 0x56 超过 0.5s 没有数据"),
+            Check("topic:/health/driver", "eq", True, field="arm_online",
+                  level=Verdict.STALE, reason="机械臂未 READY（arm_online=false）"),
+            Check("topic:/health/driver", "eq", False, field="arm_estop",
+                  level=Verdict.DEGRADED, reason="机械臂固件急停位置位"),
         ), blocked_by=("power",)),
 
         ComponentSpec("tof", "ToF 深度", (
@@ -106,8 +109,6 @@ def build_specs() -> tuple[ComponentSpec, ...]:
                   reason="ToF 串口未连接"),
             Check("topic:/tof/status", "gt", 0, field="fps", level=Verdict.DEGRADED,
                   reason="ToF 帧率为 0"),
-            Check("topic:/tof/depth", "lt", 2.0, field="age_s", level=Verdict.STALE,
-                  reason="/tof/depth 超过 2s 没有数据"),
         ), blocked_by=("power",)),
 
         ComponentSpec("grasp", "抓取服务", (

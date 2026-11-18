@@ -24,6 +24,10 @@ def _fresh(ev: dict, max_age: float) -> bool:
     return isinstance(age, (int, float)) and age <= max_age
 
 
+def _fresh_scalar(value, max_age: float) -> bool:
+    return isinstance(value, (int, float)) and value <= max_age
+
+
 def _num(ev: dict, key: str) -> float:
     try:
         return float(ev.get(key) or 0.0)
@@ -32,18 +36,19 @@ def _num(ev: dict, key: str) -> float:
 
 
 def compute(results: dict[str, ProbeResult], voice_evidence: dict | None) -> BusyState:
-    arm_cmd = results.get("topic:/arm/command")
-    arm = bool(arm_cmd and arm_cmd.ok and _fresh(arm_cmd.evidence, 1.5))
+    # 驱动把 /cmd_vel_mux、/wheel_odom、/arm/command 的最近值汇总到 1Hz
+    # /health/driver；守护不再直接订阅这些 25/50Hz 话题。
+    health = results.get("topic:/health/driver")
+    ev = health.evidence if health and health.ok and _fresh(health.evidence, 2.0) else {}
 
     chassis = False
-    cmd = results.get("topic:/cmd_vel_mux")
-    if cmd and cmd.ok and _fresh(cmd.evidence, 1.0):
-        chassis = abs(_num(cmd.evidence, "linear_x")) > 0.02 or \
-                  abs(_num(cmd.evidence, "angular_z")) > 0.05
-    odom = results.get("topic:/wheel_odom")
-    if odom and odom.ok and _fresh(odom.evidence, 1.0):
-        chassis = chassis or abs(_num(odom.evidence, "linear_x")) > 0.02
-        chassis = chassis or abs(_num(odom.evidence, "angular_z")) > 0.05
+    if _fresh_scalar(ev.get("cmd_age_s"), 1.0):
+        chassis = abs(_num(ev, "cmd_vx")) > 0.02 or abs(_num(ev, "cmd_wz")) > 0.05
+    if _fresh_scalar(ev.get("telemetry_age_s"), 1.0):
+        chassis = chassis or abs(_num(ev, "odom_vx")) > 0.02
+        chassis = chassis or abs(_num(ev, "odom_wz")) > 0.05
+
+    arm = _fresh_scalar(ev.get("arm_cmd_age_s"), 1.5)
 
     grasp = False
     health = results.get("topic:/health/arm_grasp")

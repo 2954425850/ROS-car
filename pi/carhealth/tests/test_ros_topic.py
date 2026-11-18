@@ -1,6 +1,6 @@
 from carhealth.probes.ros_topic import (
-    RosTopicStore, TopicProbe, arm_health_evidence, bool_evidence, float_evidence,
-    int_evidence, odom_evidence, tof_status_evidence, twist_evidence,
+    RosTopicStore, TopicProbe, arm_health_evidence, driver_health_evidence,
+    tof_status_evidence,
 )
 
 
@@ -61,10 +61,11 @@ def test_tof_status_keeps_only_contract_fields():
     assert "huge" not in ev
 
 
-def test_arm_health_and_simple_converters():
+def test_arm_and_driver_health_converters():
     assert arm_health_evidence({"busy": True, "pid": 1, "feedback_age_s": 0.2})["busy"] is True
-    assert bool_evidence(True)["data"] is True
-    assert float_evidence(12.3)["data"] == 12.3
-    assert int_evidence(5)["data"] == 5
-    assert twist_evidence(0.2, 0.0)["linear_x"] == 0.2
-    assert odom_evidence(0.5, 0.1)["linear_x"] == 0.5
+    ev = driver_health_evidence({
+        "arm_online": True, "battery_voltage": 12.1, "cmd_vx": 0.2, "junk": 1})
+    assert ev["arm_online"] is True
+    assert ev["battery_voltage"] == 12.1
+    assert ev["cmd_vx"] == 0.2
+    assert "junk" not in ev
