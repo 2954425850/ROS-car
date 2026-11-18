@@ -23,6 +23,14 @@ def test_undervoltage():
     assert "power.undervoltage" not in hits(ctx(power={"uv_since_boot": True}))
 
 
+def test_power_probe_unavailable_is_actionable():
+    """Pi 5 实测：/dev/vcio 是 root:video，cy 不在 video 组 ⇒ vcgencmd 读不到。"""
+    c = FaultContext(
+        results={"power": ProbeResult(ok=None, error="Can't open device file")},
+        evals={}, now_mono=0.0)
+    assert "power.probe_unavailable" in hits(c)
+
+
 def test_usb_disconnect_storm():
     assert "usb.disconnect_storm" in hits(
         ctx(usb={"disconnects": {"0403:6010": 3}}))

@@ -187,6 +187,7 @@ device/port/last_error/frame_id`）即契约模板，新增心跳沿用同一形
 
 | id | 特征 | 结论 / 动作类别 | 给人的指令 |
 |---|---|---|---|
+| `power.probe_unavailable` | `vcgencmd` 读不到 `/dev/vcio`（Pi 5 实测：cy 不在 video 组） | 配置 | `sudo usermod -aG video cy` 后重新登录并重启 carhealthd |
 | `power.undervoltage` | `uv_now` 或进程观察到近期欠压 | 等 / 查供电 | 检查电源线、接插件、驱动板压降；换 5V/5A 线 |
 | `usb.disconnect_storm` | 10 分钟内同一 `vid:pid` disconnect ≥3 次 | 物理 | 换线/换口/检查供电；K230 24h 13 次重枚举属此类 |
 | `udev.l150pro_missing` | `/dev/l150pro` 不在，但其它 tty 有 `1a86:55d4` | 配置 | 装/改 `99-l150pro.rules`，确认 serial 匹配 |

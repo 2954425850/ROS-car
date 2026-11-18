@@ -60,6 +60,14 @@ class Rule:
 
 
 RULES = (
+    Rule("power.probe_unavailable", "供电探针不可用（vcgencmd 读不到 /dev/vcio）",
+         "fix_config",
+         "确认运行用户（cy）在 video 组：sudo usermod -aG video cy，"
+         "重新登录后重启 carhealthd；否则掉压检测是盲的",
+         ("power",),
+         lambda c: (c.results.get("power") is not None
+                    and c.results["power"].ok is None)),
+
     Rule("power.undervoltage", "Pi 供电欠压", "wait",
          "检查电源线、接插件与驱动板压降；欠压会连带打掉 USB 设备",
          ("power",),
