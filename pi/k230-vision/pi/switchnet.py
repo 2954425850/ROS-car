@@ -282,6 +282,8 @@ def run(ssid, password=None, new_host=None, timeout=90.0, pi_timeout=25.0,
     """执行换网。成功返回 0，失败返回 1（并写 STATUS_FILE）。"""
     old_conn = None
     old_pi_ip = None
+    old_cfg = None
+    old_board = None
     try:
         # ---- 0) 旧网预检 ----
         old_board = board_host or k230pi.board_host()
@@ -387,6 +389,14 @@ def run(ssid, password=None, new_host=None, timeout=90.0, pi_timeout=25.0,
         log("失败：%s" % e)
         if old_conn:
             log('把 Pi 切回旧连接：nmcli connection up "%s"' % old_conn)
+        # 地址类是**先落盘再换 WiFi** 的：如果板子回滚、Pi 却切到新网，
+        # 板子的 result/push 会指向一个旧网到不了的新 IP。给出把指向改回去的命令。
+        if old_cfg and old_cfg.get("result_host") and old_cfg.get("push_host"):
+            log("提示：板子的指向可能已被改成新 IP；Pi 回到旧网后若结果流仍不通，执行：")
+            log("  ~/ROS-car/pi/k230-vision/pi/k230ctl config --host %s "
+                "--result-host %s --push-host %s"
+                % (old_board, old_cfg.get("result_host"),
+                   old_cfg.get("push_host")))
         _write_status(False, ssid=ssid, pi_ip=old_pi_ip, detail=str(e))
         return 1
     except k230pi.ConfigError as e:
