@@ -64,9 +64,14 @@ RPP 严格跟随路径；**没有加禁行区/硬性横向距离**（按修订�
 1. 上电，确认场地清空、电池 ≥ 12.3 V。
 2. 同步 + 安装服务（不自动启动）：
    ```
-   cd ~/ROS-car && git pull --ff-only
+   cd ~/ROS-car
+   git log --oneline -1        # 应能看到 e7c62b5 在历史里
+   git pull --ff-only
    bash ~/ROS-car/pi/ros2_lidar/deploy_nav.sh --install-units
    ```
+   如果当前分支里没有 `e7c62b5`，说明 Pi 不在 `feat/arm-voice-motion`，
+   先别硬切分支（会动到其它服务的 symlink install），告诉我或手动把
+   `origin/feat/arm-voice-motion:pi/ros2_lidar` 拷过来。
 3. 启动导航（二选一）：
    ```
    sudo systemctl start nav
