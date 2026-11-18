@@ -366,8 +366,8 @@ def run(ssid, password=None, new_host=None, timeout=90.0, pi_timeout=25.0,
         # ---- 4) 端到端验证（resultd 的收包计数必须往前走）----
         st_before = k230pi.read_status()
         msgs0 = (st_before or {}).get("msgs")
-        ok = _verify_resultd(msgs0, timeout=max(40.0, timeout / 2), log=log)
-        if not ok:
+        verified = _verify_resultd(msgs0, timeout=max(40.0, timeout / 2), log=log)
+        if verified is False:
             raise SwitchError("板子/结果流没有在新网恢复（见上面的验证日志）")
         if target_board is None:
             # 没扫描时板子的新 IP 从 resultd 的对端拿（它刚连上来）
@@ -375,10 +375,13 @@ def run(ssid, password=None, new_host=None, timeout=90.0, pi_timeout=25.0,
             if isinstance(peer, str) and ":" in peer:
                 target_board = peer.rsplit(":", 1)[0]
 
-        log("完成：Pi=%s  K230=%s" % (new_ip, target_board))
+        detail = "ok" if verified else "ok (resultd 未运行，端到端未验证)"
+        log("完成：Pi=%s  K230=%s%s" % (
+            new_ip, target_board,
+            "" if verified else "（resultd 未运行，未做端到端验证）"))
         _write_status(True, ssid=ssid, pi_ip=new_ip, pi_old_ip=old_pi_ip,
                       board=target_board, board_old_ip=old_board_ip,
-                      detail="ok")
+                      detail=detail)
         return 0
     except SwitchError as e:
         log("失败：%s" % e)
@@ -398,8 +401,10 @@ def _verify_resultd(msgs0, timeout, log=print):
     """等 resultd 的 msgs 计数超过切换前的值 —— 板子真的在新网上把数据发到了 Pi。"""
     st = k230pi.read_status()
     if st is None:
-        log("4/4 resultd 没在跑，跳过端到端验证（用 k230ctl config 确认指向）")
-        return True
+        # 注意：不能返回 True —— 那会把"没验证"写成"验证通过"。
+        # 迁移本身可能已经成功，但必须让调用方知道没做端到端验证。
+        log("4/4 resultd 没在跑 —— 无法做端到端验证（迁移本身可能成功）")
+        return None
     if msgs0 is None:
         msgs0 = st.get("msgs") or 0
     t_end = time.time() + timeout

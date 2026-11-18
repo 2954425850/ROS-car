@@ -59,3 +59,22 @@ def test_mask_plan_hides_password():
                              "wifi_pass": "secret123"})
     assert p["wifi_pass"] == "***"
     assert p["wifi_ssid"] == "S"
+
+
+def test_verify_resultd_absent_means_unverified(monkeypatch):
+    """resultd 没跑不能当成验证通过 —— 三态：True / False / None。"""
+    monkeypatch.setattr(switchnet.k230pi, "read_status", lambda: None)
+    assert switchnet._verify_resultd(None, 0.1, log=lambda *a: None) is None
+
+
+def test_verify_resultd_success(monkeypatch):
+    states = iter([{"msgs": 10, "connected": True},
+                   {"msgs": 11, "connected": True}])
+    monkeypatch.setattr(switchnet.k230pi, "read_status", lambda: next(states))
+    assert switchnet._verify_resultd(10, 2.0, log=lambda *a: None) is True
+
+
+def test_verify_resultd_timeout_is_false(monkeypatch):
+    monkeypatch.setattr(switchnet.k230pi, "read_status",
+                        lambda: {"msgs": 10, "connected": False})
+    assert switchnet._verify_resultd(10, 0.01, log=lambda *a: None) is False

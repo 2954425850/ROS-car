@@ -345,6 +345,16 @@ def _apply_remote_config(changes, cfg_rx, pusher, r_pi, r_obs):
         if r_obs is not None:
             r_obs.close()
             r_obs._last_fail = None
+        # 8558 的**监听** socket 也必须重建：网卡 down/up 后旧监听 socket
+        # 在 lwIP 上可能已经失效。没有这一步，mode B（新网扫描 8558 找板子）
+        # 会永远找不到 —— 板子明明在线，配置入口却是死的。
+        if cfg_rx is not None:
+            try:
+                cfg_rx.rebind()
+                print("CONFIGRX rebind OK port=%d" % cfg_rx.port)
+            except BaseException as e:
+                detail = "%s (configrx rebind failed: %s)" % (detail, e)
+                print("CONFIGRX rebind FAILED: %s" % e)
         net_changed = True
         print("CONFIG wifi %s: %s" % ("OK" if ok else "FAILED", detail))
 

@@ -108,8 +108,39 @@ class ConfigRx:
 
     # ---------------- 收 ----------------
 
+    def rebind(self):
+        """WiFi 断开/重连后重建监听 socket。
+
+        2026-11-18 评审：`netup.reconnect` 会把网卡 down/up，板子只重建了
+        pusher/result/obstacle 的出站 socket，**没有重建 8558 的监听 socket**。
+        旧监听 socket 在 lwIP 上可能随 netif 一起失效 → 板子已经在新网、
+        但 8558 永远 accept 不到，Pi 的扫描/改指向就全断了。
+        换网（无论成功还是回滚）后必须调一次。
+        """
+        old = self._srv
+        self._srv = None
+        try:
+            old.close()
+        except BaseException:
+            pass
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("0.0.0.0", self.port))
+            srv.listen(1)
+            srv.settimeout(0)
+        except BaseException:
+            try:
+                srv.close()
+            except BaseException:
+                pass
+            raise
+        self._srv = srv
+
     def poll(self):
         """非阻塞。收一条命令、校验、落盘、应答，然后把运行时应用排队。"""
+        if self._srv is None:
+            return                       # rebind 失败：配置入口暂时不可用，别崩主循环
         try:
             conn, _addr = self._srv.accept()
         except OSError:
