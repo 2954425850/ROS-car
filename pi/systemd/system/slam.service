@@ -1,0 +1,19 @@
+[Unit]
+Description=nepu SLAM mapping (RPLIDAR + slam_toolbox)
+After=network-online.target
+Wants=network-online.target
+# SLAM and navigation both publish map->odom; never run them together.
+Conflicts=nav.service
+
+[Service]
+Type=simple
+User=cy
+Environment=HOME=/home/cy
+WorkingDirectory=/home/cy/ros2_lidar
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && exec ros2 launch /home/cy/ros2_lidar/launch/mapping.launch.py'
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

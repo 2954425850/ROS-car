@@ -1,76 +1,130 @@
-# 2D 导航（nav2 + AMCL）— 2026-11-17 首次真车
+# 2D 导航（nav2 + AMCL）— 2026-11-18 方案已实现，待实车验收
 
-在 `mapping.launch.py` 建完图之后使用。SLAM 与导航**不能同时跑**：两者都发
-`map->odom`。
+> **状态**：2026-11-17 第一版（NavFn + DWB）实车跑过：去程 5.1 m SUCCEEDED，
+> 停车误差 ~5 cm；返程因 DDS 心跳延迟 ABORTED。
+> **2026-11-18 按《导航方案最终规划》修订版重写**：Smac Hybrid-A* + RPP、
+> 禁止原地转、不优先贴边、composition、位姿持久化。
+> **本版还没有上过车**——第一次上车的验收步骤见文末。
+
+## 启动
 
 ```
 ros2 launch /home/cy/ros2_lidar/launch/nav.launch.py
+ros2 launch ... use_composition:=false     # 排障回退（多进程）
 ```
 
-## 这次启动了什么
+SLAM 与导航**不能同时跑**（都发 `map->odom`）。`nav.service` / `slam.service`
+用 `Conflicts=` 互斥。
+
+## 启动了什么
 
 | 节点 | 作用 |
 |---|---|
-| `lidar_reset.py`（前置） | STOP + RESET 雷达。上个驱动退出后雷达常停在扫描状态，新驱动会卡在 `getDeviceInfo`（没有 S/N、没有 `/scan`） |
-| `rplidar_composition` | 雷达，7 Hz；参数与 mapping.launch 相同（`auto_standby=false`、by-id 串口） |
-| `scan_self_filter.py` | `/scan` → `/scan_filtered`，滤掉车体 footprint 内的点 |
-| `robot_state_publisher` | `base_footprint -> base_link -> laser`（urdf/robot.urdf） |
-| `nav2_bringup/localization_launch.py` | `map_server` + `amcl` + lifecycle |
-| `nav2_navigation_launch.py`（本地改过的副本） | controller / planner / bt_navigator / behaviors / smoother / collision_monitor |
+| `tools/lidar_reset.py`（前置） | STOP + RESET 雷达；避免重启后卡在 `getDeviceInfo` |
+| `rplidar_composition` | 雷达 7 Hz；`auto_standby=false`、by-id 串口 |
+| `tools/scan_self_filter.py` | `/scan` → `/scan_filtered`，滤掉车体 footprint 内的机械臂回波 |
+| `robot_state_publisher` | `base_footprint -> base_link -> laser` |
+| nav2 `localization_launch.py` | `map_server` + `amcl`，composition 容器 |
+| `nav2_navigation_launch.py`（本地副本） | controller / planner / bt_navigator / behaviors / velocity_smoother / collision_monitor |
+| `tools/no_pivot_guard.py` | 硬禁原地转：`|w| <= |v| / 0.5` |
+| `tools/pose_persist.py` | `/amcl_pose` 存盘；启动时发 `/initialpose` |
 
-速度链路（`cmd_mux` 里导航优先级最低，10）：
+不再启动 smoother / route / waypoint / docking。
+
+## 速度链路（优先级由 cmd_mux 仲裁）
 
 ```
 controller_server -> cmd_vel_raw -> velocity_smoother -> cmd_vel_smoothed
-  -> collision_monitor -> cmd_vel_nav -> cmd_mux -> cmd_vel_mux -> 驱动
+  -> no_pivot_guard -> cmd_vel_guard -> collision_monitor -> cmd_vel_nav
+  -> cmd_mux（导航 10，最低） -> cmd_vel_mux -> 驱动
 ```
 
-> `nav2_navigation_launch.py` 是把官方文件里的 `cmd_vel -> cmd_vel_nav` 改成了
-> `cmd_vel -> cmd_vel_raw`，这样最终输出能由 collision_monitor 收口到
-> `/cmd_vel_nav`，不会落到 `/cmd_vel`（那是 legacy，优先级 80，会压过语音）。
+`nav2_navigation_launch.py` 是官方文件的副本，把 `cmd_vel -> cmd_vel_nav`
+改成了 `cmd_vel -> cmd_vel_raw`，最终输出由 collision_monitor 收口到
+`/cmd_vel_nav`，不会落到 `/cmd_vel`（legacy 80，会压过语音）。
 
-## 必须按次修改的参数
+## 2026-11-18 算法与参数
 
-`config/nav2_params.yaml` → `amcl.initial_pose`：
+| 环节 | 选型 | 关键参数 |
+|---|---|---|
+| 定位 | AMCL likelihood field | 500~2000 粒子；`recovery_alpha_slow=0.01`、`fast=0.2`；初始位姿由 `pose_persist` 恢复，yaml 里的只是兜底 |
+| 全局规划 | **Smac Hybrid-A\*** | `motion_model_for_search=REEDS_SHEPP`、`minimum_turning_radius=0.5`、`reverse_penalty=2.0`、`change_penalty=0.3`、`cost_penalty=2.0`、`allow_unknown=false`、`tolerance=0.15` |
+| 局部控制 | **RPP** | `use_rotate_to_heading=false`、`allow_reversing=true`、`use_cost_regulated_linear_velocity_scaling=true`、`desired_linear_vel=0.25`、`max_angular_accel=0.8` |
+| 局部代价图 | **obstacle 层**（不再 voxel） | 3×3 m，`/scan_filtered`，膨胀 **0.7 m**、`cost_scaling_factor=2.0` |
+| 全局代价图 | static + obstacle + inflation | unknown 当障碍；膨胀 0.7/2.0 |
+| 行为 | backup / drive_on_heading / assisted_teleop / wait | **无 spin** |
+| 行为树 | `config/bt_nav_to_pose.xml` | 重规划 0.5 Hz；恢复 = 清代价图 → Wait 2 s → BackUp 0.15 m |
+| 硬安全 | collision_monitor | stop 区（车体外扩 15 cm）+ 1 m 减速区；scan 超时 0.5 s |
 
-```yaml
-set_initial_pose: true
-initial_pose: {x: -1.157, y: 0.556, z: 0.0, yaw: 0.0}   # 2026-11-17 那次
-```
+**不优先贴边**：靠 Smac 的 `cost_penalty` 在“路短”和“离障碍远”之间权衡，
+RPP 严格跟随路径；**没有加禁行区/硬性横向距离**（按修订版）。
 
-换位置起车必须改成当次位姿，否则 AMCL 从错的位置开始。
+## 明早运行手册（Pi 上）
 
-## 地图
+1. 上电，确认场地清空、电池 ≥ 12.3 V。
+2. 同步 + 安装服务（不自动启动）：
+   ```
+   cd ~/ROS-car && git pull --ff-only
+   bash ~/ROS-car/pi/ros2_lidar/deploy_nav.sh --install-units
+   ```
+3. 启动导航（二选一）：
+   ```
+   sudo systemctl start nav
+   # 或前台：ros2 launch ~/ros2_lidar/launch/nav.launch.py
+   ```
+4. 预检：
+   ```
+   ros2 topic hz /scan          # ~7 Hz
+   ros2 topic echo /amcl_pose --once
+   ros2 run tf2_ros tf2_echo map base_footprint
+   ```
+   `pose_persist` 会用上次位姿；如果车被搬动过，删 `~/ros2_lidar/maps/last_pose.json`
+   并改 `nav2_params.yaml` 的 `amcl.initial_pose`。
+   **不要靠原地转一圈让 AMCL 收敛**（新方案禁止原地转）；丢了定位就用 PS2
+   以低速往前开 0.3~0.5 m，让扫描匹配重新收敛。
+5. 验收（20 次往返 = 40 个目标；约 20 分钟）：
+   ```
+   python3 ~/ros2_lidar/tools/nav_accept.py --rounds 20
+   ```
+   结果写到 `~/ros2_lidar/maps/nav_accept_*.json`。
+   看四个数：
+   - `in_place_rotation_samples` **必须 0**
+   - `rounds_succeeded` **≥ 18/20**
+   - `stop_error_max_m` **≤ 0.10**
+   - `lateral_y_mean` 接近 0.45~0.50（软指标）
+6. 如果 planner 插件加载失败（`SmacPlannerHybrid` 名字不对），把
+   `nav2_params.yaml` 里的 `plugin` 在
+   `nav2_smac_planner::SmacPlannerHybrid` 和 `nav2_smac_planner/SmacPlannerHybrid`
+   之间换一下；如果 composition 起不来，加 `use_composition:=false`。
 
-`maps/nav_20261117.pgm/.yaml`：553×139 @0.05 m（27.6 × 7.0 m），
-unknown 82.8% / free 15.4% / occupied 1.8%（正确保存，204→205 未知区）。
-同一目录下的 `.posegraph/.data` 是 slam_toolbox 序列化图（只在 Pi 上，未入库，8 MB）。
+## 资源实测（2026-11-18，干净重启、静止）
 
-## 今天踩到的五个坑（都已修）
+| 场景 | 4 核占用 | 折合核心 | 内存 |
+|---|---|---|---|
+| 基础服务（语音/手柄/驱动/臂/TOF） | 17% | 0.7 | 1.6 GB |
+| + SLAM（静止） | 17% | 0.7 | 1.7 GB |
+| + nav2（14 节点，静止） | 31% | 1.25 | 2.0 GB |
 
-1. **`bt_navigator` 的 action 超时默认只有 20 ms**
-   官方 `default_server_timeout`。DDS 发现稍慢就 abort 整个目标，日志是
-   `Timed out while waiting for action server ... compute_path_to_pose`。
-   → 改成 `2000`。
-2. **机械臂被雷达当成障碍**
-   雷达在车尾（-0.256 m），机械臂在车头 → `/scan` 的 0° 有固定回波 **0.44 m**，
-   落在 collision_monitor 的停车区 → 速度永远为 0。
-   → `scan_self_filter.py` 把车体 footprint（0.60×0.40 + 2 cm）内的点置 `inf`，
-   AMCL / costmap / collision_monitor 全部改用 `/scan_filtered`。
-3. **雷达重启后卡在初始化**
-   → 前置 `lidar_reset.py`（STOP + RESET，DTR 拉低）。
-4. **Fast DDS SHM 端口残留**
-   反复重启 nav2 后出现 `RTPS_TRANSPORT_SHM ... portNNNN open_and_lock_file failed`，
-   服务调用要 30~40 s。→ launch 里 export `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`。
-5. **CPU 过载**
-   Pi 4 核跑到 load 17.8：controller 实际只有 5~15 Hz（目标 15），
-   collision_monitor 报 scan 时间戳落后 0.7 s，最后 **behavior_server 4 s 没心跳，
-   lifecycle manager 把整组节点关掉** → 返回目标 ABORTED。
-   建议：控制频率降到 10 Hz、少起 route/docking/smoother、跑完一轮重启 Pi 清 DDS。
+nav2 相对基线只多用 ~0.5 核，CPU 有 68% 空闲。**算力不是瓶颈**；
+`load average` 高来自 Fast DDS 线程和 D 状态任务。
 
-## 2026-11-17 实测结果
+## 五个已修的坑
 
-- 地图：走廊 27.6 × 7.0 m，unknown 82.8%，建图 30 分钟零 warning/error
-- 去程：从 `(-1.157, 0.556)` 到 `(4.0, 0.45)`，**SUCCEEDED**，停车误差 ~5 cm
-- 返程：目标接受后走到 `(0.34, -0.03)`，因 `behavior_server` 心跳丢失 ABORTED
-- 电压：开始时 12.36 V，结束时 11.67 V（11.2 V 以下性能减半，跑之前充满）
+1. **`bt_navigator.default_server_timeout` 官方默认 20 ms**
+   DDS 发现稍慢就 abort 整个目标。已改 2000 ms。
+2. **机械臂自遮挡**：雷达在车尾 -0.256 m、臂在车头 → `/scan` 0° 固定回波
+   0.44 m，collision_monitor 判成障碍永久停车。`scan_self_filter.py` 把
+   footprint 内的点置 inf → `/scan_filtered`。
+3. **雷达重启卡在 `getDeviceInfo`** → 前置 `lidar_reset.py`（STOP+RESET，DTR 低）。
+4. **Fast DDS SHM 端口残留** → nav launch export
+   `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`。
+5. **DDS 心跳/发现延迟（曾误判成 CPU 过载）**：`load average` 高但 CPU 只
+   31% 忙；症状是 behavior_server 4 s 没心跳 → lifecycle manager 关掉整组节点。
+   修法：重启 Pi 清状态、UDPv4、稳定链路；`bond_timeout` 已放宽到 10 s。
+
+## 2026-11-17 第一版实测（历史）
+
+- 地图 `nav_20261117`：553×139 @0.05（27.6×7.0 m），unknown 82.8%
+- 去程 (-1.157,0.556) → (4.0,0.45)：**SUCCEEDED**，停车误差 ~5 cm
+- 返程：走到 (0.34,-0.03)，因 DDS 心跳丢失 ABORTED
+- 电压 12.36 V → 11.67 V（11.2 V 以下性能减半）

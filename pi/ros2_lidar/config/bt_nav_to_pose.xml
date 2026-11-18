@@ -1,0 +1,49 @@
+<!--
+  Nav-to-pose BT for the L150Pro (2026-11-18, "no in-place rotation" plan).
+
+  Differences from the stock nav2_bt_navigator tree:
+    * RateController 1.0 Hz -> 0.5 Hz (less replan jitter).
+    * Recovery RoundRobin has NO Spin. The robot must never rotate in place.
+      Recovery = clear costmaps -> Wait 2 s -> BackUp 0.15 m -> replan.
+    * Backup is checked against the local costmap by behavior_server.
+
+  NOTE: this file must be listed in nav2_params.yaml as
+  bt_navigator.default_nav_to_pose_bt_xml.
+-->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+        <RateController hz="0.5">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+            <Sequence>
+              <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+          <Sequence>
+            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+          </Sequence>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <Wait wait_duration="2.0"/>
+          <BackUp backup_dist="0.15" backup_speed="0.10" error_code_id="{backup_code_id}"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>
