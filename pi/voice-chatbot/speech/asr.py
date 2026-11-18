@@ -10,6 +10,7 @@
 
 import os
 import tempfile
+import time
 from http import HTTPStatus
 from pathlib import Path
 
@@ -31,6 +32,10 @@ class ASRClient:
         self._api_key = config.get("asr.api_key")
         self._model = config.get("asr.model", "paraformer-realtime-v2")
         self._sample_rate = config.get("asr.sample_rate", 16000)
+        # 给 carhealth 心跳用：API 错误会被这里吞成空字符串，必须单独留痕迹。
+        self.last_error: str | None = None
+        self.last_error_wall: float | None = None
+        self.last_ok_wall: float | None = None
 
     def recognize(self, audio_wav: bytes) -> str:
         """Recognize speech from WAV audio bytes.
@@ -58,7 +63,16 @@ class ASRClient:
             sample_rate=self._sample_rate,
             callback=None,  # 非流式 call() 不需要回调
         )
-        result = recognition.call(str(tmp_path))
+        try:
+            result = recognition.call(str(tmp_path))
+        except Exception as e:
+            self.last_error = repr(e)
+            self.last_error_wall = time.time()
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
 
         # cleanup temp file
         try:
@@ -68,8 +82,12 @@ class ASRClient:
 
         if result.status_code != HTTPStatus.OK:
             logger.error(f"ASR: API error — status={result.status_code}, message={result.message}")
+            self.last_error = f"status={result.status_code}: {result.message}"
+            self.last_error_wall = time.time()
             return ""
 
+        self.last_ok_wall = time.time()
+        self.last_error = None
         sentences = result.get_sentence()  # 非流式返回 List[Dict]
         if not sentences:
             logger.warning("ASR: no speech detected")

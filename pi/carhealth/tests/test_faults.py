@@ -68,6 +68,20 @@ def test_cpu_rules():
     assert "host.cpu_high" not in hits(ctx(host={"cpu_pct": 40.0}))
 
 
+def test_gateway_latency_rule():
+    assert "host.gateway_latency" in hits(
+        ctx(**{"net:gateway": {"rtt_avg_ms": 141.0}}))
+    assert "host.gateway_latency" not in hits(
+        ctx(**{"net:gateway": {"rtt_avg_ms": 3.9, "rtt_max_ms": 10.0,
+                               "loss_pct": 0.0}}))
+
+
+def test_asr_error_rule():
+    assert "voice.asr_error" in hits(
+        ctx(**{"file:voice-heartbeat": {
+            "asr_last_error": "status=44: request timeout"}}))
+
+
 def test_wakeword_lost_and_api_stuck():
     assert "voice.wakeword_lost" in hits(
         ctx(**{"file:voice-heartbeat": {"wakeword_ready": False}}))

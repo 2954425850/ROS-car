@@ -20,7 +20,8 @@ def test_build_engine_wires_specs_and_probes(tmp_path):
         assert {s.name for s in eng.specs} == {s.name for s in build_specs()}
         assert "topic:/tof/status" in eng.probes
         assert "unit:ps2-teleop" in eng.probes
-        assert {"service", "usb", "dds", "config_drift", "udev:js0"} <= set(eng.probes)
+        assert {"service", "usb", "dds", "config_drift", "udev:js0",
+                "net:gateway"} <= set(eng.probes)
     finally:
         eng.close()
 

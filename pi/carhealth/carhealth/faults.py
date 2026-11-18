@@ -182,6 +182,14 @@ RULES = (
          lambda c: ((_number(ev(c, "host").get("wifi_signal_dbm"), 0) < -75)
                     or (_number(ev(c, "host").get("wifi_link"), 99) < 30))),
 
+    Rule("host.gateway_latency", "WiFi 网关延迟高（信号满格也会这样）", "human",
+         "网关 RTT 平均 >50ms 或最大 >200ms：云端 ASR/TTS 会超时；"
+         "换 5G/AP、靠近路由或改用有线",
+         ("host",),
+         lambda c: ((_number(ev(c, "net:gateway").get("rtt_avg_ms"), 0) > 50)
+                    or (_number(ev(c, "net:gateway").get("rtt_max_ms"), 0) > 200)
+                    or (_number(ev(c, "net:gateway").get("loss_pct"), 0) >= 20))),
+
     Rule("service.memory_high", "有服务内存占用过高", "human",
          "看是否内存泄漏；>1GB 通常会拖垮整机",
          (),
@@ -203,6 +211,12 @@ RULES = (
          "USB 重枚举/设备被抢占；换口或重启语音助手",
          ("voice",),
          lambda c: bool(ev(c, "file:voice-heartbeat").get("mic_last_error"))),
+
+    Rule("voice.asr_error", "云端 ASR 调用失败/超时", "human",
+         "看 asr_last_error；常见是网络延迟导致 request timeout（status=44）。"
+         "先查网关 RTT / WiFi 质量",
+         ("voice",),
+         lambda c: bool(ev(c, "file:voice-heartbeat").get("asr_last_error"))),
 
     Rule("tof.last_error_stale", "ToF 连着但保留着旧错误", "none",
          "仅提示：该字段重连后不清零，不代表当前故障",

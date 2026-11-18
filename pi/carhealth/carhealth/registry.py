@@ -17,6 +17,7 @@ from .probes.dds import DdsProbe
 from .probes.file_status import FileStatusProbe
 from .probes.host import HostProbe
 from .probes.net import PingProbe, TcpProbe, resolve_board_host
+from .probes.net_latency import GatewayLatencyProbe
 from .probes.power import PowerProbe
 from .probes.ros_topic import RosNodeBackend, RosTopicStore, TopicProbe
 from .probes.service_health import ServiceHealthProbe
@@ -76,6 +77,7 @@ def build_probes(ros: bool = True, board_host: str | None = None,
     probes["net:board"] = PingProbe("net:board", host_fn=host_fn)
     probes["net:rosbridge"] = TcpProbe("net:rosbridge", ROSBRIDGE_ADDR[0],
                                        ROSBRIDGE_ADDR[1])
+    probes["net:gateway"] = GatewayLatencyProbe()
 
     probes["usb"] = UsbEventsProbe()
     probes["dds"] = DdsProbe()

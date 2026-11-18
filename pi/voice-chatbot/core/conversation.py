@@ -435,8 +435,9 @@ class ConversationManager:
             "wakeword_last_byte_age_s": self._wakeword.last_byte_age_s,
             "mic_open": self._mic.is_open,
             "mic_last_error": self._mic.last_error,
-            "asr_last_ok_wall": self._asr_last_ok_wall,
-            "asr_last_err_wall": self._asr_last_err_wall,
+            "asr_last_ok_wall": getattr(self._asr, "last_ok_wall", None),
+            "asr_last_err_wall": getattr(self._asr, "last_error_wall", None),
+            "asr_last_error": getattr(self._asr, "last_error", None),
         }
 
     def run(self) -> None:
