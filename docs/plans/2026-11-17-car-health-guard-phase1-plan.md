@@ -5955,3 +5955,8 @@ git commit -m "test(health): 一期故障注入脚本与验收记录"
   `tof` 正确判 DEGRADED 并给出 `udev.tof_byid_only` 指令。
 - 现场 `arm-grasp`/`voice`/`k230-framed` 仍是旧代码，`/health/arm_grasp`、
   语音心跳、framed 状态文件不存在 → 对应组件 STALE，符合“部署未完成”的预期。
+- 2026-11-18 10:00 用户喊唤醒词“小亚”后无响应：日志显示唤醒正常，但
+  `ASR: API error — status=44, request timeout after 23 seconds`；根因是
+  `TP-LINK_EE82_507` 2.4G，网关 RTT 平均 141ms → 372ms、最大 463ms。
+  已新增 `net:gateway` 探针与 `host.gateway_latency` / `voice.asr_error` 规则；
+  `ASRClient` 不再把 API 错误吞成“成功”，心跳带 `asr_last_error`。
