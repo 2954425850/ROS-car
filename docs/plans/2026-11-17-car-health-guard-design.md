@@ -214,7 +214,7 @@ device/port/last_error/frame_id`）即契约模板，新增心跳沿用同一形
 | `voice.mic_error` | 心跳带 `mic_last_error` | 物理 | USB 重枚举/设备被抢占；换口或重启语音助手 |
 | `voice.api_stuck` | `busy_for_s`>180 | 软件 | 看 ASR/LLM 报错；这是「400 后卡死」的历史形态 |
 | `voice.asr_error` | 心跳带 `asr_last_error` | 网络/软件 | 常见是 `status=44 request timeout`；先查网关 RTT/WiFi |
-| `host.gateway_latency` | 网关 RTT 平均 >50ms 或最大 >200ms 或丢包 ≥20% | 物理/网络 | 信号满格也会发生；换 5G/AP、靠近路由或改有线 |
+| `host.gateway_latency` | 网关 RTT 平均 >50ms 或最大 >200ms 或丢包 ≥20% | 物理/网络 | 信号满格也会发生；**先关 WiFi 省电**（`iwconfig wlan0 power off`），再换 5G/AP 或改有线 |
 | `tof.last_error_stale` | `connected=true` 但 `last_error` 非空 | 证据 | 只提示，不判故障（该字段重连后不清零） |
 
 规则是纯函数，输入是 `{probe_name: ProbeResult}` + 组件判定 + 当前时间；

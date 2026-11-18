@@ -183,8 +183,9 @@ RULES = (
                     or (_number(ev(c, "host").get("wifi_link"), 99) < 30))),
 
     Rule("host.gateway_latency", "WiFi 网关延迟高（信号满格也会这样）", "human",
-         "网关 RTT 平均 >50ms 或最大 >200ms：云端 ASR/TTS 会超时；"
-         "换 5G/AP、靠近路由或改用有线",
+         "网关 RTT 平均 >50ms 或最大 >200ms：先关 WiFi 省电"
+         "（sudo iwconfig wlan0 power off），再换 5G/AP、靠近路由或改用有线；"
+         "否则云端 ASR/TTS 会超时",
          ("host",),
          lambda c: ((_number(ev(c, "net:gateway").get("rtt_avg_ms"), 0) > 50)
                     or (_number(ev(c, "net:gateway").get("rtt_max_ms"), 0) > 200)

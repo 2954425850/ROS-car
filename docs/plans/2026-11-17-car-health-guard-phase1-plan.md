@@ -5960,3 +5960,6 @@ git commit -m "test(health): 一期故障注入脚本与验收记录"
   `TP-LINK_EE82_507` 2.4G，网关 RTT 平均 141ms → 372ms、最大 463ms。
   已新增 `net:gateway` 探针与 `host.gateway_latency` / `voice.asr_error` 规则；
   `ASRClient` 不再把 API 错误吞成“成功”，心跳带 `asr_last_error`。
+- 换到 OPPO 后仍慢（ASR 25s/TTS 14s）：WiFi **省电模式 on**，网关 RTT 425ms/最大 1s；
+  `iwconfig wlan0 power off` 后 33.6ms/46ms。已用 NetworkManager 持久化
+  `wifi.powersave=2` + `99-wifi-powersave-off.conf`；规则提示也加了这一条。
