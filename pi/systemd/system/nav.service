@@ -10,7 +10,7 @@ Type=simple
 User=cy
 Environment=HOME=/home/cy
 WorkingDirectory=/home/cy/ros2_lidar
-ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && exec ros2 launch /home/cy/ros2_lidar/launch/nav.launch.py'
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && exec ros2 launch /home/cy/ros2_lidar/launch/nav.launch.py use_composition:=False'
 Restart=on-failure
 RestartSec=5
 KillMode=control-group
