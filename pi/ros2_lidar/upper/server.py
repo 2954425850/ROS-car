@@ -264,6 +264,7 @@ class ModeController:
         self.launch_dir = launch_dir
         self.tools_dir = os.path.join(os.path.dirname(launch_dir), "tools")
         self.proc = None
+        self.pgid = None       # launch 的进程组；即使拉起进程先死了也要收干净
         self.mode = None
         self.lock = threading.Lock()
         threading.Thread(target=self._watch, daemon=True,
@@ -277,8 +278,7 @@ class ModeController:
             with self.lock:
                 if self.proc is not None and self.proc.poll() is not None:
                     code = self.proc.returncode
-                    self.proc = None
-                    self.mode = None
+                    self._kill()          # 组里可能还有没退干净的节点
                     self.state.set_status(mode="idle", owned=False,
                                           goal=None,
                                           note="进程已退出（rc=%s）" % code)
@@ -301,24 +301,45 @@ class ModeController:
                 return m
         return None
 
+    def _group_alive(self):
+        if self.pgid is None:
+            return False
+        try:
+            os.killpg(self.pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
     def _kill(self):
-        if self.proc is None:
+        """收掉整个进程组。nav2 的 lifecycle_manager 不鸟 SIGTERM，
+        所以要等到超时后 SIGKILL；不能只看 launch 进程是否已退出。"""
+        if self.pgid is None:
             return
         try:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
-            self.proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-            except OSError:
-                pass
-            try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+            os.killpg(self.pgid, signal.SIGINT)
         except OSError:
             pass
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if self.proc is not None:
+                self.proc.poll()      # 顺手回收，避免僵尸让组一直"活着"
+            if not self._group_alive():
+                break
+            time.sleep(0.2)
+        if self._group_alive():
+            try:
+                os.killpg(self.pgid, signal.SIGKILL)
+            except OSError:
+                pass
+        if self.proc is not None:
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
         self.proc = None
+        self.pgid = None
         self.mode = None
         self.state.set_status(owned=False, goal=None)
 
@@ -347,6 +368,8 @@ class ModeController:
                 if self.mode == mode:
                     return True, "已经在运行"
                 return False, "另一个模式正在运行，先停止"
+            if self.pgid is not None and not self._alive():
+                self._kill()              # 上一次的残组先收掉
             ext = self._external()
             if ext:
                 return False, ("检测到外部实例（%s）。先 sudo systemctl stop slam/nav"
@@ -369,12 +392,14 @@ class ModeController:
                 self.proc = subprocess.Popen(
                     cmd, stdout=log, stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL, start_new_session=True)
+                self.pgid = os.getpgid(self.proc.pid)
             except Exception as e:
                 self.proc = None
+                self.pgid = None
                 return False, "启动失败：%s" % e
             time.sleep(2.0)
             if self.proc.poll() is not None:
-                self.proc = None
+                self._kill()
                 return False, "启动失败，看 %s" % log_path
             self.mode = mode
             self.state.set_status(
@@ -385,7 +410,7 @@ class ModeController:
 
     def stop(self):
         with self.lock:
-            if not self._alive():
+            if self.pgid is None:
                 self.proc = None
                 self.mode = None
                 self.state.set_status(owned=False)
