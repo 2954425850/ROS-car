@@ -1,7 +1,7 @@
 """建图之后的定位 + 导航：雷达 + TF + AMCL + nav2（2026-11-18 方案）。
 
     ros2 launch /home/cy/ros2_lidar/launch/nav.launch.py
-    ros2 launch ... use_composition:=false      # 回退到多进程（排障用）
+    ros2 launch ... use_composition:=False      # 回退到多进程（排障用）
 
 链路（速度优先级由 cmd_mux 仲裁，导航最低）：
   controller_server -> cmd_vel_raw -> velocity_smoother -> cmd_vel_smoothed
@@ -117,7 +117,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('use_composition', default_value='true'),
+        DeclareLaunchArgument('use_composition', default_value='True'),
         DeclareLaunchArgument('container_name', default_value='nav2_container'),
 
         # nav2 进程反复重启后 Fast DDS 的 SHM 端口会残留冲突。

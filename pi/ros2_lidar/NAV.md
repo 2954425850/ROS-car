@@ -10,7 +10,7 @@
 
 ```
 ros2 launch /home/cy/ros2_lidar/launch/nav.launch.py
-ros2 launch ... use_composition:=false     # 排障回退（多进程）
+ros2 launch ... use_composition:=False     # 排障回退（多进程）
 ```
 
 SLAM 与导航**不能同时跑**（都发 `map->odom`）。`nav.service` / `slam.service`
@@ -103,7 +103,7 @@ RPP 严格跟随路径；**没有加禁行区/硬性横向距离**（按修订�
    之间换一下；RPP 同理：
    `nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController` ↔
    `.../RegulatedPurePursuitController`。如果 composition 起不来，加
-   `use_composition:=false`。
+   `use_composition:=False`。
 
 > 注：`bond_timeout=10 s` 只改了 navigation 的 lifecycle manager（失败发生在
 > behavior_server 这一侧）；localization 的 manager 仍是官方默认 4 s，因为
