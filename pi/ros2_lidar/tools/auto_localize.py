@@ -26,7 +26,7 @@ Parameters
   pose_file             default <map dir>/last_pose.json
   map_frame             default map
   laser_x/laser_y       default -0.256 / 0.0065 (laser in base_footprint)
-  score_thresh          0.20
+  score_thresh          0.25
   min_clearance         0.30 m (candidate poses must be this far from walls)
   max_attempts          5 (then keep retrying every retry_period)
   retry_period          15 s
@@ -112,7 +112,7 @@ class AutoLocalize(Node):
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('laser_x', -0.256)
         self.declare_parameter('laser_y', 0.0065)
-        self.declare_parameter('score_thresh', 0.20)
+        self.declare_parameter('score_thresh', 0.25)
         self.declare_parameter('min_clearance', 0.30)
         self.declare_parameter('max_attempts', 5)
         self.declare_parameter('retry_period', 15.0)
