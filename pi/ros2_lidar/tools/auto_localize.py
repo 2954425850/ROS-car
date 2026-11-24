@@ -262,9 +262,12 @@ class AutoLocalize(Node):
         msg.pose.pose.position.y = y
         msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
         msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
-        msg.pose.covariance[0] = 0.25
-        msg.pose.covariance[7] = 0.25
-        msg.pose.covariance[35] = 0.068
+        # tight prior: the global scan match is the best estimate; letting
+        # AMCL start with a 0.5 m std lets it slide along a featureless
+        # corridor (seen 2026-11-24: 1.04 -> 0.61 m).
+        msg.pose.covariance[0] = 0.05
+        msg.pose.covariance[7] = 0.05
+        msg.pose.covariance[35] = 0.02
         for _ in range(3):
             msg.header.stamp = self.get_clock().now().to_msg()
             self.pub.publish(msg)
