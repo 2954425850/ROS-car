@@ -754,6 +754,9 @@ def main(argv=None):
     parser.add_argument("--maps-dir", default=maps_default,
                         help="地图目录（默认 %s）" % maps_default)
     args = parser.parse_args(argv)
+    # systemd 的 stop 发 SIGTERM。转成 SystemExit，好让下面的 finally
+    # 优雅地停掉自己拉起的 launch 子进程。
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     state = State()
     stop = threading.Event()

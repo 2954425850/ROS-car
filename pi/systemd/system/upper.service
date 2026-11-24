@@ -1,0 +1,19 @@
+[Unit]
+Description=nepu upper (SLAM/nav web entry)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cy
+Environment=HOME=/home/cy
+WorkingDirectory=/home/cy/ROS-car/pi/ros2_lidar/upper
+# run.sh 会 source ROS 环境后 exec server.py
+ExecStart=/bin/bash /home/cy/ROS-car/pi/ros2_lidar/upper/run.sh
+Restart=on-failure
+RestartSec=5
+# 停服务时把它拉起的 slam/nav 子进程一起收掉（否则会留在 cgroup 外）
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

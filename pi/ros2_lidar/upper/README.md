@@ -16,6 +16,16 @@ http://<Pi IP>:8850
 - 地图目录默认 `/home/cy/ros2_lidar/maps`（不存在时用仓库里的 `maps/`），
   `--maps-dir` 可改。
 
+### 开机自启
+
+```bash
+bash ~/ROS-car/pi/ros2_lidar/upper/install.sh    # 装 systemd 单元并立即启动
+bash ~/ROS-car/pi/ros2_lidar/upper/uninstall.sh  # 取消自启
+```
+
+服务名 `upper`（`pi/systemd/system/upper.service`）。启动后是空闲状态，
+建图/导航仍需在页面上点。`systemctl stop upper` 会把它拉起的建图/导航一并停掉。
+
 ## 页面操作
 
 | 按钮 | 行为 |
@@ -67,7 +77,8 @@ curl -s http://127.0.0.1:8850/api/health
 ## 删除
 
 ```bash
-rm -rf ~/ROS-car/pi/ros2_lidar/upper
+bash ~/ROS-car/pi/ros2_lidar/upper/uninstall.sh   # 先撤 systemd 单元
+rm -rf ~/ROS-car/pi/ros2_lidar/upper             # 再删代码
 ```
 
-没有 systemd 单元、sudoers、symlink 或配置文件需要清理。
+除此之外没有别的东西需要清理：没有 sudoers、symlink 或配置文件。
