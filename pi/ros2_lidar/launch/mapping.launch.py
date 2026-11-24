@@ -37,7 +37,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import ExecuteProcess, IncludeLaunchDescription, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
@@ -55,6 +55,14 @@ def generate_launch_description():
             'is the RPLIDAR plugged in?\n'
             'Present: %s' % (sorted(glob.glob('/dev/serial/by-id/*')) or 'nothing'))
 
+    reset = ExecuteProcess(
+        cmd=['python3', os.path.join(HERE, 'tools', 'lidar_reset.py'), ports[0]],
+        output='screen')
+
+    scan_filter = ExecuteProcess(
+        cmd=['python3', os.path.join(HERE, 'tools', 'scan_self_filter.py')],
+        output='screen')
+
     slam_params = os.path.join(HERE, 'config', 'slam_params.yaml')
     urdf_file = os.path.join(HERE, 'urdf', 'robot.urdf')
 
@@ -62,6 +70,13 @@ def generate_launch_description():
         robot_description = f.read()
 
     return LaunchDescription([
+        # 2026-11-24: same two pre-steps as nav.launch.py.
+        #  * STOP+RESET the lidar, otherwise a restart can hang in getDeviceInfo.
+        #  * feed slam_toolbox /scan_filtered (arm is a fixed 0.44 m return at
+        #    0 deg); config/slam_params.yaml has scan_topic: /scan_filtered.
+        reset,
+        TimerAction(period=1.0, actions=[scan_filter]),
+        TimerAction(period=3.0, actions=[
         # Mirrors the stock rplidar.launch.py plus auto_standby and a resolved
         # serial port. Measured on the bench: ~6.5 Hz, frame_id 'laser'.
         Node(
@@ -77,7 +92,7 @@ def generate_launch_description():
                 'angle_compensate': True,
                 'auto_standby': False,
             }],
-        ),
+        )]),
 
         # Publishes base_footprint -> base_link -> laser (fixed joints).
         Node(
