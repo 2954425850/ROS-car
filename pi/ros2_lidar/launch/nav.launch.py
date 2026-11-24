@@ -39,7 +39,7 @@ from launch_ros.actions import ComposableNodeContainer, Node
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 PARAMS = os.path.join(HERE, 'config', 'nav2_params.yaml')
-MAP_YAML = os.path.join(HERE, 'maps', 'nav_20261117.yaml')
+MAP_YAML = os.path.join(HERE, 'maps', 'nav_20261124.yaml')
 URDF = os.path.join(HERE, 'urdf', 'robot.urdf')
 
 

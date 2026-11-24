@@ -39,10 +39,10 @@ amcl:
     scan_topic: scan_filtered
     set_initial_pose: true
     initial_pose:
-      x: -1.157
-      y: 0.556
+      x: 0.744
+      y: 0.581
       z: 0.0
-      yaw: 0.0
+      yaw: -0.127
 bt_navigator:
   ros__parameters:
     global_frame: map
