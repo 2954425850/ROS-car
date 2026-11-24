@@ -86,7 +86,9 @@ def generate_launch_description():
     # scan-to-map search).
     pose_persist = ExecuteProcess(
         cmd=['python3', os.path.join(HERE, 'tools', 'pose_persist.py'),
-             '--ros-args', '-p', 'max_attempts:=0'],
+             '--ros-args', '-p', 'max_attempts:=0',
+             # 与 auto_localize 同一张地图、同一个 *_last_pose.json
+             '-p', ['map_yaml:=', map_yaml]],
         output='screen')
 
     auto_localize = ExecuteProcess(

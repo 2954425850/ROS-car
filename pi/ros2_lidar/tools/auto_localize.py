@@ -14,8 +14,19 @@ No operator input needed at startup:
      into the mapped area or re-map.
 
 The score is the trimmed mean distance from the scan endpoints to the nearest
-occupied map cell (1 m penalty for unknown cells, 2 m outside the map).  On the
-2026-11-24 map a correct pose scores ~0.05 m; a wrong one >= 0.45 m.
+occupied map cell (1 m penalty for unknown cells, 2 m outside the map).  A pose
+is accepted only if BOTH:
+
+  * score < score_thresh, and
+  * at least hit_thresh of the scan endpoints land within hit_dist of an
+    occupied cell.
+
+2026-11-24 实测（这张图）：正确位姿 score 0.005~0.02 / 命中 86%；错误位姿
+score 0.08~0.12 / 命中 37%。只用距离时错误位姿也能过 0.25 的阈值，加命中率
+后才能把两者分开。
+
+此外，扫描点数不足 min_scan_points 时（雷达刚复位的第一圈常常只有 200 点左右）
+不参与定位，等下一帧完整扫描。
 
     ros2 run-style: python3 auto_localize.py --ros-args \
         -p map_yaml:=/home/cy/ros2_lidar/maps/nav_20261124.yaml
@@ -23,10 +34,14 @@ occupied map cell (1 m penalty for unknown cells, 2 m outside the map).  On the
 Parameters
   map_yaml (required)   map .yaml (PGM + resolution + origin)
   scan_topic            default scan_filtered
-  pose_file             default <map dir>/last_pose.json
+  pose_file             default <地图名>_last_pose.json，与地图同目录
+                        （不再用整个目录共用的 last_pose.json；见 nav_pose_file.py）
   map_frame             default map
   laser_x/laser_y       default -0.256 / 0.0065 (laser in base_footprint)
-  score_thresh          0.25
+  score_thresh          0.25 (m)
+  hit_dist              0.10 (m) 端点算作"打中"的距离
+  hit_thresh            0.50     至少一半端点要打中
+  min_scan_points       500      少于此数不定位
   min_clearance         0.30 m (candidate poses must be this far from walls)
   max_attempts          5 (then keep retrying every retry_period)
   retry_period          15 s
@@ -48,6 +63,8 @@ try:
     _HAVE_SCIPY = True
 except Exception:
     _HAVE_SCIPY = False
+
+from nav_pose_file import pose_path
 
 
 def read_pgm(path):
@@ -113,6 +130,9 @@ class AutoLocalize(Node):
         self.declare_parameter('laser_x', -0.256)
         self.declare_parameter('laser_y', 0.0065)
         self.declare_parameter('score_thresh', 0.25)
+        self.declare_parameter('hit_dist', 0.10)
+        self.declare_parameter('hit_thresh', 0.50)
+        self.declare_parameter('min_scan_points', 500)
         self.declare_parameter('min_clearance', 0.30)
         self.declare_parameter('max_attempts', 5)
         self.declare_parameter('retry_period', 15.0)
@@ -121,12 +141,15 @@ class AutoLocalize(Node):
         if not yaml_path:
             raise RuntimeError('auto_localize: map_yaml parameter is required')
         self.map_dir = os.path.dirname(os.path.abspath(yaml_path))
-        self.pose_file = self.get_parameter('pose_file').value or \
-            os.path.join(self.map_dir, 'last_pose.json')
+        self.pose_file = pose_path(yaml_path,
+                                   self.get_parameter('pose_file').value)
         self.map_frame = self.get_parameter('map_frame').value
         self.lx = float(self.get_parameter('laser_x').value)
         self.ly = float(self.get_parameter('laser_y').value)
         self.thresh = float(self.get_parameter('score_thresh').value)
+        self.hit_dist = float(self.get_parameter('hit_dist').value)
+        self.hit_thresh = float(self.get_parameter('hit_thresh').value)
+        self.min_points = int(self.get_parameter('min_scan_points').value)
         self.min_clear = float(self.get_parameter('min_clearance').value)
         self.max_attempts = int(self.get_parameter('max_attempts').value)
         self.retry = float(self.get_parameter('retry_period').value)
@@ -149,6 +172,8 @@ class AutoLocalize(Node):
             self.get_logger().warn('scipy missing: using chamfer distance')
         self.pen = np.where(a == 205, 1.0, 0.0)
         self.score_cell = self.dist + self.pen
+        # "打中"：端点离最近占用格不超过 hit_dist（距离图已在米制）
+        self.hit_ok = self.dist <= self.hit_dist
         self.free = (((a == 254) | (a == 255)) &
                      (self.dist > self.min_clear))
         ys, xs = np.where(self.free)
@@ -183,9 +208,9 @@ class AutoLocalize(Node):
         ang = m.angle_min + np.arange(len(r)) * m.angle_increment
         ok = np.isfinite(r) & (r > 0.15) & (r < 12.0)
         r, ang = r[ok], ang[ok]
-        # The first revolution after the lidar starts is often incomplete
-        # (202 points instead of ~650); scoring it gives false negatives.
-        if len(r) < 150:
+        # 雷达刚复位的第一圈常常只有 ~200 点（完整一圈约 650）。这种残帧参与
+        # 匹配会把位姿带偏（2026-11-24 实测：错 4 m、147°）。等完整帧。
+        if len(r) < self.min_points:
             return None
         step = max(1, len(r) // max_points)
         r, ang = r[::step], ang[::step]
@@ -202,6 +227,21 @@ class AutoLocalize(Node):
         sc[ins] = self.score_cell[py[ins], px[ins]]
         k = max(1, int(len(sc) * trim))
         return float(np.sort(sc)[:k].mean())
+
+    def hit_rate(self, bx, by, yaw, sv):
+        """端点落在占用格 hit_dist 以内的比例（与 score 同一套投影）。"""
+        c, s = math.cos(yaw), math.sin(yaw)
+        R = np.array([[c, -s], [s, c]])
+        pts = sv @ R.T + np.array([self.lx, self.ly]) @ R.T + np.array([bx, by])
+        px = ((pts[:, 0] - self.ox) / self.res).astype(np.int32)
+        py = (self.h - 1 - ((pts[:, 1] - self.oy) / self.res)).astype(np.int32)
+        ins = (px >= 0) & (px < self.w) & (py >= 0) & (py < self.h)
+        hit = np.zeros(len(pts), dtype=bool)
+        hit[ins] = self.hit_ok[py[ins], px[ins]]
+        return float(hit.mean())
+
+    def acceptable(self, score, hit):
+        return score < self.thresh and hit >= self.hit_thresh
 
     # ------------------------------------------------------------- search
     def global_search(self, sv):
@@ -291,39 +331,47 @@ class AutoLocalize(Node):
             return
         if self.attempts > 0 and now - self.last_try < self.retry:
             return
-        self.last_try = now
-        self.attempts += 1
         sv = self.scan_vectors()
         if sv is None:
+            self.get_logger().info(
+                'auto_localize: waiting for a full scan (>= %d points)'
+                % self.min_points, throttle_duration_sec=5.0)
             return
+        self.last_try = now
+        self.attempts += 1
 
         # 1) last saved pose
         if os.path.exists(self.pose_file):
             try:
                 with open(self.pose_file) as f:
                     d = json.load(f)
-                s = self.score(float(d['x']), float(d['y']),
-                               float(d['yaw']), sv)
-                if s < self.thresh:
-                    if self.publish_pose(float(d['x']), float(d['y']),
-                                         math.degrees(float(d['yaw'])),
-                                         'restored last pose score %.3f' % s):
+                bx, by, byaw = float(d['x']), float(d['y']), float(d['yaw'])
+                s = self.score(bx, by, byaw, sv)
+                h = self.hit_rate(bx, by, byaw, sv)
+                if self.acceptable(s, h):
+                    if self.publish_pose(bx, by, math.degrees(byaw),
+                                         'restored last pose score %.3f hit %.0f%%'
+                                         % (s, 100 * h)):
                         return
                 self.get_logger().info(
-                    'auto_localize: last pose score %.3f (> %.2f), global search'
-                    % (s, self.thresh))
+                    'auto_localize: last pose score %.3f hit %.0f%% '
+                    '(need < %.2f and >= %.0f%%), global search'
+                    % (s, 100 * h, self.thresh, 100 * self.hit_thresh))
             except Exception as e:
                 self.get_logger().warn('auto_localize: last pose unusable: %s' % e)
 
         # 2) global search
         s, x, y, yaw = self.global_search(sv)
-        if s < self.thresh:
-            self.publish_pose(x, y, yaw, 'global match score %.3f' % s)
+        h = self.hit_rate(x, y, math.radians(yaw), sv)
+        if self.acceptable(s, h):
+            self.publish_pose(x, y, yaw,
+                              'global match score %.3f hit %.0f%%' % (s, 100 * h))
         else:
             self.get_logger().error(
-                'auto_localize: NO match (best %.3f > %.2f). Robot is probably '
-                'outside the mapped area or the scene changed. NOT publishing; '
-                'move it into the map or re-map.' % (s, self.thresh))
+                'auto_localize: NO match (score %.3f hit %.0f%%; need < %.2f '
+                'and >= %.0f%%). Robot is probably outside the mapped area or '
+                'the scene changed. NOT publishing; move it into the map or '
+                're-map.' % (s, 100 * h, self.thresh, 100 * self.hit_thresh))
 
 
 def main():

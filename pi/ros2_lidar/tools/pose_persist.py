@@ -14,7 +14,10 @@ If the file is missing or the robot was moved, delete the file: AMCL then uses
 the initial_pose fallback in nav2_params.yaml.
 
 Parameters
-  pose_file      (default /home/cy/ros2_lidar/maps/last_pose.json)
+  map_yaml       (default '')  给了就按地图名存 <地图名>_last_pose.json，
+                               与 auto_localize 使用同一规则（nav_pose_file.py）
+  pose_file      (default '')  显式路径优先；两者都空时退回
+                               /home/cy/ros2_lidar/maps/last_pose.json
   publish_delay  (8.0 s)   wait for AMCL to start before restoring
   retry_period   (5.0 s)
   max_attempts   (3)
@@ -29,18 +32,21 @@ import rclpy
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from rclpy.node import Node
 
+from nav_pose_file import pose_path
+
 
 class PosePersist(Node):
     def __init__(self):
         super().__init__('pose_persist')
-        self.declare_parameter('pose_file',
-                               '/home/cy/ros2_lidar/maps/last_pose.json')
+        self.declare_parameter('map_yaml', '')
+        self.declare_parameter('pose_file', '')
         self.declare_parameter('publish_delay', 8.0)
         self.declare_parameter('retry_period', 5.0)
         self.declare_parameter('max_attempts', 3)
         self.declare_parameter('map_frame', 'map')
 
-        self.file = self.get_parameter('pose_file').value
+        self.file = pose_path(self.get_parameter('map_yaml').value,
+                              self.get_parameter('pose_file').value)
         self.map_frame = self.get_parameter('map_frame').value
         self.publish_delay = float(self.get_parameter('publish_delay').value)
         self.retry_period = float(self.get_parameter('retry_period').value)

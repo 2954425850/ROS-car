@@ -51,7 +51,7 @@ controller_server -> cmd_vel_raw -> velocity_smoother -> cmd_vel_smoothed
 
 | 环节 | 选型 | 关键参数 |
 |---|---|---|
-| 定位 | AMCL likelihood field | 500~2000 粒子；`recovery_alpha_slow=0.01`、`fast=0.2`；初始位姿由 `pose_persist` 恢复，yaml 里的只是兜底 |
+| 定位 | AMCL likelihood field | 500~2000 粒子；`recovery_alpha_slow=0.01`、`fast=0.2`；初始位姿由 `auto_localize` 给出（score + 命中率双判据），yaml 里不设兜底 |
 | 全局规划 | **Smac Hybrid-A\*** | `motion_model_for_search=REEDS_SHEPP`、`minimum_turning_radius=0.5`、`reverse_penalty=2.0`、`change_penalty=0.3`、`cost_penalty=2.0`、`allow_unknown=false`、`tolerance=0.15` |
 | 局部控制 | **RPP** | `use_rotate_to_heading=false`、`allow_reversing=true`、`use_cost_regulated_linear_velocity_scaling=true`、`desired_linear_vel=0.25`、`max_angular_accel=0.8` |
 | 局部代价图 | **obstacle 层**（不再 voxel） | 3×3 m，`/scan_filtered`，膨胀 **0.7 m**、`cost_scaling_factor=2.0` |
@@ -62,6 +62,23 @@ controller_server -> cmd_vel_raw -> velocity_smoother -> cmd_vel_smoothed
 
 **不优先贴边**：靠 Smac 的 `cost_penalty` 在“路短”和“离障碍远”之间权衡，
 RPP 严格跟随路径；**没有加禁行区/硬性横向距离**（按修订版）。
+
+## 2026-11-24 定位可靠性修补
+
+实车踩到：新地图第一次起导航时，`auto_localize` 全图搜索把位姿选错了
+（错 4 m、147°），错位姿打分 0.12 仍低于旧的 0.25 阈值被接受；AMCL 又关闭了
+随机恢复粒子，错位姿被锁死；`pose_persist` 把它存盘，下次启动直接"恢复"。
+
+三条修改：
+
+| 改动 | 内容 |
+|---|---|
+| 位姿文件按地图区分 | `<地图名>_last_pose.json`，规则在 `tools/nav_pose_file.py`；`auto_localize` 与 `pose_persist` 共用。换地图不会再继承别的图的位姿 |
+| 双判据接受 | `score < 0.25` **且** 命中率 `>= 50%`（端点在墙 0.1 m 内）。实测正确位姿 score 0.005~0.02/命中 86%，错误 0.08~0.12/命中 37% |
+| 等完整扫描 | 有效点 `< 500`（雷达刚复位的第一圈约 200 点）不参与定位 |
+
+参数：`hit_dist=0.10`、`hit_thresh=0.50`、`min_scan_points=500`。
+
 
 ## 明早运行手册（Pi 上）
 
@@ -87,8 +104,9 @@ RPP 严格跟随路径；**没有加禁行区/硬性横向距离**（按修订�
    ros2 topic echo /amcl_pose --once
    ros2 run tf2_ros tf2_echo map base_footprint
    ```
-   `pose_persist` 会用上次位姿；如果车被搬动过，删 `~/ros2_lidar/maps/last_pose.json`
-   并改 `nav2_params.yaml` 的 `amcl.initial_pose`。
+   `pose_persist` 会用上次位姿；如果车被搬动过，删
+   `~/ros2_lidar/maps/<地图名>_last_pose.json`（例如
+   `nav_20261124_last_pose.json`）。**不再有所有地图共用的 `last_pose.json`**。
    **不要靠原地转一圈让 AMCL 收敛**（新方案禁止原地转）；丢了定位就用 PS2
    以低速往前开 0.3~0.5 m，让扫描匹配重新收敛。
 5. 验收（20 次往返 = 40 个目标；约 20 分钟）：
