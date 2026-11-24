@@ -84,8 +84,8 @@ controller_server:
     general_goal_checker:
       stateful: true
       plugin: nav2_controller::SimpleGoalChecker
-      xy_goal_tolerance: 0.1
-      yaw_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.05
+      yaw_goal_tolerance: 0.2
     FollowPath:
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
       desired_linear_vel: 0.25
@@ -110,6 +110,7 @@ controller_server:
       transform_tolerance: 0.2
       use_fixed_curvature_lookahead: false
       curvature_lookahead_dist: 1.0
+      xy_goal_tolerance: 0.05
 local_costmap:
   local_costmap:
     ros__parameters:
