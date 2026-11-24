@@ -11,6 +11,10 @@
 ```
 ros2 launch /home/cy/ros2_lidar/launch/nav.launch.py use_composition:=False
 # composition 目前不稳（container load_node 超时），默认走多进程     # 排障回退（多进程）
+
+# 换地图（默认仍是 maps/nav_20261124.yaml）：
+ros2 launch /home/cy/ros2_lidar/launch/nav.launch.py \
+    map:=/home/cy/ros2_lidar/maps/map_20261124_upper.yaml use_composition:=False
 ```
 
 SLAM 与导航**不能同时跑**（都发 `map->odom`）。`nav.service` / `slam.service`

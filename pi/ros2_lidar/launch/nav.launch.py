@@ -2,6 +2,8 @@
 
     ros2 launch /home/cy/ros2_lidar/launch/nav.launch.py
     ros2 launch ... use_composition:=False      # 回退到多进程（排障用）
+    ros2 launch ... map:=/home/cy/ros2_lidar/maps/xxx.yaml   # 换一张地图
+
 
 链路（速度优先级由 cmd_mux 仲裁，导航最低）：
   controller_server -> cmd_vel_raw -> velocity_smoother -> cmd_vel_smoothed
@@ -39,7 +41,9 @@ from launch_ros.actions import ComposableNodeContainer, Node
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 PARAMS = os.path.join(HERE, 'config', 'nav2_params.yaml')
-MAP_YAML = os.path.join(HERE, 'maps', 'nav_20261124.yaml')
+# 默认地图保持不变（systemd 的 nav.service 不带参数，行为与之前一致）。
+# 临时入口/语音可以用 `map:=/abs/path/to/xxx.yaml` 覆盖。
+MAP_DEFAULT = os.path.join(HERE, 'maps', 'nav_20261124.yaml')
 URDF = os.path.join(HERE, 'urdf', 'robot.urdf')
 
 
@@ -53,6 +57,7 @@ def generate_launch_description():
 
     use_composition = LaunchConfiguration('use_composition')
     container_name = LaunchConfiguration('container_name')
+    map_yaml = LaunchConfiguration('map')
 
     reset = ExecuteProcess(
         cmd=['python3', os.path.join(HERE, 'tools', 'lidar_reset.py'), ports[0]],
@@ -86,7 +91,7 @@ def generate_launch_description():
 
     auto_localize = ExecuteProcess(
         cmd=['python3', os.path.join(HERE, 'tools', 'auto_localize.py'),
-             '--ros-args', '-p', 'map_yaml:=' + MAP_YAML,
+             '--ros-args', '-p', ['map_yaml:=', map_yaml],
              '-p', 'scan_topic:=scan_filtered'],
         output='screen')
 
@@ -108,7 +113,7 @@ def generate_launch_description():
             get_package_share_directory('nav2_bringup'),
             'launch', 'localization_launch.py')),
         launch_arguments={
-            'map': MAP_YAML, 'use_sim_time': 'false',
+            'map': map_yaml, 'use_sim_time': 'false',
             'params_file': PARAMS, 'autostart': 'true',
             'use_composition': use_composition,
             'container_name': container_name,
@@ -129,6 +134,9 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('use_composition', default_value='True'),
         DeclareLaunchArgument('container_name', default_value='nav2_container'),
+        DeclareLaunchArgument(
+            'map', default_value=MAP_DEFAULT,
+            description='静态地图 yaml（绝对路径）；默认 nav_20261124.yaml'),
 
         # nav2 进程反复重启后 Fast DDS 的 SHM 端口会残留冲突。
         # 这个 launch 起的节点改走 UDP，避开 SHM；与基础服务仍能互通。
