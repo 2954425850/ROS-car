@@ -262,7 +262,7 @@ class ModeController:
         self.ros = ros                # RosSource；没有就发不了目标
         self.maps_dir = maps_dir
         self.launch_dir = launch_dir
-        self.tools_dir = os.path.dirname(launch_dir)
+        self.tools_dir = os.path.join(os.path.dirname(launch_dir), "tools")
         self.proc = None
         self.mode = None
         self.lock = threading.Lock()

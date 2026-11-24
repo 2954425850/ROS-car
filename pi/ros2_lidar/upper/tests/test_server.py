@@ -170,6 +170,38 @@ def test_bad_body_is_400(tmp_path):
         srv.shutdown()
 
 
+def test_save_map_calls_tools_save_map_snapshot(tmp_path, monkeypatch):
+    import os
+    import server as srv_mod
+    from server import ModeController
+
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "save_map_snapshot.py").write_text("")
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    maps = tmp_path / "maps"
+    maps.mkdir()
+    ctl = ModeController(State(), None, str(maps), str(launch))
+    assert ctl.tools_dir == str(tools)
+
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+
+        class R:
+            returncode = 0
+            stdout = "saved"
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(srv_mod.subprocess, "run", fake_run)
+    ok, msg = ctl.save_map("abc")
+    assert ok, msg
+    assert seen["cmd"][1] == os.path.join(str(tools), "save_map_snapshot.py")
+
+
 def test_sse_delivers_later_map_update(tmp_path):
     state = State()
     srv, base = _serve(tmp_path, state)
