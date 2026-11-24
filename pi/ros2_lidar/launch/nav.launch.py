@@ -76,8 +76,18 @@ def generate_launch_description():
         cmd=['python3', os.path.join(HERE, 'tools', 'no_pivot_guard.py')],
         output='screen')
 
+    # pose_persist only SAVES now (max_attempts:=0); auto_localize owns the
+    # startup restore (it validates the saved pose and falls back to a global
+    # scan-to-map search).
     pose_persist = ExecuteProcess(
-        cmd=['python3', os.path.join(HERE, 'tools', 'pose_persist.py')],
+        cmd=['python3', os.path.join(HERE, 'tools', 'pose_persist.py'),
+             '--ros-args', '-p', 'max_attempts:=0'],
+        output='screen')
+
+    auto_localize = ExecuteProcess(
+        cmd=['python3', os.path.join(HERE, 'tools', 'auto_localize.py'),
+             '--ros-args', '-p', 'map_yaml:=' + MAP_YAML,
+             '-p', 'scan_topic:=scan_filtered'],
         output='screen')
 
     rsp = Node(
@@ -129,5 +139,6 @@ def generate_launch_description():
         TimerAction(period=5.0, actions=[scan_filter]),
         TimerAction(period=6.0, actions=[pivot_guard]),
         TimerAction(period=6.0, actions=[pose_persist]),
+        TimerAction(period=6.0, actions=[auto_localize]),
         rsp, container, localization, navigation,
     ])
