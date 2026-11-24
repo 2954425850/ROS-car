@@ -183,7 +183,9 @@ class AutoLocalize(Node):
         ang = m.angle_min + np.arange(len(r)) * m.angle_increment
         ok = np.isfinite(r) & (r > 0.15) & (r < 12.0)
         r, ang = r[ok], ang[ok]
-        if len(r) == 0:
+        # The first revolution after the lidar starts is often incomplete
+        # (202 points instead of ~650); scoring it gives false negatives.
+        if len(r) < 150:
             return None
         step = max(1, len(r) // max_points)
         r, ang = r[::step], ang[::step]

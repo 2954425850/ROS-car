@@ -13,6 +13,7 @@ Everything else is passed through unchanged.
     publishes /scan_filtered
 """
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -30,6 +31,7 @@ class ScanSelfFilter(Node):
         self.pub = self.create_publisher(LaserScan, 'scan_filtered', 10)
         self.create_subscription(LaserScan, 'scan', self.cb, qos_profile_sensor_data)
         self.last_removed = -1
+        self.last_log_t = 0.0
 
     def cb(self, msg):
         out = list(msg.ranges)
@@ -45,9 +47,11 @@ class ScanSelfFilter(Node):
                 n += 1
         msg.ranges = out
         self.pub.publish(msg)
-        if n != self.last_removed:
+        now = time.monotonic()
+        if n != self.last_removed and now - self.last_log_t > 5.0:
             self.get_logger().info('filtered %d self points per scan' % n)
             self.last_removed = n
+            self.last_log_t = now
 
 
 def main():
