@@ -3,7 +3,8 @@
 
 Default route (the same one used on 2026-11-17):
 
-    A = (0.744, 0.581, -7.3 deg)    B = (5.0, -0.23, 0 deg)
+    A = (0.744, 0.581, 0 deg)       B = (5.0, -0.23, 0 deg)
+  # both face +x: A->B drives forward, B->A reverses (no U-turn at the ends)
 
 Each "round" is A -> B -> A, so --rounds 20 sends 40 goals.
 
@@ -145,7 +146,7 @@ class Accept(Node):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--a', default='0.744,0.581,-7.3', help='x,y,yaw_deg')
+    ap.add_argument('--a', default='0.744,0.581,0', help='x,y,yaw_deg')
     ap.add_argument('--b', default='5.0,-0.23,0', help='x,y,yaw_deg')
     ap.add_argument('--rounds', type=int, default=20)
     ap.add_argument('--leg-timeout', type=float, default=120.0)
