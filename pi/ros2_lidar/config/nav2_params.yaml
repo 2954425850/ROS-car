@@ -79,8 +79,8 @@ controller_server:
     use_realtime_priority: false
     progress_checker:
       plugin: nav2_controller::SimpleProgressChecker
-      required_movement_radius: 0.3
-      movement_time_allowance: 20.0
+      required_movement_radius: 0.15
+      movement_time_allowance: 30.0
     general_goal_checker:
       stateful: true
       plugin: nav2_controller::SimpleGoalChecker
@@ -358,7 +358,7 @@ collision_monitor:
     slow_zone:
       type: polygon
       action_type: slowdown
-      points: '[[-1.0,-0.65],[1.0,-0.65],[1.0,0.65],[-1.0,0.65]]'
+      points: '[[-0.7,-0.45],[0.7,-0.45],[0.7,0.45],[-0.7,0.45]]'
       slowdown_factor: 0.5
       visualize: false
       enabled: true
