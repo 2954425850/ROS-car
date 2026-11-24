@@ -68,6 +68,108 @@ def test_sse_pushes_status_and_map(tmp_path):
         srv.shutdown()
 
 
+class FakeController:
+    maps_dir = "/tmp/maps"
+
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.calls = []
+
+    def list_maps(self):
+        return [{"name": "a.yaml", "size": 1, "mtime": 2}]
+
+    def start(self, mode, map_name=None):
+        self.calls.append(("start", mode, map_name))
+        return (True, "started") if self.ok else (False, "外部实例在跑")
+
+    def stop(self):
+        self.calls.append(("stop",))
+        return True, "stopped"
+
+    def save_map(self, name):
+        self.calls.append(("save", name))
+        return True, "saved"
+
+    def send_goal(self, x, y, yaw):
+        self.calls.append(("goal", x, y, yaw))
+        return True, "goal sent"
+
+    def cancel_goal(self):
+        self.calls.append(("cancel",))
+        return True, "canceled"
+
+
+def _serve_ctl(tmp_path, controller):
+    index = tmp_path / "index.html"
+    index.write_text("<html>ok</html>", encoding="utf-8")
+    srv = build_server("127.0.0.1", 0, State(), str(index), controller)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d" % srv.server_address[1]
+
+
+def _post(base, path, obj):
+    req = urllib.request.Request(
+        base + path, data=json.dumps(obj).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    return urllib.request.urlopen(req)
+
+
+def test_maps_and_mode_with_controller(tmp_path):
+    ctl = FakeController()
+    srv, base = _serve_ctl(tmp_path, ctl)
+    try:
+        maps = json.loads(urllib.request.urlopen(base + "/api/maps").read())
+        assert maps["maps"][0]["name"] == "a.yaml"
+        body = json.loads(_post(base, "/api/mode",
+                                {"mode": "slam"}).read())
+        assert body["ok"] is True
+        assert ctl.calls[-1] == ("start", "slam", None)
+    finally:
+        srv.shutdown()
+
+
+def test_mode_error_is_409(tmp_path):
+    ctl = FakeController(ok=False)
+    srv, base = _serve_ctl(tmp_path, ctl)
+    try:
+        try:
+            _post(base, "/api/mode", {"mode": "nav", "map": "a.yaml"})
+            assert False, "expected 409"
+        except urllib.error.HTTPError as e:
+            assert e.code == 409
+            assert "外部实例" in json.loads(e.read())["error"]
+    finally:
+        srv.shutdown()
+
+
+def test_goal_and_cancel(tmp_path):
+    ctl = FakeController()
+    srv, base = _serve_ctl(tmp_path, ctl)
+    try:
+        body = json.loads(_post(base, "/api/goal",
+                                {"x": 1.5, "y": -2.0, "yaw": 0.5}).read())
+        assert body["ok"] is True
+        assert ctl.calls[-1] == ("goal", 1.5, -2.0, 0.5)
+        assert json.loads(_post(base, "/api/goal/cancel", {}).read())["ok"]
+    finally:
+        srv.shutdown()
+
+
+def test_bad_body_is_400(tmp_path):
+    srv, base = _serve_ctl(tmp_path, FakeController())
+    try:
+        req = urllib.request.Request(
+            base + "/api/mode", data=b"not json",
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            urllib.request.urlopen(req)
+            assert False, "expected 400"
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+    finally:
+        srv.shutdown()
+
+
 def test_sse_delivers_later_map_update(tmp_path):
     state = State()
     srv, base = _serve(tmp_path, state)

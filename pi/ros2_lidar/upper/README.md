@@ -1,6 +1,6 @@
-# upper — 建图/导航可视化（临时件）
+# upper — 建图/导航入口（临时件）
 
-给「看建图」用的最轻入口。**只读**：不启动/停止任何 ROS 进程，不写任何文件。
+实时看 `/map`、雷达、位姿，并在页面上起停建图/导航、存图、点图发目标。
 后续 App 会做正式的可视化，这个目录可以整个删掉。
 
 ## 起停
@@ -13,8 +13,29 @@ http://<Pi IP>:8850
 ```
 
 - 端口默认 **8850**，`--port` 可改。
-- 建图/导航仍按原方式起：`sudo systemctl start slam` / `sudo systemctl start nav`。
-- 本服务只显示「建图中 / 导航中 / 空闲」，不控制它们。
+- 地图目录默认 `/home/cy/ros2_lidar/maps`（不存在时用仓库里的 `maps/`），
+  `--maps-dir` 可改。
+
+## 页面操作
+
+| 按钮 | 行为 |
+|---|---|
+| 开始建图 / 停止 | 以子进程组起停 `mapping.launch.py`，日志 `/tmp/upper_slam.log` |
+| 选地图 + 开始导航 | 起 `nav.launch.py map:=<选择的地图> use_composition:=False`，日志 `/tmp/upper_nav.log` |
+| 保存地图 | 复用 `tools/save_map_snapshot.py`，写到地图目录 |
+| 点图发目标 | 导航模式下点地图 → 确认 → `NavigateToPose`；可取消 |
+
+**安全边界**：
+
+- 只管理**本页面自己拉起的**子进程；检测到 systemd 的 `slam`/`nav` 或其他实例在跑
+  就拒绝并提示，不抢、不 kill 别人的进程。
+- 建图与导航互斥；切换时先「停止」。
+- 关掉页面服务时会停掉自己拉起的进程（Ctrl-C）。
+
+HTTP API（供以后语音/脚本调用）：`GET /api/maps`、`POST /api/mode
+{"mode":"slam|nav|idle","map":"x.yaml"}`、`POST /api/map/save {"name":"x"}`、
+`POST /api/goal {"x":..,"y":..,"yaw":..}`、`POST /api/goal/cancel`、
+`GET /api/health`。
 
 不连 ROS 只看页面（Pi 关机也能跑）：
 

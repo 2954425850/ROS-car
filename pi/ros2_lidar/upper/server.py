@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""建图/导航可视化入口（临时件，第一层：只读）。
+"""建图/导航可视化入口（临时件，两层）。
 
-一个进程里两件事：
+一个进程里三件事：
   * 后台线程：rclpy 节点订阅 /map、/scan_filtered，查 TF map->base_footprint
+  * 后台线程：ModeController 以子进程组起停 mapping/nav launch，存图、发目标
   * 主线程：stdlib ThreadingHTTPServer，提供页面 + SSE 推送
 
-只读。不启动/停止任何 ROS 进程，不写任何文件。
-删除：rm -rf pi/ros2_lidar/upper（Pi 上没有 systemd 单元、sudoers、symlink）。
+进程控制只动**自己拉起的子进程**；检测到 systemd 的 slam/nav 在跑就拒绝，
+不抢、不 kill 别人的实例。删除：rm -rf pi/ros2_lidar/upper。
 
     bash upper/run.sh                 # 连 ROS
-    python3 upper/server.py --demo    # 不连 ROS，合成数据自检页面
+    python3 upper/server.py --demo    # 不连 ROS，合成数据自检页面（不能操作）
 """
 import base64
 import json
 import math
+import os
+import re
+import signal
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from encode import occupancy_payload, pack_points, scan_to_points, yaw_from_quat
 
 DEFAULT_PORT = 8850
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 class State:
@@ -32,7 +39,7 @@ class State:
         self._scan = None
         self._pose = None
         self._status = {"mode": "unknown", "tf_ok": False, "ros": "starting",
-                        "note": ""}
+                        "note": "", "goal": None, "owned": False}
         self.map_v = 0
         self.scan_v = 0
         self.pose_v = 0
@@ -108,7 +115,17 @@ class Handler(BaseHTTPRequestHandler):
                 "map": None if m is None else {"w": m["w"], "h": m["h"]},
                 "scan_points": snap["scan"]["n"] if snap["scan"] else 0,
                 "clients": state.clients,
+                "goal": snap["status"].get("goal"),
+                "owned": snap["status"].get("owned", False),
+                "control": self.server.controller is not None,
             })
+        elif path == "/api/maps":
+            ctl = self.server.controller
+            if ctl is None:
+                self._json(503, {"error": "演示模式不可操作"})
+            else:
+                self._json(200, {"maps": ctl.list_maps(),
+                                 "maps_dir": ctl.maps_dir})
         elif path == "/events":
             self._sse()
         elif path == "/favicon.ico":
@@ -116,6 +133,55 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
         else:
             self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        ctl = self.server.controller
+        if ctl is None:
+            self._json(503, {"ok": False, "error": "演示模式不可操作"})
+            return
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            if n <= 0 or n > 65536:
+                raise ValueError("bad length")
+            body = json.loads(self.rfile.read(n).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("bad body")
+        except Exception:
+            self._json(400, {"ok": False, "error": "请求格式不对"})
+            return
+
+        if path == "/api/mode":
+            mode = body.get("mode")
+            if mode == "idle":
+                ok, msg = ctl.stop()
+            elif mode in ("slam", "nav"):
+                ok, msg = ctl.start(mode, body.get("map"))
+            else:
+                self._json(400, {"ok": False, "error": "mode 只能是 slam/nav/idle"})
+                return
+        elif path == "/api/map/save":
+            name = body.get("name") or ""
+            ok, msg = ctl.save_map(name)
+        elif path == "/api/goal":
+            try:
+                x = float(body["x"])
+                y = float(body["y"])
+                yaw = float(body.get("yaw", 0.0))
+            except Exception:
+                self._json(400, {"ok": False, "error": "目标点格式不对"})
+                return
+            ok, msg = ctl.send_goal(x, y, yaw)
+        elif path == "/api/goal/cancel":
+            ok, msg = ctl.cancel_goal()
+        else:
+            self._json(404, {"error": "not found"})
+            return
+
+        if ok:
+            self._json(200, {"ok": True, "message": msg})
+        else:
+            self._json(409, {"ok": False, "error": msg})
 
     def _chunk(self, data):
         self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
@@ -159,6 +225,9 @@ class Handler(BaseHTTPRequestHandler):
                         "map_res": m["res"] if m else 0,
                         "scan_n": snap["scan"]["n"] if snap["scan"] else 0,
                         "clients": state.clients,
+                        "goal": snap["status"].get("goal"),
+                        "owned": snap["status"].get("owned", False),
+                        "control": self.server.controller is not None,
                     }))
                 time.sleep(0.05)
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -168,12 +237,191 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-def build_server(host, port, state, index_path):
+def build_server(host, port, state, index_path, controller=None):
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
     srv.state = state
     srv.index_path = index_path
+    srv.controller = controller
     return srv
+
+
+# ---------------------------------------------------------------------------
+# 进程控制（第二层）
+# ---------------------------------------------------------------------------
+
+class ModeController:
+    """起停自己拉起的 launch 子进程；存图；转发导航目标。
+
+    只动自己的进程组。看到 systemd 的 slam/nav（或别处起的实例）就拒绝，
+    不抢、不 kill 别人的进程。
+    """
+
+    def __init__(self, state, ros, maps_dir, launch_dir):
+        self.state = state
+        self.ros = ros                # RosSource；没有就发不了目标
+        self.maps_dir = maps_dir
+        self.launch_dir = launch_dir
+        self.tools_dir = os.path.dirname(launch_dir)
+        self.proc = None
+        self.mode = None
+        self.lock = threading.Lock()
+        threading.Thread(target=self._watch, daemon=True,
+                         name="upper-watch").start()
+
+    # ---------------------------------------------------------------- 内部
+    def _watch(self):
+        """子进程自己退出（崩溃/被 kill）时把状态收回 idle。"""
+        while True:
+            time.sleep(1.0)
+            with self.lock:
+                if self.proc is not None and self.proc.poll() is not None:
+                    code = self.proc.returncode
+                    self.proc = None
+                    self.mode = None
+                    self.state.set_status(mode="idle", owned=False,
+                                          goal=None,
+                                          note="进程已退出（rc=%s）" % code)
+
+    def _alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def _external(self):
+        for unit, name in (("slam", "mapping"), ("nav", "navigating")):
+            try:
+                r = subprocess.run(["systemctl", "is-active", unit],
+                                   capture_output=True, text=True, timeout=3)
+            except Exception:
+                continue
+            if r.stdout.strip() == "active":
+                return name
+        if self.proc is None:
+            m = detect_mode()
+            if m != "idle":
+                return m
+        return None
+
+    def _kill(self):
+        if self.proc is None:
+            return
+        try:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+            self.proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        except OSError:
+            pass
+        self.proc = None
+        self.mode = None
+        self.state.set_status(owned=False, goal=None)
+
+    # ---------------------------------------------------------------- 调色板
+    def list_maps(self):
+        out = []
+        try:
+            for fn in os.listdir(self.maps_dir):
+                if not fn.endswith(".yaml"):
+                    continue
+                p = os.path.join(self.maps_dir, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                out.append({"name": fn, "size": st.st_size,
+                            "mtime": int(st.st_mtime)})
+        except OSError:
+            pass
+        out.sort(key=lambda m: -m["mtime"])
+        return out
+
+    def start(self, mode, map_name=None):
+        with self.lock:
+            if self._alive():
+                if self.mode == mode:
+                    return True, "已经在运行"
+                return False, "另一个模式正在运行，先停止"
+            ext = self._external()
+            if ext:
+                return False, ("检测到外部实例（%s）。先 sudo systemctl stop slam/nav"
+                               % ("建图" if ext == "mapping" else "导航"))
+            if mode == "nav":
+                if (not map_name or not NAME_RE.match(map_name)
+                        or not map_name.endswith(".yaml")):
+                    return False, "请选择地图（.yaml）"
+                if not os.path.isfile(os.path.join(self.maps_dir, map_name)):
+                    return False, "地图不存在：%s" % map_name
+                launch = os.path.join(self.launch_dir, "nav.launch.py")
+                cmd = ["ros2", "launch", launch, "use_composition:=False",
+                       "map:=" + os.path.join(self.maps_dir, map_name)]
+            else:
+                launch = os.path.join(self.launch_dir, "mapping.launch.py")
+                cmd = ["ros2", "launch", launch]
+            log_path = "/tmp/upper_%s.log" % mode
+            try:
+                log = open(log_path, "ab")
+                self.proc = subprocess.Popen(
+                    cmd, stdout=log, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, start_new_session=True)
+            except Exception as e:
+                self.proc = None
+                return False, "启动失败：%s" % e
+            time.sleep(2.0)
+            if self.proc.poll() is not None:
+                self.proc = None
+                return False, "启动失败，看 %s" % log_path
+            self.mode = mode
+            self.state.set_status(mode=mode, owned=True, goal=None, note="")
+            return True, "已启动%s（日志 %s）" % (
+                "建图" if mode == "slam" else "导航", log_path)
+
+    def stop(self):
+        with self.lock:
+            if not self._alive():
+                self.proc = None
+                self.mode = None
+                self.state.set_status(owned=False)
+                return True, "没有由本页面启动的进程"
+            self._kill()
+            return True, "已停止"
+
+    def save_map(self, name):
+        name = (name or "").strip()
+        for ext in (".yaml", ".pgm", ".png"):
+            if name.endswith(ext):
+                name = name[:-len(ext)]
+        if not NAME_RE.match(name):
+            return False, "名字只能用字母/数字/下划线/点/横线（≤64 字）"
+        if not (self._alive() and self.mode == "slam") and detect_mode() != "mapping":
+            return False, "当前不在建图，没有可保存的地图"
+        base = os.path.join(self.maps_dir, name)
+        snapshot = os.path.join(self.tools_dir, "save_map_snapshot.py")
+        try:
+            r = subprocess.run([sys.executable, snapshot, base],
+                               capture_output=True, text=True, timeout=25)
+        except subprocess.TimeoutExpired:
+            return False, "存图超时（没有收到 /map）"
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or "存图失败").strip()[-300:]
+        return True, "已保存 %s.yaml" % name
+
+    def send_goal(self, x, y, yaw):
+        if not (self._alive() and self.mode == "nav") and detect_mode() != "navigating":
+            return False, "当前不在导航模式"
+        if self.ros is None:
+            return False, "ROS 未就绪"
+        return self.ros.send_goal(x, y, yaw)
+
+    def cancel_goal(self):
+        if self.ros is None:
+            return False, "ROS 未就绪"
+        return self.ros.cancel_goal()
 
 
 # ---------------------------------------------------------------------------
@@ -195,10 +443,13 @@ def detect_mode():
 
 
 def _mode_loop(state, stop):
+    """页面自己拉起的进程由 ModeController 负责状态；这里只检测外部实例。"""
     while not stop.is_set():
-        mode = detect_mode()
-        if state.snapshot()["status"].get("mode") != mode:
-            state.set_status(mode=mode)
+        st = state.snapshot()["status"]
+        if not st.get("owned"):
+            mode = detect_mode()
+            if st.get("mode") != mode:
+                state.set_status(mode=mode)
         stop.wait(2.0)
 
 
@@ -218,6 +469,13 @@ class RosSource:
                                    ReliabilityPolicy)
             from sensor_msgs.msg import LaserScan
             from tf2_ros import Buffer, TransformListener
+            try:
+                from action_msgs.msg import GoalStatus
+                from nav2_msgs.action import NavigateToPose
+                from rclpy.action import ActionClient
+                have_nav2 = True
+            except Exception:
+                have_nav2 = False
         except Exception as e:  # 没 source ROS 环境
             self.state.set_status(ros="unavailable",
                                   note="ROS 环境不可用：%s" % e)
@@ -244,6 +502,79 @@ class RosSource:
                 self.create_subscription(LaserScan, "/scan_filtered",
                                          self._on_scan, scan_qos)
                 self.create_timer(0.1, self._tick)
+                self._ac = (ActionClient(self, NavigateToPose,
+                                         "navigate_to_pose")
+                            if have_nav2 else None)
+                self._goal_handle = None
+                self._goal = None
+
+            # ---- 导航目标 ----
+            def _set_goal(self, **kw):
+                g = dict(self._goal or {})
+                g.update(kw)
+                self._goal = g
+                state.set_status(goal=dict(g))
+
+            def send_goal(self, x, y, yaw):
+                if self._ac is None:
+                    return False, "nav2_msgs 不可用"
+                if not self._ac.wait_for_server(timeout_sec=2.0):
+                    return False, "导航服务不在（nav2 没起？）"
+                if self._goal_handle is not None:
+                    try:
+                        self._goal_handle.cancel_goal_async()
+                    except Exception:
+                        pass
+                    self._goal_handle = None
+                g = NavigateToPose.Goal()
+                g.pose.header.frame_id = "map"
+                g.pose.header.stamp = self.get_clock().now().to_msg()
+                g.pose.pose.position.x = float(x)
+                g.pose.pose.position.y = float(y)
+                g.pose.pose.orientation.z = math.sin(float(yaw) / 2.0)
+                g.pose.pose.orientation.w = math.cos(float(yaw) / 2.0)
+                self._set_goal(state="sending", x=float(x), y=float(y),
+                               yaw=float(yaw))
+                fut = self._ac.send_goal_async(
+                    g, feedback_callback=self._on_feedback)
+                fut.add_done_callback(self._on_goal_response)
+                return True, "目标已发送"
+
+            def _on_feedback(self, msg):
+                d = getattr(msg.feedback, "distance_remaining", None)
+                if d is not None:
+                    self._set_goal(state="executing", remaining=float(d))
+
+            def _on_goal_response(self, fut):
+                try:
+                    gh = fut.result()
+                except Exception as e:
+                    self._set_goal(state="failed", error=str(e))
+                    return
+                if not gh.accepted:
+                    self._set_goal(state="rejected")
+                    return
+                self._goal_handle = gh
+                self._set_goal(state="executing")
+                gh.get_result_async().add_done_callback(self._on_goal_result)
+
+            def _on_goal_result(self, fut):
+                self._goal_handle = None
+                try:
+                    st = fut.result().status
+                except Exception as e:
+                    self._set_goal(state="failed", error=str(e))
+                    return
+                names = {GoalStatus.STATUS_SUCCEEDED: "succeeded",
+                         GoalStatus.STATUS_CANCELED: "canceled",
+                         GoalStatus.STATUS_ABORTED: "aborted"}
+                self._set_goal(state=names.get(st, "failed"))
+
+            def cancel_goal(self):
+                if self._goal_handle is None:
+                    return False, "没有正在执行的导航目标"
+                self._goal_handle.cancel_goal_async()
+                return True, "已请求取消"
 
             def _on_map(self, msg):
                 state.set_map(occupancy_payload(msg))
@@ -291,6 +622,16 @@ class RosSource:
                 ex.spin_once(timeout_sec=0.1)
             except Exception:
                 time.sleep(0.1)
+
+    def send_goal(self, x, y, yaw):
+        if self._node is None:
+            return False, "ROS 未就绪"
+        return self._node.send_goal(x, y, yaw)
+
+    def cancel_goal(self):
+        if self._node is None:
+            return False, "ROS 未就绪"
+        return self._node.cancel_goal()
 
 
 # ---------------------------------------------------------------------------
@@ -398,33 +739,47 @@ def main(argv=None):
     import argparse
     import os
 
-    parser = argparse.ArgumentParser(description="建图/导航可视化（只读）")
+    here = os.path.dirname(os.path.abspath(__file__))
+    maps_default = "/home/cy/ros2_lidar/maps"
+    if not os.path.isdir(maps_default):
+        maps_default = os.path.normpath(os.path.join(here, "..", "maps"))
+
+    parser = argparse.ArgumentParser(description="建图/导航入口（可视化 + 操作）")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--demo", action="store_true",
-                        help="不连 ROS，用合成数据自检页面")
+                        help="不连 ROS，用合成数据自检页面（不能操作）")
+    parser.add_argument("--maps-dir", default=maps_default,
+                        help="地图目录（默认 %s）" % maps_default)
     args = parser.parse_args(argv)
 
     state = State()
     stop = threading.Event()
+    controller = None
     if args.demo:
         DemoSource(state).start()
     else:
         source = RosSource(state)
-        if source.start():
+        ok = source.start()
+        controller = ModeController(
+            state, source if ok else None, args.maps_dir,
+            os.path.normpath(os.path.join(here, "..", "launch")))
+        if ok:
             threading.Thread(target=_mode_loop, args=(state, stop),
                              daemon=True, name="upper-mode").start()
 
-    here = os.path.dirname(os.path.abspath(__file__))
     srv = build_server(args.host, args.port, state,
-                       os.path.join(here, "index.html"))
-    print("upper: http://%s:%d" % (args.host, args.port), flush=True)
+                       os.path.join(here, "index.html"), controller)
+    print("upper: http://%s:%d  maps=%s" % (args.host, args.port,
+                                            args.maps_dir), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         stop.set()
+        if controller is not None:
+            controller.stop()
         srv.shutdown()
 
 

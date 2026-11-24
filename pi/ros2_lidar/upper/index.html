@@ -19,6 +19,7 @@
     --demo: #b28dff;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   body {
     font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC",
@@ -66,6 +67,59 @@
   .conn.bad::before { background: var(--bad); }
   .meta { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
 
+  #panel {
+    position: fixed; left: 14px; top: 58px; z-index: 3; width: 286px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    backdrop-filter: blur(8px); overflow: hidden;
+  }
+  #panel .head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 10px; cursor: pointer; font-size: 12px; color: var(--dim);
+    border-bottom: 1px solid var(--line);
+  }
+  #panel.collapsed .head { border-bottom: none; }
+  #panel.collapsed .body { display: none; }
+  #panel .body { padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+  #panel .row { display: flex; gap: 8px; align-items: center; }
+  #panel button, #panel select {
+    flex: 1; min-width: 0; height: 34px; border-radius: 8px;
+    border: 1px solid var(--line); background: rgba(255,255,255,.06);
+    color: var(--text); font-size: 13px; cursor: pointer; padding: 0 8px;
+  }
+  #panel button:hover { background: rgba(255,255,255,.12); }
+  #panel button:disabled { opacity: .4; cursor: not-allowed; }
+  #panel button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  #panel button.danger { background: rgba(255,95,86,.16); border-color: rgba(255,95,86,.4); color: #ff8a84; }
+  #panel button.active { background: rgba(255,179,71,.18); border-color: rgba(255,179,71,.5); color: #ffb347; }
+  #panel select { flex: 2; }
+  .note { font-size: 11px; color: var(--dim); min-height: 14px; line-height: 1.4; }
+  .note.bad { color: var(--bad); }
+  .note.ok { color: var(--ok); }
+
+  #pending {
+    position: fixed; left: 50%; bottom: 62px; transform: translateX(-50%);
+    z-index: 4; display: flex; gap: 10px; align-items: center;
+    padding: 8px 12px; border-radius: 10px; background: var(--panel);
+    border: 1px solid rgba(255,179,71,.5); font-size: 13px;
+  }
+  #pending button {
+    height: 30px; padding: 0 12px; border-radius: 7px; border: 1px solid var(--line);
+    background: rgba(255,255,255,.08); color: var(--text); cursor: pointer;
+  }
+  #pending button.go { background: #ffb347; border-color: #ffb347; color: #1a1205; font-weight: 600; }
+
+  #toast {
+    position: fixed; left: 50%; bottom: 118px; transform: translateX(-50%);
+    z-index: 5; padding: 8px 14px; border-radius: 999px; font-size: 12px;
+    background: rgba(20,25,33,.95); border: 1px solid var(--line);
+    color: var(--text); opacity: 0; transition: opacity .2s; pointer-events: none;
+    max-width: 80vw; text-align: center;
+  }
+  #toast.show { opacity: 1; }
+  #toast.bad { border-color: rgba(255,95,86,.5); color: #ff8a84; }
+
+  #goalchip { font-size: 12px; color: #ffb347; }
+
   #tools {
     position: fixed; right: 14px; bottom: 46px; z-index: 2;
     display: flex; flex-direction: column; gap: 8px;
@@ -92,6 +146,7 @@
   <div class="left">
     <span class="title">建图 / 导航</span>
     <span id="mode" class="pill">连接中…</span>
+    <span id="goalchip" hidden></span>
     <span id="warn" class="warn" hidden></span>
   </div>
   <div class="right">
@@ -102,6 +157,38 @@
 </header>
 
 <canvas id="view"></canvas>
+
+<section id="panel">
+  <div class="head" id="panel-head">
+    <span>操作</span><span id="panel-caret">▾</span>
+  </div>
+  <div class="body">
+    <div class="row">
+      <button id="btn-slam" class="primary">开始建图</button>
+      <button id="btn-stop" class="danger">停止</button>
+    </div>
+    <div class="row">
+      <select id="map-select" title="导航使用的地图"></select>
+      <button id="btn-nav">开始导航</button>
+    </div>
+    <div class="row">
+      <button id="btn-save">保存地图</button>
+      <button id="btn-goal">点图发目标</button>
+    </div>
+    <div class="row" id="goal-row" hidden>
+      <button id="btn-cancel-goal" class="danger">取消导航目标</button>
+    </div>
+    <div class="note" id="panel-note"></div>
+  </div>
+</section>
+
+<div id="pending" hidden>
+  <span id="pending-text">导航到目标点？</span>
+  <button class="go" id="pending-send">发送</button>
+  <button id="pending-cancel">取消</button>
+</div>
+
+<div id="toast"></div>
 
 <div id="tools">
   <button id="zin" title="放大">＋</button>
@@ -125,6 +212,14 @@
   const elConn = document.getElementById("conn");
   const elMeta = document.getElementById("meta");
   const elZoom = document.getElementById("zoom");
+  const elGoalChip = document.getElementById("goalchip");
+  const elPanel = document.getElementById("panel");
+  const elNote = document.getElementById("panel-note");
+  const elMapSel = document.getElementById("map-select");
+  const elGoalRow = document.getElementById("goal-row");
+  const elPending = document.getElementById("pending");
+  const elPendingText = document.getElementById("pending-text");
+  const elToast = document.getElementById("toast");
 
   let dpr = 1, W = 0, H = 0;
   let map = null;          // {w,h,res,ox,oy,data:Int8Array}
@@ -136,6 +231,13 @@
   let fitted = false;
   let userMoved = false;   // 用户自己缩放过/拖过，就不再自动复位视野
   let dirty = true;
+
+  // ---- 第二层：操作 ----
+  let controlEnabled = true;   // 服务端是 --demo 时为 false
+  let goalMode = false;        // 「点图发目标」开关
+  let pendingGoal = null;      // {x,y,yaw} 等确认
+  let activeGoal = null;       // {x,y,state} 已发送的目标
+  let toastTimer = null;
 
   // ---------- 坐标与画布 ----------
   function resize() {
@@ -284,6 +386,35 @@
     ctx.stroke();
   }
 
+  function goalColor(state) {
+    if (state === "succeeded") return "#3ddc84";
+    if (state === "aborted" || state === "failed" || state === "rejected") return "#ff5f56";
+    if (state === "canceled") return "#8b95a5";
+    return "#ffb347";
+  }
+
+  function drawGoalMarker(g, color, dashed) {
+    const [sx, sy] = w2s(g.x, g.y);
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    if (dashed) ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.arc(sx, sy, 9, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(sx - 14, sy); ctx.lineTo(sx + 14, sy);
+    ctx.moveTo(sx, sy - 14); ctx.lineTo(sx, sy + 14);
+    ctx.stroke();
+    if (g.yaw !== undefined && g.yaw !== null) {
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(sx + Math.cos(-g.yaw) * 26, sy + Math.sin(-g.yaw) * 26);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   function render() {
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = "#0e1116";
@@ -292,6 +423,8 @@
     drawMap();
     drawScan();
     drawRobot();
+    if (pendingGoal) drawGoalMarker(pendingGoal, "#ffffff", true);
+    if (activeGoal) drawGoalMarker(activeGoal, goalColor(activeGoal.state), false);
   }
 
   function loop() {
@@ -347,6 +480,190 @@
     elConn.className = "conn " + (ok ? "ok" : "bad");
   }
 
+  // ---------- 操作（第二层） ----------
+  async function api(path, body) {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    let j = null;
+    try { j = await r.json(); } catch (e) { /* 非 JSON */ }
+    if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+    return j || {};
+  }
+
+  function toast(msg, bad) {
+    elToast.textContent = msg;
+    elToast.className = "show" + (bad ? " bad" : "");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { elToast.className = ""; }, 4000);
+  }
+
+  function note(msg, kind) {
+    elNote.textContent = msg || "";
+    elNote.className = "note" + (kind ? " " + kind : "");
+  }
+
+  function setControlEnabled(on) {
+    controlEnabled = on;
+    for (const id of ["btn-slam", "btn-stop", "btn-nav", "btn-save",
+                      "btn-goal", "btn-cancel-goal"]) {
+      const b = document.getElementById(id);
+      if (b) b.disabled = !on;
+    }
+    elMapSel.disabled = !on;
+    if (!on) note("演示模式：操作不可用");
+  }
+
+  async function loadMaps() {
+    try {
+      const r = await fetch("/api/maps");
+      if (!r.ok) return;
+      const j = await r.json();
+      const cur = elMapSel.value;
+      elMapSel.innerHTML = "";
+      if (!j.maps || !j.maps.length) {
+        const o = document.createElement("option");
+        o.textContent = "（没有地图）";
+        o.value = "";
+        elMapSel.appendChild(o);
+        return;
+      }
+      for (const m of j.maps) {
+        const o = document.createElement("option");
+        o.value = m.name;
+        o.textContent = m.name.replace(/\.yaml$/, "");
+        elMapSel.appendChild(o);
+      }
+      if (cur && [...elMapSel.options].some(o => o.value === cur)) {
+        elMapSel.value = cur;
+      }
+    } catch (e) { /* 断线时忽略 */ }
+  }
+
+  async function doMode(mode, map) {
+    note("处理中…");
+    try {
+      const j = await api("/api/mode", { mode, map });
+      note(j.message || "已发送", "ok");
+      toast(j.message || "已发送");
+      setTimeout(loadMaps, 1500);
+    } catch (e) {
+      note(e.message, "bad");
+      toast(e.message, true);
+    }
+  }
+
+  function suggestName() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, "0");
+    return "map_" + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) +
+           "_" + p(d.getHours()) + p(d.getMinutes());
+  }
+
+  async function saveMap() {
+    const name = window.prompt("地图名（保存为 <名字>.yaml/.pgm）", suggestName());
+    if (!name) return;
+    try {
+      const j = await api("/api/map/save", { name });
+      note(j.message || "已保存", "ok");
+      toast(j.message || "已保存");
+      loadMaps();
+    } catch (e) {
+      note(e.message, "bad");
+      toast(e.message, true);
+    }
+  }
+
+  function setGoalMode(on) {
+    goalMode = on;
+    document.getElementById("btn-goal").classList.toggle("active", on);
+    cv.style.cursor = on ? "crosshair" : "";
+    if (on) {
+      if (status.mode !== "navigating") {
+        toast("先开始导航，再点图发目标", true);
+      } else {
+        toast("在地图上点一下选目标");
+      }
+    } else {
+      clearPending();
+    }
+  }
+
+  function clearPending() {
+    pendingGoal = null;
+    elPending.hidden = true;
+    dirty = true;
+  }
+
+  function setPending(wx, wy) {
+    const yaw = pose ? Math.atan2(wy - pose.y, wx - pose.x) : 0;
+    pendingGoal = { x: wx, y: wy, yaw };
+    elPendingText.textContent = "导航到 (" + wx.toFixed(2) + ", " +
+                                wy.toFixed(2) + ")？";
+    elPending.hidden = false;
+    dirty = true;
+  }
+
+  async function sendPending() {
+    if (!pendingGoal) return;
+    const g = pendingGoal;
+    try {
+      await api("/api/goal", g);
+      activeGoal = { x: g.x, y: g.y, yaw: g.yaw, state: "sending" };
+      toast("目标已发送");
+      note("目标已发送", "ok");
+    } catch (e) {
+      toast(e.message, true);
+      note(e.message, "bad");
+    }
+    clearPending();
+    setGoalMode(false);
+    dirty = true;
+  }
+
+  async function cancelGoal() {
+    try {
+      const j = await api("/api/goal/cancel", {});
+      toast(j.message || "已请求取消");
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+
+  function updateGoalUI() {
+    const g = status.goal;
+    if (g && g.state && g.x !== undefined) {
+      activeGoal = { x: g.x, y: g.y, yaw: g.yaw, state: g.state };
+      const texts = {
+        sending: "目标：发送中…",
+        executing: (g.remaining !== undefined && g.remaining !== null)
+          ? "目标：还剩 " + Number(g.remaining).toFixed(1) + " m"
+          : "目标：执行中",
+        succeeded: "已到达目标",
+        aborted: "导航失败/中止",
+        canceled: "已取消",
+        rejected: "目标被拒绝",
+        failed: "导航出错",
+      };
+      elGoalChip.textContent = texts[g.state] || g.state;
+      elGoalChip.hidden = false;
+      elGoalRow.hidden = !(g.state === "sending" || g.state === "executing");
+    } else {
+      activeGoal = null;
+      elGoalChip.hidden = true;
+      elGoalRow.hidden = true;
+    }
+    if (goalMode && status.mode !== "navigating") {
+      goalMode = false;
+      document.getElementById("btn-goal").classList.remove("active");
+      cv.style.cursor = "";
+      clearPending();
+    }
+    dirty = true;
+  }
+
   // ---------- SSE ----------
   function connect() {
     const es = new EventSource("/events");
@@ -382,6 +699,12 @@
       status = JSON.parse(e.data);
       updateMode();
       updateMeta();
+      if (status.control === false) {
+        if (controlEnabled) setControlEnabled(false);
+      } else if (!controlEnabled) {
+        setControlEnabled(true);
+      }
+      updateGoalUI();
     });
   }
 
@@ -392,20 +715,32 @@
   }, { passive: false });
 
   let drag = null;
+  let press = null;
   cv.addEventListener("pointerdown", (e) => {
     drag = { x: e.clientX, y: e.clientY };
+    press = { x: e.clientX, y: e.clientY, moved: false };
     cv.setPointerCapture(e.pointerId);
   });
   cv.addEventListener("pointermove", (e) => {
     if (!drag) return;
+    if (press && Math.hypot(e.clientX - press.x, e.clientY - press.y) > 5) {
+      press.moved = true;
+    }
     userMoved = true;
     camX -= (e.clientX - drag.x) / scale;
     camY += (e.clientY - drag.y) / scale;
     drag = { x: e.clientX, y: e.clientY };
     dirty = true;
   });
-  const endDrag = () => { drag = null; };
-  cv.addEventListener("pointerup", endDrag);
+  cv.addEventListener("pointerup", (e) => {
+    if (press && !press.moved && goalMode && status.mode === "navigating") {
+      const [wx, wy] = s2w(e.clientX, e.clientY);
+      setPending(wx, wy);
+    }
+    press = null;
+    drag = null;
+  });
+  const endDrag = () => { drag = null; press = null; };
   cv.addEventListener("pointercancel", endDrag);
 
   cv.addEventListener("dblclick", fit);
@@ -413,6 +748,28 @@
   document.getElementById("zin").onclick = () => zoomAt(W / 2, H / 2, 1.3);
   document.getElementById("zout").onclick = () => zoomAt(W / 2, H / 2, 1 / 1.3);
   document.getElementById("fit").onclick = fit;
+
+  // ---- 操作面板 ----
+  document.getElementById("btn-slam").onclick = () => doMode("slam");
+  document.getElementById("btn-stop").onclick = () => doMode("idle");
+  document.getElementById("btn-nav").onclick = () => {
+    const m = elMapSel.value;
+    if (!m) { toast("先选地图", true); return; }
+    doMode("nav", m);
+  };
+  document.getElementById("btn-save").onclick = saveMap;
+  document.getElementById("btn-goal").onclick = () => setGoalMode(!goalMode);
+  document.getElementById("btn-cancel-goal").onclick = cancelGoal;
+  document.getElementById("pending-send").onclick = sendPending;
+  document.getElementById("pending-cancel").onclick = () => {
+    clearPending();
+    setGoalMode(false);
+  };
+  document.getElementById("panel-head").onclick = () => {
+    elPanel.classList.toggle("collapsed");
+    document.getElementById("panel-caret").textContent =
+      elPanel.classList.contains("collapsed") ? "▸" : "▾";
+  };
 
   // ---------- 启动 ----------
   // 现场排障用：浏览器控制台 `__upper.state` 可看缩放、地图参数和原始帧计数
@@ -428,9 +785,15 @@
     fit,
   };
 
+  if (window.innerWidth < 600) {
+    elPanel.classList.add("collapsed");
+    document.getElementById("panel-caret").textContent = "▸";
+  }
+
   resize();
   updateZoom();
   requestAnimationFrame(loop);
+  loadMaps();
   connect();
 })();
 </script>
