@@ -377,7 +377,9 @@ class ModeController:
                 self.proc = None
                 return False, "启动失败，看 %s" % log_path
             self.mode = mode
-            self.state.set_status(mode=mode, owned=True, goal=None, note="")
+            self.state.set_status(
+                mode="mapping" if mode == "slam" else "navigating",
+                owned=True, goal=None, note="")
             return True, "已启动%s（日志 %s）" % (
                 "建图" if mode == "slam" else "导航", log_path)
 
