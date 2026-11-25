@@ -58,6 +58,7 @@ class NoPivotGuard(Node):
         self.w = 0.0
         self.clamped = 0
         self.pivots_zeroed = 0
+        self.pivots_allowed = 0
         self.last_report = 0.0
         self.create_timer(1.0 / rate, self.tick)
         self.get_logger().info(
@@ -86,7 +87,7 @@ class NoPivotGuard(Node):
                 if self.allow_pivot:
                     w = max(-self.pivot_w, min(self.pivot_w, w))
                     if abs(w) > 1e-6:
-                        self.pivots_zeroed += 1
+                        self.pivots_allowed += 1
                 else:
                     if abs(w) > 1e-6:
                         self.pivots_zeroed += 1
@@ -96,10 +97,11 @@ class NoPivotGuard(Node):
         self.pub.publish(out)
 
         if now - self.last_report >= 2.0:
-            if self.clamped or self.pivots_zeroed:
+            if self.clamped or self.pivots_zeroed or self.pivots_allowed:
                 self.get_logger().info(
-                    'guard: clamped=%d pivot_zeroed=%d'
-                    % (self.clamped, self.pivots_zeroed))
+                    'guard: clamped=%d pivot_zeroed=%d pivot_allowed=%d'
+                    % (self.clamped, self.pivots_zeroed,
+                       self.pivots_allowed))
             self.last_report = now
 
 

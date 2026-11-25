@@ -34,7 +34,7 @@ def test_nav2_fusion_loosens_goal_checker():
     d = load("nav2_params_fusion.yaml")
     p = d["controller_server"]["ros__parameters"]["general_goal_checker"]
     assert p["xy_goal_tolerance"] == 0.25
-    assert p["yaw_goal_tolerance"] == 0.45
+    assert p["yaw_goal_tolerance"] == 3.15
 
 
 def test_slam_fusion_updates_faster_and_keeps_scan_filter():

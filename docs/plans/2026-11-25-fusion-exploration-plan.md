@@ -1596,7 +1596,7 @@ def test_nav2_fusion_loosens_goal_checker():
     d = load("nav2_params_fusion.yaml")
     p = d["controller_server"]["ros__parameters"]["general_goal_checker"]
     assert p["xy_goal_tolerance"] == 0.25
-    assert p["yaw_goal_tolerance"] == 0.45
+    assert p["yaw_goal_tolerance"] == 3.15
 
 
 def test_slam_fusion_updates_faster_and_keeps_scan_filter():
@@ -1698,7 +1698,7 @@ cp config/nav2_params.yaml config/nav2_params_fusion.yaml
 
 ```yaml
       xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.45
+      yaw_goal_tolerance: 3.15
 ```
 
 4) RPP 的终点容差（`FollowPath` 段里的 `xy_goal_tolerance: 0.05`）：
@@ -1773,8 +1773,12 @@ def generate_launch_description():
         cmd=["python3", os.path.join(HERE, "tools", "scan_self_filter.py")],
         output="screen")
 
+    # 融合/探索模式允许慢速原地转；导航模式 nav.launch.py 仍用默认 False。
     pivot_guard = ExecuteProcess(
-        cmd=["python3", os.path.join(HERE, "tools", "no_pivot_guard.py")],
+        cmd=["python3", os.path.join(HERE, "tools", "no_pivot_guard.py"),
+             "--ros-args",
+             "-p", "allow_slow_pivot:=true",
+             "-p", "slow_pivot_omega:=0.35"],
         output="screen")
 
     fusion_nav = ExecuteProcess(
@@ -2816,7 +2820,7 @@ Expected：slam_toolbox、fusion_nav、controller_server 都在；`/map` 持续�
 - `/fusion/status` 的 `legs`、`reason`；
 - 倒车段方向是否正确（特别是有没有"倒车但转向反了"）。
 
-Expected：3/3 到达；没有原地转；`reason` 为空或 `arrived`。
+Expected：3/3 到达；导航模式仍无原地转；融合模式允许慢速原地转（记录 U 型调头是否成功）。
 
 - [ ] **Step 6: 点一个未知区**
 
@@ -2874,7 +2878,7 @@ Expected：`rounds_succeeded >= 18/20`、`in_place_rotation_samples == 0`、
 - `frontiers` 数量变化；
 - 卡住次数（`state=blocked` 或雷达停车）；
 - 假前沿（明显是玻璃/反光/12 m 量程边缘的目标）次数；
-- 是否出现原地转（应始终为 0）。
+- 是否出现原地转（导航模式应为 0；融合模式允许慢速原地转，记录用于 U 型调头的次数和效果）。
 
 Expected：能自行走完 27×7 m 场地的主要区域；结束原因应为
 `no_frontier`、`area_stalled` 或人工关闭之一，不能无限跑。
@@ -2931,7 +2935,7 @@ git commit -m "docs(fusion): on-car acceptance results and runbook"
 |---|---|
 | D1 真融合 launch | Task 6 |
 | D2 分步追目标、不用 allow_unknown | Task 2、5 |
-| D3 原地转先硬禁、倒车 | Task 6 参数不动；Task 9 Step 5 实测 |
+| D3 导航硬禁、融合允许慢速原地转 | Task 6 launch 参数；Task 9 Step 5 实测 |
 | D4 边界 L1 进主线、L2 以后 | Task 1、7、8、10 |
 | D5 全局去掉 obstacle_layer | Task 6 |
 | D6 存图写位姿 | Task 7 |

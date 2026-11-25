@@ -28,7 +28,7 @@
 |---|---|---|
 | D1 | 真融合：slam_toolbox + nav2 navigation（不含 localization） | nav2 官方建图模式；假融合无法满足"过程中持续建图" |
 | D2 | 不靠 `allow_unknown: true` 实现"点未知区"；用**分步追目标器** | 用户指出原 M1 验收把核心需求降级；Hybrid-A* 穿墙重规划不可接受 |
-| D3 | 原地转先保持硬禁；靠 360° 雷达 + Reeds-Shepp 倒车完成死角 | 禁转的物理原因未查清，探索模式同样成立 |
+| D3 | 导航模式保持硬禁；**融合/探索模式允许慢速原地转**（`allow_slow_pivot=true`、0.35 rad/s） | 2026-11-25 实车：硬禁下 U 型调头在窄处死锁（guard clamp 231、pivot 清零 40 次仍不前进） |
 | D4 | 边界线 L1（探索器过滤 + 拒绝线外点击）进主线；L2（KeepoutFilter）以后单独做 | 长走廊场景 L1 已覆盖九成 |
 | D5 | 融合模式全局代价图**去掉 obstacle_layer**，只留 static + inflation | 回环修正后全局层旧障碍点会变成幽灵障碍 |
 | D6 | 融合模式下存图时同时写当前位姿 | 切回 nav 模式可直接用，不拿旧图位姿初始化 AMCL |
@@ -186,7 +186,7 @@ slam_toolbox 在 且 nav2_controller 在  → fusion
 ### 5.4 目标朝向
 
 每条腿的 goal yaw = `atan2(G.y - P.y, G.x - P.x)`（人点和探索共用）。
-融合参数里 `yaw_goal_tolerance` 放宽到 0.4~0.5 rad，`xy_goal_tolerance` 0.2~0.25 m，
+融合参数里 `yaw_goal_tolerance` 放宽到 3.15（π，只到位置、不管朝向），`xy_goal_tolerance` 0.2~0.25 m，
 避免终点原地找角度。
 
 ### 5.5 执行
@@ -308,7 +308,7 @@ score = w_gain * min(cluster_size, gain_cap)
 | 全局 `plugins` | static + obstacle + inflation | **static + inflation** | 回环后全局旧障碍点变幽灵 |
 | 局部 costmap 尺寸 | 3×3 m | 4×4 m | 去掉全局动态层后给局部更多反应距离 |
 | `xy_goal_tolerance` | 0.15 | 0.2~0.25 | 分步腿短，避免终点磨蹭 |
-| `yaw_goal_tolerance` | 原值 | 0.4~0.5 | 目标 yaw 用行进方向，不需要精确对准 |
+| `yaw_goal_tolerance` | 原值 | 3.15（π） | 融合模式只到位置、不管朝向；窄处对角度会反复磨 |
 | `allow_unknown` | false | **保持 false** | 未知区由分步器推进，不靠穿墙规划 |
 | 其余（Smac/RPP/collision_monitor/no_pivot） | — | 不变 | 安全层不动 |
 
@@ -432,7 +432,7 @@ M0 必须先在 headless 下验证，不碰 UI。
 
 1. **玻璃**：雷达可能直接看穿，不只是假前沿，是真会撞；没有物理护栏时不承诺。
 2. **倒车链路**：RPP 负速度要端到端穿过 smoother、`no_pivot_guard`、collision_monitor、
-   `cmd_mux` 和驱动；任何一环截掉，D3 的策略就落空。M0 必须实测倒车转弯方向。
+   `cmd_mux` 和驱动；任何一环截掉，D3 的策略就落空。M0 必须实测倒车转弯方向；2026-11-25 实车确认硬禁下 U 型调头会死锁，融合模式已改为允许慢速原地转。
 3. **回环幽灵障碍**：已用 D5 规避全局层；局部层仍可能有短暂错位，属可接受。
 4. **长走廊永远建不完**：靠 D8 的时间/里程/停滞条件收口，不追求"建满"。
 5. **雷达 USB 锁死**：已知硬件坑，长时间探索要有无进展停车兜底。

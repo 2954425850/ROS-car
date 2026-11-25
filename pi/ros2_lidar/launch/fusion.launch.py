@@ -50,8 +50,13 @@ def generate_launch_description():
         cmd=["python3", os.path.join(HERE, "tools", "scan_self_filter.py")],
         output="screen")
 
+    # 融合/探索模式允许慢速原地转（死角和 U 型调头需要）；导航模式
+    # nav.launch.py 仍用默认 allow_slow_pivot=false，5/5 验收规则不变。
     pivot_guard = ExecuteProcess(
-        cmd=["python3", os.path.join(HERE, "tools", "no_pivot_guard.py")],
+        cmd=["python3", os.path.join(HERE, "tools", "no_pivot_guard.py"),
+             "--ros-args",
+             "-p", "allow_slow_pivot:=true",
+             "-p", "slow_pivot_omega:=0.35"],
         output="screen")
 
     fusion_nav = ExecuteProcess(
