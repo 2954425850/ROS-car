@@ -388,6 +388,7 @@ class Navigator:
         self.failures = 0
         self.last_dist = None
         self.frontier_count = 0
+        self.legs_done = 0
 
     def status(self):
         return {
@@ -397,7 +398,7 @@ class Navigator:
             "leg": self.leg,
             "leg_kind": self.leg_kind,
             "reason": self.reason,
-            "legs": self.budget.legs if self.budget else 0,
+            "legs": self.legs_done,
             "frontiers": self.frontier_count,
         }
 
@@ -421,6 +422,7 @@ class Navigator:
         self.stalls = 0
         self.failures = 0
         self.blacklist.clear()
+        self.legs_done = 0
         self.last_dist = math.hypot(self.final[0] - pose[0],
                                     self.final[1] - pose[1])
         self._plan(grid, pose, boundary)
@@ -483,6 +485,7 @@ class Navigator:
 
     def on_leg_started(self, pose):
         self.leg_start = (float(pose[0]), float(pose[1]))
+        self.legs_done += 1
 
     def on_leg_succeeded(self, grid, pose, boundary=None):
         if self.leg is None:
@@ -495,9 +498,20 @@ class Navigator:
         self.leg_kind = None
         self.leg_start = None
         self.failures = 0
+        if kind == "direct":
+            # nav2 的 action 成功就是到达；不要再按自己的 0.25 m 阈值重算，
+            # 否则车会在目标附近反复生成同一个 direct 腿、来回磨。
+            self.final = None
+            self.budget = None
+            self.state = "idle"
+            self.reason = "arrived"
+            if self.explore:
+                self._plan_explore(grid, pose, boundary)
+            return
         if kind == "explore":
             self._plan_explore(grid, pose, boundary)
             return
+        # staged：中间点到了，继续朝最终目标推进
         if self.final is not None:
             d = math.hypot(self.final[0] - pose[0],
                            self.final[1] - pose[1])

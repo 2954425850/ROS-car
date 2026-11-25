@@ -237,6 +237,27 @@ def test_navigator_direct_target_and_arrival():
     assert n.final is None
 
 
+def test_navigator_direct_success_is_arrival_even_if_offset():
+    g = make_grid(w=80, h=40, res=0.1)
+    n = Navigator()
+    n.set_target((2.0, 1.0), g, (1.0, 1.0))
+    n.on_leg_started((1.0, 1.0))
+    n.on_leg_succeeded(g, (2.3, 1.0))   # nav2 的 0.25 m 容差附近
+    assert n.state == "idle"
+    assert n.reason == "arrived"
+    assert n.final is None
+
+
+def test_navigator_counts_legs_done():
+    g = make_grid(w=80, h=40, res=0.1)
+    n = Navigator()
+    n.set_target((2.0, 1.0), g, (1.0, 1.0))
+    n.on_leg_started((1.0, 1.0))
+    assert n.status()["legs"] == 1
+    n.on_leg_succeeded(g, (2.0, 1.0))
+    assert n.status()["legs"] == 1
+
+
 def test_navigator_staged_progress_then_arrival():
     g = _navigator_grid()
     n = Navigator()

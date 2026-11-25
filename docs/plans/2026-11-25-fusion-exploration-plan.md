@@ -1133,6 +1133,12 @@ class Navigator:
         self.reason = "leg_failed"
 ```
 
+> **实车修正（2026-11-25）**：`on_leg_succeeded` 里 `kind == "direct"` 必须
+> 直接视为到达（nav2 action 成功即到达），不要再按 0.25 m 阈值重算；否则
+> 车会在目标附近反复生成同一个 direct 腿、来回磨（当天实车复现）。
+> `status()["legs"]` 改用独立的 `legs_done` 计数器，避免到达后预算清空显示 0。
+> 代码与新增测试见仓库 `fusion_plan.py` / `tests/test_fusion_plan.py`。
+
 - [ ] **Step 4: 运行测试**
 
 ```bash
