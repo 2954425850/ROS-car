@@ -151,6 +151,17 @@ def test_choose_intermediate_snaps_start_out_of_unknown_footprint():
     assert 1.0 < goal[0] < 2.0
 
 
+def test_choose_intermediate_respects_inflation_clearance():
+    g = make_grid(w=80, h=40, res=0.1)
+    set_rect(g, 20, 0, 80, 40, -1)
+    # 障碍物紧贴自由区边缘（x=2.05, y=1.55）；旧 clearance=0.35 会选到
+    # (1.95,1.05) 这种离障碍 0.5 m 的点，在 master 上是 253（内切区）。
+    g.data[15 * 80 + 20] = 100
+    goal = choose_intermediate(g, (1.0, 1.0), (5.0, 1.0))
+    assert goal is not None
+    assert clearance_ok(g, goal[0], goal[1], 0.6)
+
+
 def test_choose_intermediate_honours_blacklist():
     g = _unknown_half_grid()
     # 把机器人前方 3 m 内的 free 区整片拉黑

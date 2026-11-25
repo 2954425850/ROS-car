@@ -379,8 +379,8 @@ git commit -m "feat(fusion): grid, boundary and reachability primitives"
   - `Budget(start, final, max_legs=20, max_distance=0.0)`
     - `add_leg(a, b) -> None`；`exceeded() -> bool`
   - `Decision(kind, goal=None, reason="")`；`kind ∈ {"direct","staged","reject"}`
-  - `choose_intermediate(grid, pose, final, boundary=None, blacklist=(), *, min_leg=0.9, max_leg=3.0, clearance=0.35, cone_deg=60.0, step_cells=1) -> (x,y) | None`
-  - `decide_target(grid, pose, final, boundary=None, budget=None, blacklist=(), *, min_leg=0.9, max_leg=3.0, clearance=0.35) -> Decision`
+  - `choose_intermediate(grid, pose, final, boundary=None, blacklist=(), *, min_leg=0.9, max_leg=3.0, clearance=0.6, cone_deg=60.0, step_cells=1) -> (x,y) | None`
+  - `decide_target(grid, pose, final, boundary=None, budget=None, blacklist=(), *, min_leg=0.9, max_leg=3.0, clearance=0.6) -> Decision`
 
 - [ ] **Step 1: 写失败测试（追加到 `tests/test_fusion_plan.py`）**
 
@@ -507,7 +507,7 @@ class Decision:
 
 
 def choose_intermediate(grid, pose, final, boundary=None, blacklist=(),
-                        *, min_leg=0.9, max_leg=3.0, clearance=0.35,
+                        *, min_leg=0.9, max_leg=3.0, clearance=0.6,
                         cone_deg=60.0, step_cells=1):
     # step_cells=1：自由边缘可能落在任意格子，粗采样会错过最靠前的那一格，
     # 导致中间点偏到侧面。3 m 内约 3.7k 个候选，单次规划 <0.2 s，可接受。
@@ -553,7 +553,7 @@ def choose_intermediate(grid, pose, final, boundary=None, blacklist=(),
 
 def decide_target(grid, pose, final, boundary=None, budget=None,
                   blacklist=(), *, min_leg=0.9, max_leg=3.0,
-                  clearance=0.35):
+                  clearance=0.6):
     if final is None:
         return Decision("reject", None, "no_target")
     if boundary is not None and boundary.crosses(final):
@@ -584,6 +584,11 @@ cd pi/ros2_lidar && python -m pytest tests/test_fusion_plan.py -v
 > **实车修正（2026-11-25）**：`choose_intermediate` 的 `line_free` 起点要先用
 > `nearest_free_point` 吸附到最近 free 格（0.5 m 内）。自车 footprint 常被
 > `scan_self_filter` 留成 unknown，不吸附的话所有中间点都会被判不可达。
+
+> **实车修正（2026-11-25，第二次）**：`clearance` 必须是 **0.6**（设计 §5.2），
+> 不是 0.35。0.35 会选到离障碍约 0.5 m 的“free”点，它在 master costmap 上是
+> **253（内切区）**，Smac 报 `no valid path found`。同日实测 StaticLayer 正常
+> resize；之前 `costmap`/`static_layer` 话题的 284×144 是 transient_local 缓存旧帧。
 
 Expected: 全部 PASS。若 `test_decide_target_no_free_cell_near_unknown_rejected`
 失败，检查测试网格：机器人 (2,2) 在 cell (20,20)，周围 2×2 格 free，
@@ -954,7 +959,7 @@ Expected: `ImportError: cannot import name 'Navigator'`。
 class Navigator:
     """不碰 ROS 的状态机；外部在目标/腿结束/定时调用。"""
 
-    def __init__(self, *, min_leg=0.9, max_leg=3.0, clearance=0.35,
+    def __init__(self, *, min_leg=0.9, max_leg=3.0, clearance=0.6,
                  max_legs=20, stall_limit=3, blacklist_radius=0.5,
                  frontier_clearance=0.6):
         self.min_leg = min_leg

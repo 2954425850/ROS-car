@@ -217,7 +217,7 @@ class Decision:
 
 
 def choose_intermediate(grid, pose, final, boundary=None, blacklist=(),
-                        *, min_leg=0.9, max_leg=3.0, clearance=0.35,
+                        *, min_leg=0.9, max_leg=3.0, clearance=0.6,
                         cone_deg=60.0, step_cells=1):
     # step_cells=1：自由边缘可能落在任意格子，粗采样会错过最靠前的那一格，
     # 导致中间点偏到侧面。3 m 内约 3.7k 个候选，单次规划 <0.2 s，可接受。
@@ -266,7 +266,7 @@ def choose_intermediate(grid, pose, final, boundary=None, blacklist=(),
 
 def decide_target(grid, pose, final, boundary=None, budget=None,
                   blacklist=(), *, min_leg=0.9, max_leg=3.0,
-                  clearance=0.35):
+                  clearance=0.6):
     if final is None:
         return Decision("reject", None, "no_target")
     if boundary is not None and boundary.crosses(final):
@@ -387,7 +387,7 @@ def choose_frontier_goal(grid, pose, frontiers, *, clearance=0.6,
 class Navigator:
     """不碰 ROS 的状态机；外部在目标/腿结束/定时调用。"""
 
-    def __init__(self, *, min_leg=0.9, max_leg=3.0, clearance=0.35,
+    def __init__(self, *, min_leg=0.9, max_leg=3.0, clearance=0.6,
                  max_legs=20, stall_limit=3, blacklist_radius=0.5,
                  frontier_clearance=0.6):
         self.min_leg = min_leg

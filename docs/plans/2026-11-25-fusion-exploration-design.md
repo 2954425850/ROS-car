@@ -316,9 +316,14 @@ score = w_gain * min(cluster_size, gain_cap)
 
 ### 8.3 待实测确认
 
-- `StaticLayer` 是否随 slam_toolbox 的 `/map` 全量更新而重载（`subscribe_to_updates`
-  指 `map_updates`，slam_toolbox 不发该话题；全量回调应更新，但必须实车看）。
-  不更新则记录为阻塞项，改用独立 mask/重启 layer，不静默。
+- **2026-11-25 实测：StaticLayer 正常**。日志持续出现
+  `StaticLayer: Resizing costmap to 295 X 159`；`/global_costmap/get_static_layer`
+  服务返回的内部数据是 295×159、原点与 `/map` 一致，robot/leg2 都是 0（free）。
+  之前从 `costmap` / `static_layer` **话题**读到 284×144 是 transient_local
+  缓存旧帧，不代表层失效。
+- **真正的坑**：分步选点的 `clearance` 用了 0.35，而设计 §5.2 要求 0.6。
+  选出的“free”中间点在 master 上是 253（内切区），Smac 返回
+  `no valid path found`（error_code 208）。已改为 0.6。
 - 融合模式 CPU/内存：nav2 约 1.25 核、slam 约 0.7 核，合计预计 < 2.5 核 / 4 核。
 - 局部图 4×4 与 `collision_monitor` 1 m 减速区是否重叠过多导致频繁停车。
 
@@ -438,5 +443,5 @@ M0 必须先在 headless 下验证，不碰 UI。
 5. **雷达 USB 锁死**：已知硬件坑，长时间探索要有无进展停车兜底。
 6. **composition 不稳**：融合 launch 默认 `use_composition:=False`。
 7. **地图推送带宽**：融合模式地图更新变快，页面推送必须节流，否则 WiFi 拥塞。
-8. **实测未知**：StaticLayer 是否随 `/map` 更新、局部图 4×4 是否够、1 s 地图间隔的 CPU，
-   都在 M0 用数据回答，不靠推断。
+8. **实测未知**：局部图 4×4 是否够、1 s 地图间隔的 CPU、`fusion_nav` 在 640k 格
+   地图上的耗时，还要用数据回答。StaticLayer 已在 2026-11-25 实测正常，不再是风险。
