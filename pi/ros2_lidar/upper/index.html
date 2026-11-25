@@ -96,17 +96,17 @@
   .note.bad { color: var(--bad); }
   .note.ok { color: var(--ok); }
 
-  #pending {
+  #pending, #boundary-bar {
     position: fixed; left: 50%; bottom: 62px; transform: translateX(-50%);
     z-index: 4; display: flex; gap: 10px; align-items: center;
     padding: 8px 12px; border-radius: 10px; background: var(--panel);
     border: 1px solid rgba(255,179,71,.5); font-size: 13px;
   }
-  #pending button {
+  #pending button, #boundary-bar button {
     height: 30px; padding: 0 12px; border-radius: 7px; border: 1px solid var(--line);
     background: rgba(255,255,255,.08); color: var(--text); cursor: pointer;
   }
-  #pending button.go { background: #ffb347; border-color: #ffb347; color: #1a1205; font-weight: 600; }
+  #pending button.go, #boundary-bar button.go { background: #ffb347; border-color: #ffb347; color: #1a1205; font-weight: 600; }
 
   #toast {
     position: fixed; left: 50%; bottom: 118px; transform: translateX(-50%);
@@ -172,6 +172,14 @@
       <button id="btn-nav">开始导航</button>
     </div>
     <div class="row">
+      <button id="btn-fusion" class="primary">边建边航</button>
+      <button id="btn-explore">自动探索：关</button>
+    </div>
+    <div class="row">
+      <button id="btn-boundary">画边界线</button>
+      <button id="btn-clear-boundary">清除边界</button>
+    </div>
+    <div class="row">
       <button id="btn-save">保存地图</button>
       <button id="btn-goal">点图发目标</button>
     </div>
@@ -186,6 +194,12 @@
   <span id="pending-text">导航到目标点？</span>
   <button class="go" id="pending-send">发送</button>
   <button id="pending-cancel">取消</button>
+</div>
+
+<div id="boundary-bar" hidden>
+  <span id="boundary-text">点地图加线段，完成后点“应用”</span>
+  <button class="go" id="boundary-apply">应用</button>
+  <button id="boundary-cancel">取消</button>
 </div>
 
 <div id="toast"></div>
@@ -219,6 +233,8 @@
   const elGoalRow = document.getElementById("goal-row");
   const elPending = document.getElementById("pending");
   const elPendingText = document.getElementById("pending-text");
+  const elBoundaryBar = document.getElementById("boundary-bar");
+  const elBoundaryText = document.getElementById("boundary-text");
   const elToast = document.getElementById("toast");
 
   let dpr = 1, W = 0, H = 0;
@@ -238,6 +254,11 @@
   let pendingGoal = null;      // {x,y,yaw} 等确认
   let activeGoal = null;       // {x,y,state} 已发送的目标
   let toastTimer = null;
+  let boundaryMode = false;
+  let boundaryPoints = [];
+  let boundaryAnchor = null;
+  let boundary = null;
+  let fusion = null;
 
   // ---------- 坐标与画布 ----------
   function resize() {
@@ -386,6 +407,59 @@
     ctx.stroke();
   }
 
+  function drawBoundary() {
+    if (!boundary || !boundary.segments) return;
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,95,86,.9)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 6]);
+    for (const s of boundary.segments) {
+      const [x1, y1] = w2s(s[0], s[1]);
+      const [x2, y2] = w2s(s[2], s[3]);
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawBoundaryDraft() {
+    if (!boundaryMode || boundaryPoints.length < 2) return;
+    ctx.save();
+    ctx.strokeStyle = "#ffb347";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    for (let i = 0; i < boundaryPoints.length; i++) {
+      const [sx, sy] = w2s(boundaryPoints[i][0], boundaryPoints[i][1]);
+      if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawLeg() {
+    let leg = null;
+    if (status.mode === "fusion" && status.fusion) {
+      leg = status.fusion.leg;
+    } else {
+      leg = status.leg;
+    }
+    if (!leg) return;
+    const x = Array.isArray(leg) ? leg[0] : leg.x;
+    const y = Array.isArray(leg) ? leg[1] : leg.y;
+    if (x === undefined || y === undefined) return;
+    const [sx, sy] = w2s(x, y);
+    ctx.save();
+    ctx.strokeStyle = "#ffb347";
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.arc(sx, sy, 8, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   function goalColor(state) {
     if (state === "succeeded") return "#3ddc84";
     if (state === "aborted" || state === "failed" || state === "rejected") return "#ff5f56";
@@ -421,10 +495,13 @@
     ctx.fillRect(0, 0, W, H);
     drawGrid();
     drawMap();
+    drawBoundary();
     drawScan();
     drawRobot();
     if (pendingGoal) drawGoalMarker(pendingGoal, "#ffffff", true);
     if (activeGoal) drawGoalMarker(activeGoal, goalColor(activeGoal.state), false);
+    drawBoundaryDraft();
+    drawLeg();
   }
 
   function loop() {
@@ -439,6 +516,7 @@
   const MODE_TEXT = {
     mapping: ["建图中", "on"],
     navigating: ["导航中", "nav"],
+    fusion: ["建图+导航中", "nav"],
     demo: ["演示", "demo"],
     idle: ["空闲", ""],
     unknown: ["—", ""],
@@ -507,8 +585,9 @@
 
   function setControlEnabled(on) {
     controlEnabled = on;
-    for (const id of ["btn-slam", "btn-stop", "btn-nav", "btn-save",
-                      "btn-goal", "btn-cancel-goal"]) {
+    for (const id of ["btn-slam", "btn-stop", "btn-nav", "btn-fusion",
+                      "btn-explore", "btn-boundary", "btn-clear-boundary",
+                      "btn-save", "btn-goal", "btn-cancel-goal"]) {
       const b = document.getElementById(id);
       if (b) b.disabled = !on;
     }
@@ -577,12 +656,13 @@
   }
 
   function setGoalMode(on) {
+    if (on && boundaryMode) setBoundaryMode(false);
     goalMode = on;
     document.getElementById("btn-goal").classList.toggle("active", on);
     cv.style.cursor = on ? "crosshair" : "";
     if (on) {
-      if (status.mode !== "navigating") {
-        toast("先开始导航，再点图发目标", true);
+      if (!(status.mode === "navigating" || status.mode === "fusion")) {
+        toast("先开始导航或边建边航，再点图发目标", true);
       } else {
         toast("在地图上点一下选目标");
       }
@@ -595,6 +675,71 @@
     pendingGoal = null;
     elPending.hidden = true;
     dirty = true;
+  }
+
+  function setBoundaryMode(on) {
+    if (on) setGoalMode(false);
+    boundaryMode = on;
+    document.getElementById("btn-boundary").classList.toggle("active", on);
+    cv.style.cursor = on ? "crosshair" : "";
+    if (on) {
+      if (!pose) {
+        toast("还没有位姿，不能画边界", true);
+        setBoundaryMode(false);
+        return;
+      }
+      boundaryAnchor = [pose.x, pose.y];
+      boundaryPoints = [];
+      elBoundaryBar.hidden = false;
+      elBoundaryText.textContent = "点地图加线段（至少两个点），完成后点“应用”";
+      toast("画在“不能去”的一侧；线的另一侧会被禁止");
+    } else {
+      elBoundaryBar.hidden = true;
+      boundaryPoints = [];
+    }
+    dirty = true;
+  }
+
+  async function applyBoundary() {
+    if (!boundaryAnchor || boundaryPoints.length < 2) {
+      toast("至少要点两个点", true);
+      return;
+    }
+    const segments = [];
+    for (let i = 1; i < boundaryPoints.length; i++) {
+      segments.push([boundaryPoints[i - 1][0], boundaryPoints[i - 1][1],
+                     boundaryPoints[i][0], boundaryPoints[i][1]]);
+    }
+    try {
+      const j = await api("/api/boundary",
+                          { anchor: boundaryAnchor, segments });
+      boundary = { anchor: boundaryAnchor, segments };
+      toast(j.message || "边界已应用");
+      setBoundaryMode(false);
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+
+  async function clearBoundary() {
+    try {
+      const j = await api("/api/boundary", { anchor: null, segments: [] });
+      boundary = null;
+      toast(j.message || "边界已清除");
+      dirty = true;
+    } catch (e) {
+      toast(e.message, true);
+    }
+  }
+
+  async function loadBoundary() {
+    try {
+      const r = await fetch("/api/boundary");
+      if (!r.ok) return;
+      const j = await r.json();
+      boundary = j.boundary || null;
+      dirty = true;
+    } catch (e) { /* 断线忽略 */ }
   }
 
   function setPending(wx, wy) {
@@ -633,6 +778,32 @@
   }
 
   function updateGoalUI() {
+    const f = status.fusion;
+    if (status.mode === "fusion" && f) {
+      fusion = f;
+      const texts = {
+        idle: "空闲",
+        following: "分步推进中",
+        exploring: "探索中",
+        blocked: "已停止：" + (f.reason || ""),
+        done: "探索结束：" + (f.reason || ""),
+      };
+      elGoalChip.textContent = texts[f.state] || f.state;
+      elGoalChip.hidden = !f.state || f.state === "idle";
+      elGoalRow.hidden = !(f.state === "following" ||
+                           f.state === "exploring");
+      if (f.leg) {
+        activeGoal = { x: f.leg[0], y: f.leg[1], state: "executing" };
+      } else {
+        activeGoal = null;
+      }
+      const ex = document.getElementById("btn-explore");
+      ex.textContent = f.explore ? "自动探索：开" : "自动探索：关";
+      ex.classList.toggle("active", !!f.explore);
+      dirty = true;
+      return;
+    }
+    fusion = null;
     const g = status.goal;
     if (g && g.state && g.x !== undefined) {
       activeGoal = { x: g.x, y: g.y, yaw: g.yaw, state: g.state };
@@ -655,7 +826,11 @@
       elGoalChip.hidden = true;
       elGoalRow.hidden = true;
     }
-    if (goalMode && status.mode !== "navigating") {
+    const ex = document.getElementById("btn-explore");
+    ex.textContent = "自动探索：关";
+    ex.classList.remove("active");
+    if (goalMode &&
+        !(status.mode === "navigating" || status.mode === "fusion")) {
       goalMode = false;
       document.getElementById("btn-goal").classList.remove("active");
       cv.style.cursor = "";
@@ -733,9 +908,17 @@
     dirty = true;
   });
   cv.addEventListener("pointerup", (e) => {
-    if (press && !press.moved && goalMode && status.mode === "navigating") {
+    if (press && !press.moved) {
       const [wx, wy] = s2w(e.clientX, e.clientY);
-      setPending(wx, wy);
+      if (boundaryMode) {
+        boundaryPoints.push([wx, wy]);
+        elBoundaryText.textContent =
+          "已加 " + boundaryPoints.length + " 个点；至少两个点后点“应用”";
+        dirty = true;
+      } else if (goalMode &&
+                 (status.mode === "navigating" || status.mode === "fusion")) {
+        setPending(wx, wy);
+      }
     }
     press = null;
     drag = null;
@@ -743,7 +926,7 @@
   const endDrag = () => { drag = null; press = null; };
   cv.addEventListener("pointercancel", endDrag);
 
-  cv.addEventListener("dblclick", fit);
+  cv.addEventListener("dblclick", () => { if (!boundaryMode) fit(); });
 
   document.getElementById("zin").onclick = () => zoomAt(W / 2, H / 2, 1.3);
   document.getElementById("zout").onclick = () => zoomAt(W / 2, H / 2, 1 / 1.3);
@@ -757,6 +940,26 @@
     if (!m) { toast("先选地图", true); return; }
     doMode("nav", m);
   };
+  document.getElementById("btn-fusion").onclick = () => doMode("fusion");
+  document.getElementById("btn-explore").onclick = async () => {
+    if (status.mode !== "fusion") {
+      toast("先开始边建边航", true);
+      return;
+    }
+    const on = !(status.fusion && status.fusion.explore);
+    try {
+      const j = await api("/api/explore", { enabled: on });
+      toast(j.message || "已切换");
+    } catch (e) {
+      toast(e.message, true);
+    }
+  };
+  document.getElementById("btn-boundary").onclick =
+    () => setBoundaryMode(!boundaryMode);
+  document.getElementById("btn-clear-boundary").onclick = clearBoundary;
+  document.getElementById("boundary-apply").onclick = applyBoundary;
+  document.getElementById("boundary-cancel").onclick =
+    () => setBoundaryMode(false);
   document.getElementById("btn-save").onclick = saveMap;
   document.getElementById("btn-goal").onclick = () => setGoalMode(!goalMode);
   document.getElementById("btn-cancel-goal").onclick = cancelGoal;
@@ -794,6 +997,7 @@
   updateZoom();
   requestAnimationFrame(loop);
   loadMaps();
+  loadBoundary();
   connect();
 })();
 </script>
