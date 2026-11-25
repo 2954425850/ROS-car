@@ -110,7 +110,8 @@ class FusionNav(Node):
             resp.message = "没有地图/位姿"
             return resp
         self.nav.set_explore(req.data, self.grid, self.pose, self.boundary)
-        if req.data and self.explore_start_t is None:
+        if (req.data and self.explore_start_t is None
+                and self.nav.final is None):
             self.explore_start_t = time.monotonic()
             self.last_area = self.area
             self.last_area_t = self.explore_start_t
@@ -158,7 +159,9 @@ class FusionNav(Node):
     def plan_tick(self):
         if self.grid is None or self.pose is None:
             return
-        if self.nav.explore:
+        # 人工目标期间暂停探索的时间/面积判据；否则长目标会被 finish_explore
+        # 当成探索超时取消掉。
+        if self.nav.explore and self.nav.final is None:
             if self.explore_start_t is None:
                 self.explore_start_t = time.monotonic()
                 self.last_area = self.area
