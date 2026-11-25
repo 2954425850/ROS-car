@@ -1,6 +1,7 @@
 # 融合建图导航（边建边航）+ 自主探索 — 设计
 
-> **状态**：2026-11-25 定稿，未实施。
+> **状态**：2026-11-25 定稿；纯算法/后端/页面已在 Windows 实现并通过单测
+> （35 个融合测试 + 22 个 upper 测试），**fusion.launch.py / fusion_nav.py 待 Pi 实车验收**。
 > **前置**：`pi/ros2_lidar/NAV.md`（nav2 + AMCL 现状）、
 > `docs/plans/2026-11-24-upper-visualization-design.md`（网页入口）。
 > **定位**：在现有建图/导航之上增加第三种模式 `fusion`：
