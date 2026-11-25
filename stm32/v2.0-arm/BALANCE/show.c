@@ -43,9 +43,17 @@ void show_task(void *pvParameters)
 		Voltage_All=0;
 		if(LowVoltage_1==1)LowVoltage_1++; //Make sure the buzzer only rings for 0.5 seconds //确保蜂鸣器只响0.5秒
 		if(LowVoltage_2==1)LowVoltage_2++; //Make sure the buzzer only rings for 0.5 seconds //确保蜂鸣器只响0.5秒
-		if(Voltage>=12.6f)Voltage=12.6f;
+		if(0 && Voltage>=12.6f)Voltage=Voltage;/* ROS DEBUG 2026-10-13: clamp disabled to read the real voltage.
+		 * Restore to:  if(Voltage>=12.6f)Voltage=12.6f;  */
 		else if(10<=Voltage && Voltage<10.5f && LowVoltage_1<2)LowVoltage_1++; //10.5V, first buzzer when low battery //10.5V，低电量时蜂鸣器第一次报警
 		else if(Voltage<10 && LowVoltage_2<2)LowVoltage_2++; //10V, when the car is not allowed to control, the buzzer will alarm the second time //10V，小车禁止控制时蜂鸣器第二次报警			
+		/* ROS FIX 2026-10-13: continuous low-battery alarm. Below 10.6 V the
+		 * buzzer is held on at every 10 Hz tick of this task, so it sounds
+		 * continuously (not the 0.5 s one-shot below) until the voltage comes
+		 * back up. Same pin as the existing logic: PA8, active high.
+		 * 低于10.6V时蜂鸣器持续鸣叫 */
+		if(Voltage < 10.6f) Buzzer=1;
+
 		/* ROS: APP_Show() re-enabled 2026-09-20. It holds the only live printf()
 	    calls, and fputc() targets USART2 -- which IS initialised again now
 	    (see system.c). This is the readback path for the wheel-speed PI

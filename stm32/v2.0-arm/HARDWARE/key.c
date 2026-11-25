@@ -11,6 +11,8 @@ Output  : none
 void KEY_Init(void)
 {
 	GPIO_InitTypeDef  GPIO_InitStructure;
+	GPIO_StructInit(&GPIO_InitStructure);   /* ROS FIX 2026-10-13: define every member - *Init() reads the rest
+	 * as stack garbage */
   RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOE, ENABLE);//使能GPIOB时钟
   GPIO_InitStructure.GPIO_Pin = KEY_PIN; //KEY对应引脚
   GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN;//普通输入模式
