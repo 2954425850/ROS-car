@@ -42,4 +42,10 @@ def test_slam_fusion_updates_faster_and_keeps_scan_filter():
     p = d["slam_toolbox"]["ros__parameters"]
     assert p["map_update_interval"] == 1.0
     assert p["scan_topic"] == "/scan_filtered"
-    assert p["max_laser_range"] == 12.0
+    assert p["max_laser_range"] == 11.5
+
+
+def test_slam_base_clamps_max_range():
+    d = load("slam_params.yaml")
+    p = d["slam_toolbox"]["ros__parameters"]
+    assert p["max_laser_range"] == 11.5

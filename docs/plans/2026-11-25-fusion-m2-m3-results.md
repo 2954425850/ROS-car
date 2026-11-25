@@ -68,7 +68,7 @@ L1 只覆盖探索目标和人工点击；L2 KeepoutFilter 仍未做（见 §7�
 
 ---
 
-## 5. 四个真实坑（按发现顺序）
+## 5. 五个真实坑（按发现顺序）
 
 ### 5.1 StaticLayer 是“假警报”
 
@@ -102,6 +102,16 @@ L1 只覆盖探索目标和人工点击；L2 KeepoutFilter 仍未做（见 §7�
   新增 `test_choose_frontier_goal_falls_back_in_tight_map`。
 
 ---
+
+### 5.5 雷达射程末端的假墙
+
+- 现象：开阔区雷达射程末端（约 12 m）出现红点，多次后在地图上变成一堵弧墙。
+- 原因：RPLIDAR A1M8 对“无回波”返回**有限** ~12 m，slam_toolbox 把它当成真障碍；
+  `max_laser_range: 12.0` 正好等于这个值，所以没有拒绝。
+- 修复：`scan_self_filter.py` 把 >= 11.5 m 的有限值改成 `inf`，输出 `range_max=11.5`；
+  `slam_params.yaml` / `slam_params_fusion.yaml` 的 `max_laser_range` 12.0 → 11.5。
+- 影响：仓库副本（融合、仓库版建图/导航）；`/home/cy/ros2_lidar` 旧副本未改。
+- 旧地图里的假墙不会消失，需要重建。
 
 ## 6. 诊断手法（可复用）
 

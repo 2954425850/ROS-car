@@ -8,7 +8,9 @@ as an obstacle: collision_monitor stops the robot forever and the costmaps add a
 fake obstacle in front.
 
 Points whose base-frame position is inside the footprint (+2 cm) are set to inf.
-Everything else is passed through unchanged.
+Finite ranges at/above 11.5 m are also set to inf: the A1M8 returns a finite
+~12 m value for "no echo", and slam_toolbox would otherwise grow a false wall
+at the range limit. Everything else is passed through unchanged.
 
     publishes /scan_filtered
 """
@@ -19,6 +21,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
+
+from scan_limit import DEFAULT_MAX_VALID_RANGE, limit_max_range
 
 X_MIN, X_MAX = -0.32, 0.32
 Y_MIN, Y_MAX = -0.22, 0.22
@@ -31,10 +35,14 @@ class ScanSelfFilter(Node):
         self.pub = self.create_publisher(LaserScan, 'scan_filtered', 10)
         self.create_subscription(LaserScan, 'scan', self.cb, qos_profile_sensor_data)
         self.last_removed = -1
+        self.last_far = -1
         self.last_log_t = 0.0
 
     def cb(self, msg):
-        out = list(msg.ranges)
+        raw = list(msg.ranges)
+        n_far = sum(1 for r in raw
+                    if math.isfinite(r) and r >= DEFAULT_MAX_VALID_RANGE)
+        out = limit_max_range(raw, DEFAULT_MAX_VALID_RANGE)
         n = 0
         for i, r in enumerate(out):
             if not math.isfinite(r) or r < msg.range_min or r > msg.range_max:
@@ -46,11 +54,18 @@ class ScanSelfFilter(Node):
                 out[i] = float('inf')
                 n += 1
         msg.ranges = out
+        # Keep the advertised max in sync with the clamp; the scan visualizer
+        # (upper) and collision_monitor both use it.
+        msg.range_max = min(float(msg.range_max), DEFAULT_MAX_VALID_RANGE)
         self.pub.publish(msg)
         now = time.monotonic()
-        if n != self.last_removed and now - self.last_log_t > 5.0:
-            self.get_logger().info('filtered %d self points per scan' % n)
+        if ((n != self.last_removed or n_far != self.last_far)
+                and now - self.last_log_t > 5.0):
+            self.get_logger().info(
+                'filtered %d self, %d max-range points per scan'
+                % (n, n_far))
             self.last_removed = n
+            self.last_far = n_far
             self.last_log_t = now
 
 

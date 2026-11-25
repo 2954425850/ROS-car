@@ -34,9 +34,9 @@ slam_toolbox:
     restamp_tf: false
     min_laser_range: 0.0 #for rastering images
     # --- EDIT (stock: 20.0) ---
-    # RPLIDAR A1M8 spec is 12 m. Leaving it at 20 lets the matcher chase
-    # returns the scanner cannot actually produce.
-    max_laser_range: 12.0 #for rastering images
+    # RPLIDAR A1M8 spec is 12 m. The driver returns a finite ~12 m value
+    # for "no echo"; scan_self_filter clamps >= 11.5 m to inf. Keep sync.
+    max_laser_range: 11.5 #for rastering images
     minimum_time_interval: 0.5
     transform_timeout: 0.2
     tf_buffer_duration: 30.0

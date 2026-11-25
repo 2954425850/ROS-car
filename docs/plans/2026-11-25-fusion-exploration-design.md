@@ -300,7 +300,7 @@ free 格作为 `G`（2026-11-25 实车修正）。
 | `map_update_interval` | 5.0 | 1.0（先试 1.0，CPU 高再 2.0） | 规划基于旧图会"看不见"新区域 |
 | `minimum_time_interval` | 0.5 | 0.3 | 探索需要更快的扫描匹配；先保守 |
 
-其余（`max_laser_range=12.0`、`scan_topic=/scan_filtered`、loop closure 参数）不动。
+其余（`max_laser_range=11.5`、`scan_topic=/scan_filtered`、loop closure 参数）不动。
 
 ### 8.2 `config/nav2_params_fusion.yaml`
 
