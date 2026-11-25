@@ -223,3 +223,108 @@ def test_sse_delivers_later_map_update(tmp_path):
         if resp is not None:
             resp.close()
         srv.shutdown()
+
+
+def test_detect_mode_three_states(monkeypatch):
+    import subprocess
+    import server as srv_mod
+
+    alive = {"slam_toolbox", "nav2_controller"}
+
+    def fake_run(cmd, **kw):
+        class R:
+            returncode = 0 if cmd[2] in alive else 1
+        return R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert srv_mod.detect_mode() == "fusion"
+    alive = {"slam_toolbox"}
+    assert srv_mod.detect_mode() == "mapping"
+    alive = {"nav2_controller"}
+    assert srv_mod.detect_mode() == "navigating"
+    alive = set()
+    assert srv_mod.detect_mode() == "idle"
+
+
+class FusionController(FakeController):
+    def __init__(self):
+        super().__init__()
+        self.boundary = None
+
+    def set_explore(self, enabled):
+        self.calls.append(("explore", enabled))
+        return True, "explore %s" % enabled
+
+    def set_boundary(self, obj):
+        self.calls.append(("boundary", obj))
+        self.boundary = obj
+        return True, "boundary ok"
+
+
+def test_explore_endpoint(tmp_path):
+    ctl = FusionController()
+    srv, base = _serve_ctl(tmp_path, ctl)
+    try:
+        body = json.loads(_post(base, "/api/explore",
+                                {"enabled": True}).read())
+        assert body["ok"] is True
+        assert ctl.calls[-1] == ("explore", True)
+    finally:
+        srv.shutdown()
+
+
+def test_boundary_post_and_get(tmp_path):
+    ctl = FusionController()
+    srv, base = _serve_ctl(tmp_path, ctl)
+    try:
+        obj = {"anchor": [0.0, 0.0],
+               "segments": [[2.0, -1.0, 2.0, 1.0]]}
+        assert json.loads(_post(base, "/api/boundary", obj).read())["ok"]
+        got = json.loads(urllib.request.urlopen(base + "/api/boundary").read())
+        assert got["boundary"] == obj
+    finally:
+        srv.shutdown()
+
+
+def test_mode_accepts_fusion(tmp_path):
+    ctl = FakeController()
+    srv, base = _serve_ctl(tmp_path, ctl)
+    try:
+        body = json.loads(_post(base, "/api/mode",
+                                {"mode": "fusion"}).read())
+        assert body["ok"] is True
+        assert ctl.calls[-1] == ("start", "fusion", None)
+    finally:
+        srv.shutdown()
+
+
+def test_save_map_writes_pose(tmp_path, monkeypatch):
+    import json as _json
+    import server as srv_mod
+    from server import ModeController, State
+
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "save_map_snapshot.py").write_text("")
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    maps = tmp_path / "maps"
+    maps.mkdir()
+    state = State()
+    state.set_pose(1.25, -0.5, 0.75)
+    ctl = ModeController(state, None, str(maps), str(launch))
+
+    def fake_run(cmd, **kw):
+        class R:
+            returncode = 0
+            stdout = "saved"
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(srv_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(srv_mod, "detect_mode", lambda: "fusion")
+    ok, msg = ctl.save_map("trace")
+    assert ok, msg
+    with open(maps / "trace_last_pose.json") as f:
+        d = _json.load(f)
+    assert d == {"x": 1.25, "y": -0.5, "yaw": 0.75}

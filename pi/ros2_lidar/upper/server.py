@@ -116,6 +116,8 @@ class Handler(BaseHTTPRequestHandler):
                 "scan_points": snap["scan"]["n"] if snap["scan"] else 0,
                 "clients": state.clients,
                 "goal": snap["status"].get("goal"),
+                "fusion": snap["status"].get("fusion"),
+                "leg": snap["status"].get("leg"),
                 "owned": snap["status"].get("owned", False),
                 "control": self.server.controller is not None,
             })
@@ -126,6 +128,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, {"maps": ctl.list_maps(),
                                  "maps_dir": ctl.maps_dir})
+        elif path == "/api/boundary":
+            ctl = self.server.controller
+            self._json(200, {"boundary": getattr(ctl, "boundary", None)
+                             if ctl else None})
         elif path == "/events":
             self._sse()
         elif path == "/favicon.ico":
@@ -155,10 +161,11 @@ class Handler(BaseHTTPRequestHandler):
             mode = body.get("mode")
             if mode == "idle":
                 ok, msg = ctl.stop()
-            elif mode in ("slam", "nav"):
+            elif mode in ("slam", "nav", "fusion"):
                 ok, msg = ctl.start(mode, body.get("map"))
             else:
-                self._json(400, {"ok": False, "error": "mode 只能是 slam/nav/idle"})
+                self._json(400, {"ok": False,
+                                 "error": "mode 只能是 slam/nav/fusion/idle"})
                 return
         elif path == "/api/map/save":
             name = body.get("name") or ""
@@ -174,6 +181,10 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = ctl.send_goal(x, y, yaw)
         elif path == "/api/goal/cancel":
             ok, msg = ctl.cancel_goal()
+        elif path == "/api/explore":
+            ok, msg = ctl.set_explore(bool(body.get("enabled")))
+        elif path == "/api/boundary":
+            ok, msg = ctl.set_boundary(body)
         else:
             self._json(404, {"error": "not found"})
             return
@@ -226,6 +237,8 @@ class Handler(BaseHTTPRequestHandler):
                         "scan_n": snap["scan"]["n"] if snap["scan"] else 0,
                         "clients": state.clients,
                         "goal": snap["status"].get("goal"),
+                        "fusion": snap["status"].get("fusion"),
+                        "leg": snap["status"].get("leg"),
                         "owned": snap["status"].get("owned", False),
                         "control": self.server.controller is not None,
                     }))
@@ -266,6 +279,9 @@ class ModeController:
         self.proc = None
         self.pgid = None       # launch 的进程组；即使拉起进程先死了也要收干净
         self.mode = None
+        self.boundary = None
+        self.boundary_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "boundary.json")
         self.lock = threading.Lock()
         threading.Thread(target=self._watch, daemon=True,
                          name="upper-watch").start()
@@ -373,7 +389,8 @@ class ModeController:
             ext = self._external()
             if ext:
                 return False, ("检测到外部实例（%s）。先 sudo systemctl stop slam/nav"
-                               % ("建图" if ext == "mapping" else "导航"))
+                               % {"mapping": "建图", "navigating": "导航",
+                                  "fusion": "融合"}.get(ext, ext))
             if mode == "nav":
                 if (not map_name or not NAME_RE.match(map_name)
                         or not map_name.endswith(".yaml")):
@@ -383,6 +400,9 @@ class ModeController:
                 launch = os.path.join(self.launch_dir, "nav.launch.py")
                 cmd = ["ros2", "launch", launch, "use_composition:=False",
                        "map:=" + os.path.join(self.maps_dir, map_name)]
+            elif mode == "fusion":
+                launch = os.path.join(self.launch_dir, "fusion.launch.py")
+                cmd = ["ros2", "launch", launch]
             else:
                 launch = os.path.join(self.launch_dir, "mapping.launch.py")
                 cmd = ["ros2", "launch", launch]
@@ -403,10 +423,12 @@ class ModeController:
                 return False, "启动失败，看 %s" % log_path
             self.mode = mode
             self.state.set_status(
-                mode="mapping" if mode == "slam" else "navigating",
+                mode=("mapping" if mode == "slam" else
+                      "fusion" if mode == "fusion" else "navigating"),
                 owned=True, goal=None, note="")
             return True, "已启动%s（日志 %s）" % (
-                "建图" if mode == "slam" else "导航", log_path)
+                {"slam": "建图", "nav": "导航", "fusion": "边建边航"}[mode],
+                log_path)
 
     def stop(self):
         with self.lock:
@@ -425,8 +447,10 @@ class ModeController:
                 name = name[:-len(ext)]
         if not NAME_RE.match(name):
             return False, "名字只能用字母/数字/下划线/点/横线（≤64 字）"
-        if not (self._alive() and self.mode == "slam") and detect_mode() != "mapping":
-            return False, "当前不在建图，没有可保存的地图"
+        owned = self.mode if self._alive() else None
+        mode = owned or detect_mode()
+        if mode not in ("slam", "mapping", "fusion"):
+            return False, "当前不在建图/融合模式，没有可保存的地图"
         base = os.path.join(self.maps_dir, name)
         snapshot = os.path.join(self.tools_dir, "save_map_snapshot.py")
         try:
@@ -436,19 +460,79 @@ class ModeController:
             return False, "存图超时（没有收到 /map）"
         if r.returncode != 0:
             return False, (r.stderr or r.stdout or "存图失败").strip()[-300:]
-        return True, "已保存 %s.yaml" % name
+        pose = self.state.snapshot()["pose"]
+        pose_note = ""
+        if pose:
+            path = os.path.join(self.maps_dir, name + "_last_pose.json")
+            try:
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump({"x": pose["x"], "y": pose["y"],
+                               "yaw": pose["yaw"]}, f)
+                os.replace(tmp, path)
+                pose_note = "，位姿已写入"
+            except Exception as e:
+                pose_note = "，位姿写入失败：%s" % e
+        else:
+            pose_note = "，位姿未写入（没有 TF）"
+        return True, "已保存 %s.yaml%s" % (name, pose_note)
 
     def send_goal(self, x, y, yaw):
-        if not (self._alive() and self.mode == "nav") and detect_mode() != "navigating":
-            return False, "当前不在导航模式"
+        owned = self.mode if self._alive() else None
+        mode = owned or detect_mode()
         if self.ros is None:
             return False, "ROS 未就绪"
-        return self.ros.send_goal(x, y, yaw)
+        if mode == "fusion":
+            return self.ros.send_target(x, y, yaw)
+        if mode in ("nav", "navigating"):
+            return self.ros.send_goal(x, y, yaw)
+        return False, "当前不在导航/融合模式"
 
     def cancel_goal(self):
         if self.ros is None:
             return False, "ROS 未就绪"
+        owned = self.mode if self._alive() else None
+        mode = owned or detect_mode()
+        if mode == "fusion":
+            return self.ros.cancel_target()
         return self.ros.cancel_goal()
+
+    def set_explore(self, enabled):
+        owned = self.mode if self._alive() else None
+        mode = owned or detect_mode()
+        if mode != "fusion":
+            return False, "只有融合模式能开自动探索"
+        if self.ros is None:
+            return False, "ROS 未就绪"
+        return self.ros.set_explore(bool(enabled))
+
+    def set_boundary(self, obj):
+        if obj is not None:
+            if obj.get("anchor") is None and not obj.get("segments"):
+                obj = None          # 页面用 anchor:null, segments:[] 表示清除
+            else:
+                try:
+                    anchor = [float(v) for v in obj.get("anchor", [])]
+                    segs = [[float(v) for v in s]
+                            for s in obj.get("segments", [])]
+                except Exception:
+                    return False, "边界格式不对"
+                if len(anchor) != 2 or not segs or len(segs) > 200:
+                    return False, "边界需要 1~200 段，锚点两个数"
+                if any(len(s) != 4 for s in segs):
+                    return False, "每段需要 x1,y1,x2,y2"
+                obj = {"anchor": anchor, "segments": segs}
+        self.boundary = obj
+        try:
+            tmp = self.boundary_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(obj, f)
+            os.replace(tmp, self.boundary_path)
+        except Exception as e:
+            return False, "边界保存失败：%s" % e
+        if self.ros is not None:
+            self.ros.publish_boundary(obj)
+        return True, "边界已更新" if obj else "边界已清除"
 
 
 # ---------------------------------------------------------------------------
@@ -456,16 +540,24 @@ class ModeController:
 # ---------------------------------------------------------------------------
 
 def detect_mode():
-    """只读探测当前跑的是建图还是导航（外部 systemd 起的也算）。"""
+    """只读探测：mapping / navigating / fusion / idle。"""
     import subprocess
-    for pat, name in (("slam_toolbox", "mapping"),
-                      ("nav2_controller", "navigating")):
+
+    def alive(pat):
         try:
-            if subprocess.run(["pgrep", "-f", pat],
-                              capture_output=True).returncode == 0:
-                return name
+            return subprocess.run(["pgrep", "-f", pat],
+                                  capture_output=True).returncode == 0
         except OSError:
-            break
+            return False
+
+    slam = alive("slam_toolbox")
+    nav = alive("nav2_controller")
+    if slam and nav:
+        return "fusion"
+    if slam:
+        return "mapping"
+    if nav:
+        return "navigating"
     return "idle"
 
 
@@ -494,7 +586,10 @@ class RosSource:
             from rclpy.node import Node
             from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                                    ReliabilityPolicy)
+            from geometry_msgs.msg import PoseStamped
             from sensor_msgs.msg import LaserScan
+            from std_msgs.msg import String
+            from std_srvs.srv import SetBool, Trigger
             from tf2_ros import Buffer, TransformListener
             try:
                 from action_msgs.msg import GoalStatus
@@ -534,6 +629,23 @@ class RosSource:
                             if have_nav2 else None)
                 self._goal_handle = None
                 self._goal = None
+
+                boundary_qos = QoSProfile(
+                    depth=1, history=HistoryPolicy.KEEP_LAST,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL)
+                self._target_pub = self.create_publisher(
+                    PoseStamped, "/fusion/target", 10)
+                self._boundary_pub = self.create_publisher(
+                    String, "/fusion/boundary", boundary_qos)
+                self.create_subscription(
+                    String, "/fusion/status", self._on_fusion_status, 10)
+                self.create_subscription(
+                    PoseStamped, "/fusion/leg", self._on_fusion_leg, 10)
+                self._explore_cli = self.create_client(
+                    SetBool, "/fusion/explore")
+                self._cancel_cli = self.create_client(
+                    Trigger, "/fusion/cancel")
 
             # ---- 导航目标 ----
             def _set_goal(self, **kw):
@@ -603,6 +715,54 @@ class RosSource:
                 self._goal_handle.cancel_goal_async()
                 return True, "已请求取消"
 
+            # ---- 融合模式（分步执行器） ----
+            def _on_fusion_status(self, msg):
+                try:
+                    st = json.loads(msg.data)
+                except Exception:
+                    return
+                state.set_status(fusion=st)
+
+            def _on_fusion_leg(self, msg):
+                p = msg.pose
+                yaw = math.atan2(
+                    2.0 * (p.orientation.w * p.orientation.z),
+                    1.0 - 2.0 * p.orientation.z * p.orientation.z)
+                state.set_status(leg={"x": p.position.x,
+                                      "y": p.position.y, "yaw": yaw})
+
+            def send_target(self, x, y, yaw):
+                if self._target_pub.get_subscription_count() == 0:
+                    return False, "fusion_nav 不在（等融合启动完）"
+                msg = PoseStamped()
+                msg.header.frame_id = "map"
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.pose.position.x = float(x)
+                msg.pose.position.y = float(y)
+                msg.pose.orientation.z = math.sin(float(yaw) / 2.0)
+                msg.pose.orientation.w = math.cos(float(yaw) / 2.0)
+                self._target_pub.publish(msg)
+                return True, "目标已发送（分步执行）"
+
+            def cancel_target(self):
+                if not self._cancel_cli.wait_for_service(timeout_sec=1.0):
+                    return False, "fusion_nav 不在"
+                self._cancel_cli.call_async(Trigger.Request())
+                return True, "已请求取消"
+
+            def set_explore(self, enabled):
+                if not self._explore_cli.wait_for_service(timeout_sec=1.0):
+                    return False, "fusion_nav 不在"
+                req = SetBool.Request()
+                req.data = bool(enabled)
+                self._explore_cli.call_async(req)
+                return True, "探索已开启" if enabled else "探索已关闭"
+
+            def publish_boundary(self, obj):
+                msg = String()
+                msg.data = json.dumps(obj) if obj else ""
+                self._boundary_pub.publish(msg)
+
             def _on_map(self, msg):
                 state.set_map(occupancy_payload(msg))
 
@@ -659,6 +819,27 @@ class RosSource:
         if self._node is None:
             return False, "ROS 未就绪"
         return self._node.cancel_goal()
+
+    def send_target(self, x, y, yaw):
+        if self._node is None:
+            return False, "ROS 未就绪"
+        return self._node.send_target(x, y, yaw)
+
+    def cancel_target(self):
+        if self._node is None:
+            return False, "ROS 未就绪"
+        return self._node.cancel_target()
+
+    def set_explore(self, enabled):
+        if self._node is None:
+            return False, "ROS 未就绪"
+        return self._node.set_explore(enabled)
+
+    def publish_boundary(self, obj):
+        if self._node is None:
+            return False, "ROS 未就绪"
+        self._node.publish_boundary(obj)
+        return True, "边界已下发"
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +978,14 @@ def main(argv=None):
         if ok:
             threading.Thread(target=_mode_loop, args=(state, stop),
                              daemon=True, name="upper-mode").start()
+        if controller is not None:
+            bpath = os.path.join(here, "boundary.json")
+            if os.path.isfile(bpath):
+                try:
+                    with open(bpath, encoding="utf-8") as f:
+                        controller.set_boundary(json.load(f))
+                except Exception:
+                    pass
 
     srv = build_server(args.host, args.port, state,
                        os.path.join(here, "index.html"), controller)

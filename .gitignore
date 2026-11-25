@@ -60,3 +60,6 @@ pi/raspot_ws/src/**/docs/*.json
 !pi/raspot_ws/src/arm_grasp/docs/p3.json
 pi/raspot_ws/docs/shots/*.jpg
 pi/k230-vision/*.png
+
+# upper 运行时状态：页面画边界线后自动生成，不入库
+pi/ros2_lidar/upper/boundary.json
