@@ -7,7 +7,8 @@ def test_fusion_controls_present():
     html = open(os.path.join(HERE, "index.html"), encoding="utf-8").read()
     for token in ('id="btn-fusion"', 'id="btn-explore"',
                   'id="btn-boundary"', 'id="btn-clear-boundary"',
-                  'id="boundary-bar"'):
+                  'id="boundary-bar"', 'id="fusion-progress"',
+                  'REASON_TEXT'):
         assert token in html, token
 
 

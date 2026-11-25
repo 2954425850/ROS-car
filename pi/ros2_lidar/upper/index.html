@@ -152,6 +152,7 @@
   <div class="right">
     <span id="conn" class="conn">连接中…</span>
     <span id="meta" class="meta">—</span>
+    <span id="fusion-progress" class="meta" hidden></span>
     <span id="zoom" class="meta">—</span>
   </div>
 </header>
@@ -226,6 +227,7 @@
   const elConn = document.getElementById("conn");
   const elMeta = document.getElementById("meta");
   const elZoom = document.getElementById("zoom");
+  const elFusionProgress = document.getElementById("fusion-progress");
   const elGoalChip = document.getElementById("goalchip");
   const elPanel = document.getElementById("panel");
   const elNote = document.getElementById("panel-note");
@@ -522,6 +524,26 @@
     unknown: ["—", ""],
   };
 
+  // fusion_nav 的 reason 是英文码，页面统一翻成中文
+  const REASON_TEXT = {
+    outside_boundary: "在边界线外",
+    no_reachable_frontier: "前方被挡/走不到",
+    occupied: "目标是障碍",
+    outside_map: "在地图外",
+    budget_exceeded: "绕行预算用完",
+    leg_failed: "导航失败",
+    no_progress: "没有进展",
+    no_target: "没有目标",
+    no_frontier: "找不到可走的探索前沿",
+    area_stalled: "探索面积停滞",
+    time_limit: "探索超时",
+    distance_limit: "探索里程到上限",
+  };
+
+  function reasonText(code) {
+    return REASON_TEXT[code] || code || "";
+  }
+
   function updateMode() {
     const key = status.mode || "unknown";
     const [text, cls] = MODE_TEXT[key] || [key, ""];
@@ -777,19 +799,50 @@
     }
   }
 
+  function updateFusionProgress(f) {
+    if (status.mode === "fusion" && f) {
+      const parts = [];
+      if (f.covered_m2 !== undefined) {
+        parts.push("已探索 " + Number(f.covered_m2).toFixed(1) + " m²");
+      }
+      if (f.frontiers !== undefined) parts.push("前沿 " + f.frontiers);
+      if (f.elapsed_s) parts.push("用时 " + Math.round(f.elapsed_s) + " s");
+      if (f.distance_m) parts.push("里程 " + Number(f.distance_m).toFixed(1) + " m");
+      if (f.legs) parts.push("腿 " + f.legs);
+      elFusionProgress.textContent = parts.join(" · ");
+      elFusionProgress.hidden = parts.length === 0;
+    } else {
+      elFusionProgress.hidden = true;
+    }
+  }
+
   function updateGoalUI() {
     const f = status.fusion;
     if (status.mode === "fusion" && f) {
       fusion = f;
-      const texts = {
-        idle: "空闲",
-        following: "分步推进中",
-        exploring: "探索中",
-        blocked: "已停止：" + (f.reason || ""),
-        done: "探索结束：" + (f.reason || ""),
-      };
-      elGoalChip.textContent = texts[f.state] || f.state;
-      elGoalChip.hidden = !f.state || f.state === "idle";
+      const reason = reasonText(f.reason);
+      let text = "";
+      if (f.state === "following") {
+        text = "分步推进中";
+      } else if (f.state === "exploring") {
+        text = "探索中";
+      } else if (f.state === "blocked") {
+        text = "已停止：" + (reason || "未知原因");
+      } else if (f.state === "done") {
+        text = "探索结束：" + (reason || "完成");
+      } else if (f.reason === "arrived") {
+        text = "已到达";
+      } else if (f.reason === "canceled") {
+        text = "已取消";
+      } else if (f.reason === "explore_off") {
+        text = "探索已关闭";
+      } else if (f.reason) {
+        text = (f.explore ? "等待前沿：" : "探索结束：") + reason;
+      } else {
+        text = "空闲";
+      }
+      elGoalChip.textContent = text;
+      elGoalChip.hidden = !text || text === "空闲";
       elGoalRow.hidden = !(f.state === "following" ||
                            f.state === "exploring");
       if (f.leg) {
@@ -800,10 +853,12 @@
       const ex = document.getElementById("btn-explore");
       ex.textContent = f.explore ? "自动探索：开" : "自动探索：关";
       ex.classList.toggle("active", !!f.explore);
+      updateFusionProgress(f);
       dirty = true;
       return;
     }
     fusion = null;
+    updateFusionProgress(null);
     const g = status.goal;
     if (g && g.state && g.x !== undefined) {
       activeGoal = { x: g.x, y: g.y, yaw: g.yaw, state: g.state };
