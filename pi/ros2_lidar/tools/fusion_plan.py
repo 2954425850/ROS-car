@@ -354,28 +354,57 @@ def find_frontiers(grid, pose, boundary=None, blacklist=(),
     return out
 
 
+def unknown_distance(grid, x, y, max_radius=0.8):
+    step = grid.resolution * 0.5
+    best = max_radius
+    for k in range(16):
+        a = 2.0 * math.pi * k / 16.0
+        c, s = math.cos(a), math.sin(a)
+        r = step
+        while r <= max_radius:
+            if grid.classify(x + c * r, y + s * r) == "unknown":
+                best = min(best, r)
+                break
+            r += step
+    return best
+
+
 def choose_frontier_goal(grid, pose, frontiers, *, clearance=0.6,
-                         w_gain=1.0, w_dist=0.6, w_clear=1.5,
-                         gain_cap=200):
+                         unknown_clearance=0.6, w_gain=1.0, w_dist=0.6,
+                         w_clear=1.5, gain_cap=200):
     px, py = pose[0], pose[1]
+    start = nearest_free_point(grid, (px, py), 0.5)
+    if start is None:
+        return None
     best = None
     best_score = None
     for f in frontiers:
+        dist = math.hypot(f.centroid[0] - px, f.centroid[1] - py)
+        if dist < 1e-6:
+            continue
         goal = None
-        goal_d = None
-        for i in f.cells:
-            ix, iy = i % grid.width, i // grid.width
-            wx, wy = grid.cell_to_world(ix, iy)
-            d = math.hypot(wx - px, wy - py)
-            if goal_d is not None and d >= goal_d:
+        # 不能直接选前沿边缘：unknown 的膨胀会把边缘点压到 master 253，
+        # Smac 直接 no valid path。从前沿质心朝机器人退 0.6~1.2 m，
+        # 取第一个 unknown/障碍都 >= 0.6 m 且直线可达的 free 格。
+        for back in (0.6, 0.8, 1.0, 1.2):
+            t = back / dist
+            if t >= 1.0:
+                break
+            gx = f.centroid[0] + (px - f.centroid[0]) * t
+            gy = f.centroid[1] + (py - f.centroid[1]) * t
+            if goal_status(grid, gx, gy) != "free":
                 continue
-            if not clearance_ok(grid, wx, wy, clearance):
+            if unknown_distance(grid, gx, gy, 0.8) < unknown_clearance:
                 continue
-            goal, goal_d = (wx, wy), d
+            if obstacle_distance(grid, gx, gy, 0.8) < clearance:
+                continue
+            if not line_free(grid, start, (gx, gy)):
+                continue
+            goal = (gx, gy)
+            break
         if goal is None:
             continue
         gain = min(f.size, gain_cap)
-        dist = math.hypot(f.centroid[0] - px, f.centroid[1] - py)
         obs = obstacle_distance(grid, goal[0], goal[1], 0.8)
         score = w_gain * gain - w_dist * dist + w_clear * min(obs, 0.6)
         if best_score is None or score > best_score:

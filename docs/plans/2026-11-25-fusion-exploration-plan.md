@@ -678,6 +678,12 @@ def test_choose_frontier_goal_is_free_with_clearance():
     assert goal is not None
     assert goal_status(g, goal[0], goal[1]) == "free"
     assert clearance_ok(g, goal[0], goal[1], 0.6)
+
+> **实车修正（2026-11-25）**：`choose_frontier_goal` 不能直接选簇内前沿边缘；
+> unknown 的膨胀会把边缘点压到 master 253。改为从簇质心朝机器人退
+> 0.6~1.2 m，要求 `unknown_distance >= 0.6`、`obstacle_distance >= 0.6`、
+> `line_free`。新增 `test_choose_frontier_goal_keeps_unknown_clearance`。
+> 代码以仓库 `fusion_plan.py` 为准。
 ```
 
 - [ ] **Step 2: 运行，确认失败**

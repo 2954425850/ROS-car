@@ -171,7 +171,8 @@ def test_choose_intermediate_honours_blacklist():
                                 blacklist=blacklist) is None
 
 
-from fusion_plan import Frontier, find_frontiers, choose_frontier_goal
+from fusion_plan import (Frontier, find_frontiers, choose_frontier_goal,
+                         unknown_distance)
 
 
 def _room_with_frontier():
@@ -225,6 +226,16 @@ def test_choose_frontier_goal_is_free_with_clearance():
     assert goal is not None
     assert goal_status(g, goal[0], goal[1]) == "free"
     assert clearance_ok(g, goal[0], goal[1], 0.6)
+
+
+def test_choose_frontier_goal_keeps_unknown_clearance():
+    g = _room_with_frontier()
+    fs = find_frontiers(g, (2.0, 2.0))
+    goal = choose_frontier_goal(g, (2.0, 2.0), fs)
+    assert goal is not None
+    # 旧实现选前沿边缘，紧贴 unknown，master 上是 253；新实现要退到
+    # unknown 间隙 >= 0.6 m 的 free 格。
+    assert unknown_distance(g, goal[0], goal[1], 0.8) >= 0.5
 
 
 from fusion_plan import Navigator

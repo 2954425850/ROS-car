@@ -220,7 +220,10 @@ score = w_gain * min(cluster_size, gain_cap)
 ```
 
 默认 `w_gain=1.0, w_dist=0.6, w_clear=1.5, gain_cap=200`。
-选分数最高的簇；在簇内选离车最近、间隙 >= 0.6 m 的 free 格作为 `G`。
+选分数最高的簇；**不能直接选前沿边缘**（unknown 的膨胀会把边缘点压到
+master 253，Smac 直接 `no valid path`）。从簇质心朝机器人退 0.6~1.2 m，
+取第一个 unknown 间隙 >= 0.6 m、障碍间隙 >= 0.6 m、且 `line_free` 的
+free 格作为 `G`（2026-11-25 实车修正）。
 `G` 的 yaw 用 §5.4。选不到就换下一个簇。
 
 ### 6.3 节奏
