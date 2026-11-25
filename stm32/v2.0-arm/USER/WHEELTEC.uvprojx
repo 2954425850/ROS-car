@@ -434,6 +434,11 @@
               <FilePath>..\HARDWARE\motor.c</FilePath>
             </File>
             <File>
+              <FileName>motor_ext.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\HARDWARE\motor_ext.c</FilePath>
+            </File>
+            <File>
               <FileName>oled.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\HARDWARE\oled.c</FilePath>

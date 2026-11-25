@@ -3,9 +3,20 @@
 
 2026.10.02
 机械臂保持(急停/上位机断线)时只在进入保持的前3拍发送MOVE_STOP，不再每拍发送。原来每20ms重发会把受载关节的目标反复改到当前下垂位置，导致关节持续下沉（实测上位机重启2~3秒内肩部594->629 count）。宿主机测试已加断言。
-
-2026.10.13
-�޸� OLED ��ѹ���� 12.60V��Adc_Init() δ��ʼ�� ADC_InitTypeDef.ADC_ExternalTrigConv���� SPL �� ADC_Init() ����������� OR �� CR2��bit11=ALIGN����ջ����ֵʹ ADC ������롢�����Ŵ� 16 ����195.6V �� OLED ����ֻ�� 2 λ��ʾ�� 95.6���ֱ� 12.6V ǯλ�ڸǣ����� ADC_StructInit() ���Σ��� arm.c �����ջ���ݱ仯��������Ǳ���ף��ϰ汾ͬ���з��ա�
-adc.h ע�Ͷ�����Battery_Ch = ͨ�� 8 (PB0)��ԭ����д"ͨ�� 14"(=PC4)�����Ų鷽���ƫ����
-����ͬ������ 14 ����motor.c/system.c/key.c/adc.c�����ֲ� SPL ��ʼ���ṹ��δ��ֵ�ĳ�Աһ���� XxxStructInit() ��ȫ��������������TIM1(���C/D)��TIM8(���) �� TIM_RepetitionCounter���߼���ʱ�� RCR ��Ч����TIM1 �� TIM_OCInitTypeDef �� N*/idle �ֶΣ����� CCER/CR2�������󿪻����������
-��������ѹ���� 10.6V �������������У�show.c��12.6V ǯλ��ʱ�رձ��ڶ�������֤��ָ�����
+2026.10.16
+换电机：外接驱动板接在预留的 6 个舵机口上（J1=PC6 PWM1右、J2=PC7 INA1、J4=PC8 INB1、J5=PC9 PWM2左、J6=PB14 INA2、J7=PB15 INB2），TIM8 20kHz。第一步先开环让车能被动起来：MOTOR_C/MOTOR_A 的目标速度直接换算成占空比，不过编码器 PI（编码器在重新接线）；Servo_PWM_Init/Servo_PWM12_Init、0xAB 舵机帧、Servo_Set()、Set_Pwm() 里的 Servo_PWM 全部解绑，否则 100Hz 会把左轮占空比冲掉。开关：motor_ext.h 的 MOTOR_EXT_ENABLE。详见 docs/plans/2026-10-16-motor-ext-step1.md。
+2026.10.16(2)
+排障：目标速度正常但驱动板输入六个脚全 0V。逐条反汇编核对了 systemInit->MotorExt_Init、Balance_task->MotorExt_SetTargets、motor_ext_out/slew，确认代码路径与引脚配置无误（旧闭环 Set_Pwm/PI 已被链接器整段移除），因此把唯一无法远程核对的间接层去掉：删掉 s_ch[] 指针表，6 个脚改为字面写死。另加开机自检：MotorExt_Init() 先把 6 个脚拉高再读回自己的 IDR，结果由 MotorExt_PinTest() 输出到 OLED 第 6 行的 "EX nn"（EX=确认跑的是这版固件，nn=回读位图十进制 0..63，63=六个都跟得上；位为 0 表示该脚被外部拉低，例如线插在 GND 那排）。自检期间均为停机态，车不会动。排障过程与判读表见 docs/plans/2026-10-16-motor-ext-step1.md 第 8 节。
+2026.10.17
+实测（bench 模式）：右轮正转、左轮反转 → 把 MOTOREXT_L_FORWARD_IS_POS 置 0（只翻左侧占空比符号，引脚不变）。
+电源异常记录：外接驱动板由 3S 供电时，若 STM32 板也用同一块 3S 供电，电机不转；STM32 仅用 Type-C（OLED 电压 4.5V）供电时电机正常转。bench 模式已绕过电压/使能/链路门限，两路供电下固件行为完全相同，因此差异在硬件侧：待确认 3S 供电时 OLED 是否稳定显示 EX 63 / O N / 电压读数，以及拔掉六根信号线后排针是否恢复电平（用于区分驱动板把线拉死和主板不驱动）。
+2026.10.17(2)
+电源差异定位：3S 供电时 OLED 稳定、EX 63、O N、12V+，但六根信号线接上驱动板时被拉到约 0V，拔掉即恢复 3.3V/0.63V —— 是驱动板隔离输入侧在吃这几根线。关键数据：驱动板 CN1 的 VCC 在 USB 供电时 3.6V、3S 供电时 5.1V，而 MCU 是 3.3V 逻辑；隔离输入以自身 VCC 为参考，VCC=5.1V 时 3.3V 信号不在有效高电平范围内，驱动板于是把方向脚当低电平（INA=INB=L=制动），这正好解释只有在 USB 供电时才转。处置：CN1 VCC 改接主板 3V3（手册允许 3~5.5V），与 MCU 逻辑同电平；GND 仍共地。CN1 引脚：1/6=VCC，5/10=GND，2/3/4=PWM1/INA1/INB1，7/8/9=PWM2/INA2/INB2。
+2026.10.21
+机械臂复位可选跳过夹爪：0xAC 帧 flags 新增 bit1（ROS_ARM_FLAG_KEEP_GRIPPER）。bit0 的 re-home 上升沿触发复位时若 bit1 同时为 1，INIT_POSE 只把其余 4 个位置关节走到复位姿态，夹爪（ID1）保持原位；进入 READY 时夹爪的影子值取回读位置，避免恢复控制瞬间被拉回旧目标。bit1=0（默认）和上电复位的完整五关节复位行为不变。
+2026.10.22
+灯带数据脚 PA7 -> PC3。实测 PA7 对 GND 直通（蜂鸣档 0Ω；内部 40k 上拉和推挽输出都拉不高），判断为板上 ESD 保护器件 D10 的 PA7 通道击穿。ws2811 改用 SPI2（PC3 = SPI2_MOSI, AF5）+ DMA1_Stream4（Ch0），SPI 时钟仍为 2.625MHz（APB1 42MHz / 16），帧格式与灯效逻辑不变。灯带数据线需从 PA7 改接到 PC3。
+2026.10.23
+再换电机：70:1 减速比、编码器 16 PPR（轮胎/底盘/驱动板不变）。顺手把速度环从 10-16 的开环接回闭环：Robot_Init 参数改为 HALL_70/Hall_16，Encoder_precision 由 4×13×30=1560 变为 4×16×70=4480（轮速、OLED 实测、ROS 上行里程计都按它折算）；balance.c 改为 Incremental_PI_C(MOTOR_C) 右轮 + Incremental_PI_A(MOTOR_A) 左轮，输出经新增的 MotorExt_SetPwm() 送入外接驱动板（±16800 → ±95% 占空比，斜坡和接线方向宏不变）；停车时 Incremental_PI_Reset() 清积分，避免重新使能从上一次的占空比起跳。Velocity_KP/KI 按对象增益 30/70 反比放大为 5800/820（仅初值，需上车实测）。注意：满占空比轮速约为原来的 0.43 倍（约 0.4 m/s），上位机限速要降到 0.35 m/s 以下；上车前必须轮子离地确认 A/C 编码器实测速度与目标同号，编码器没接上时闭环会把占空比顶满。详见 docs/plans/2026-10-23-motor-70-16-retune.md。
+2026.10.23(2)
+A 电机编码器损坏。A、B 电机并联在同一驱动通道（M+ 接 M+、M- 接 M-），本来就同速，所以让 B 的编码器（TIM3，PB4/PB5）代表左侧：encoder.h 新增 LEFT_ENCODER_IS_B（默认 1），Get_Velocity_Form_Encoder() 在车型符号修正之后把 MOTOR_B.Encoder 抄给 MOTOR_A.Encoder，速度环 / OLED / RosUp.vA 都不用改。前提是 B 的编码器必须接到 PB4/PB5——没接则左侧实测恒 0，闭环会把左侧占空比顶满。等价替代：把 B 的编码器线插到 A 的输入端（TIM2，PA15/PB3）并把开关改回 0。

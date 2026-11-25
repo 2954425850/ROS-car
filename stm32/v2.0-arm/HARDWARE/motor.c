@@ -477,6 +477,14 @@ servo past its mechanical stop. Out of range channel numbers are ignored.
  **************************************************************************/
 void Servo_Set(u8 ch,int us)
 {
+#if MOTOR_EXT_ENABLE
+	/* ROS 2026-10-16: the six servo ports are the external motor board's PWM
+	 * and direction pins now (motor_ext.h). TIM8->CCR1 is the right wheel's
+	 * duty and TIM8->CCR4 the left one, and the rest are plain GPIO, so a
+	 * servo command must not be allowed near them. */
+	(void)ch;
+	(void)us;
+#else
 	if(us < SERVO_MIN) us = SERVO_MIN;
 	if(us > SERVO_MAX) us = SERVO_MAX;
 	if(ch < 1 || ch > SERVO_NUM) return;
@@ -492,4 +500,5 @@ void Servo_Set(u8 ch,int us)
 	}
 
 	Servo_Ch[ch] = us;
+#endif
 }

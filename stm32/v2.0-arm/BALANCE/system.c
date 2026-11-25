@@ -76,22 +76,17 @@ float Move_X, Move_Y, Move_Z;
 
 //PID parameters of Speed control
 //速度控制PID参数
-/* ROS: wheel-speed PI retuned 2026-09-20 for the current chassis.
- * The old 700/700 was for the ORIGINAL car. Since then the wheel diameter
- * went 65->125mm and the motor/chassis were replaced. Wheel perimeter scales
- * the loop gain at BOTH ends (plant gain and the error signal), so the old
- * gains were ~1.9x too hot -> +28% overshoot. Tuned on the car with
- * tools/velocity_pid_tune.py. Measured 3x at 0.3 m/s on the ground
- * (a 4th run was discarded -- the car was pushed by hand mid-run):
- *   steady-state error  +0.8 / +0.5 / +0.2 %   <- solid
- *   rise time (90%)     0.415 / 0.422 / 0.440 s  <- repeatable, +-3%
- *   overshoot           +9.0 / +17.3 / +19.4 %  <- still scattered
- * Kp=700/Ki=350 gave a slower rise (0.467s, n=1) and the same mean
- * overshoot, so the higher Kp is kept for the faster rise. Overshoot
- * scatter exceeds the difference between gain settings -- stop tuning.
- * NOTE: above ~0.5 m/s the loop SATURATES -- that is a torque/battery limit,
- * not a gain problem (verified: doubling Ki does not close the gap). */
-float Velocity_KP=2500,Velocity_KI=350; 
+/* ROS: wheel-speed PI, scaled 2026-10-23 for the 70:1 gearbox.
+ * The drive motor was swapped again: 70:1 with a 16 PPR encoder. Tyres,
+ * chassis and driver board are unchanged. At the same duty the wheel now
+ * turns 30/70 as fast as it did with the old 30:1 motor, so the plant
+ * gain fell 2.33x and both gains are multiplied by 70/30 to keep the
+ * crossover measured on 2026-09-20 (0.3 m/s, 0.42 s rise, <1% error).
+ * This is a first-order scaling, NOT a measurement: re-run
+ * tools/velocity_pid_tune.py on the car and adjust from here.
+ * Also expect the top speed to drop to about 0.4 m/s at 95% duty --
+ * keep the host speed limit below that or the loop just saturates. */
+float Velocity_KP=5800,Velocity_KI=820; 
 
 //Smooth control of intermediate variables, dedicated to omni-directional moving cars
 //平滑控制中间变量，全向移动小车专用
@@ -228,11 +223,17 @@ void systemInit(void)
 	 * speed loop reads Wheel_perimeter / Encoder_precision -- all of
 	 * them would still hold the other model's values. Re-initialise
 	 * with the four wheel car's real parameters so the tap position
-	 * can no longer affect anything. */
+	 * can no longer affect anything.
+	 *
+	 * ROS 2026-10-23: new drive motor, 70:1 gearbox and a 16 PPR encoder.
+	 * Encoder_precision becomes 4 x 16 x 70 = 4480 counts per wheel turn
+	 * (it was 4 x 13 x 30 = 1560). The speed loop, the OLED and the ROS
+	 * uplink wheel speeds all divide by it, so the old value would read
+	 * 2.87x too fast -- and drive the closed loop backwards. */
 	Robot_Init(FourWheel_real_wheelSpacing,
 	           FourWheel_real_axlespacing,
 	           0,
-	           HALL_30F, Hall_13,
+	           HALL_70, Hall_16,
 	           FourWheel_real_wheelDiameter);
 	
 	/* ROS: N10P LIDAR DISABLED (UART5 + DMA1_Stream0 stay off) */  /* LIDAR_USART_Init(); */
@@ -254,6 +255,15 @@ void systemInit(void)
 //	if(Car_Mode==Akm_Car) 
 	// initialize the steering gear control pin of Ackerman car,
 	//初始化阿克曼小车的舵机控制引脚
+#if MOTOR_EXT_ENABLE
+	/* ROS 2026-10-16: the six reserved servo ports now carry the external
+	 * motor driver's PWM and direction signals - MotorExt_Init() owns those
+	 * pins and TIM8. The two Servo_*_Init() calls below would claim the same
+	 * pins back (PC7/PC8 to TIM8_CH2/CH3, PB14/PB15 to TIM12) and leave the
+	 * direction pins in alternate function, so they are wired off rather than
+	 * deleted. See motor_ext.h. */
+	MotorExt_Init();
+#else
 	Servo_PWM_Init(9999,167);        /* ch1..4  TIM8  PC6 PC7 PC8 PC9 */
 	/* ROS: servo channels 5 and 6 on TIM12 */
 	/* psc 83, not 167. TIM8 sits on APB2 (timer clock 168MHz) but TIM12 sits
@@ -263,6 +273,7 @@ void systemInit(void)
 	 * servo range, which drives the horn into its stop and stalls it. 83
 	 * makes TIM12 count at 1MHz too, so a value means the same on both. */
 	Servo_PWM12_Init(9999,83);      /* ch5..6  TIM12 PB14 PB15 */
+#endif
 
   //Initialize motor speed control and, for controlling motor speed, PWM frequency 10kHz
   //初始化电机速度控制以及，用于控制电机速度，PWM频率10KHZ

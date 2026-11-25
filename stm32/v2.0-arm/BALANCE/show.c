@@ -252,6 +252,12 @@ void oled_show(void)
 	/* ROS: no local modes left, show the latched fault byte instead */
 	if(RosFault) OLED_ShowNumber(0,50,RosFault,2,12);
 	else         OLED_ShowString(0,50,"--");
+	/* ROS 2026-10-16: drive-path marker. "EX" says this build is the one
+	 * running; the number is the six driver pins read back at boot (0..63,
+	 * 63 = all six followed the MCU). A bit stuck low means something
+	 * outside the MCU is holding that pin down. See motor_ext.h. */
+	OLED_ShowString(18,50,"EX");
+	OLED_ShowNumber(30,50,MotorExt_PinTest(),2,12);
 	
 		
 	 //显示当前小车是否允许控制//

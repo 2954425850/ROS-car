@@ -186,6 +186,10 @@ void ros_apply_servo(void);    /* Balance_task @100Hz: push values to the servos
  *  14  t_ms    uint16 ms              travel time, 0 = firmware default
  *  16  flags   uint8  bit0 = re-home the base (EDGE: one search per
  *                           0->1 transition, not per frame)
+ *                    bit1 = with bit0, leave the gripper (field 0) where it
+ *                           is instead of walking it to ARM_RESET_POSE.
+ *                           Latched on the same edge, so it applies to that
+ *                           one re-home. Without bit0 it has no effect.
  *  17  seq     uint8
  *  18  crc     uint16 little endian, CRC-16/MODBUS over bytes 0..17
  *
@@ -205,6 +209,8 @@ void ros_apply_servo(void);    /* Balance_task @100Hz: push values to the servos
 #define ROS_ARM_NUM          6
 
 #define ROS_ARM_FLAG_REHOME  0x01    /* bit0: re-run base homing */
+#define ROS_ARM_FLAG_KEEP_GRIPPER 0x02 /* bit1: with bit0, do not reset the
+                                        * gripper during that re-home */
 
 typedef struct _ROS_ARM_
 {

@@ -1,4 +1,5 @@
 #include "ws2811.h"
+#include "ws_link.h"
 
 /* ==== WS_LOGIC_BEGIN ==== */
 /* Nothing below this marker may include an STM32 header or touch a global
@@ -371,7 +372,7 @@ void ws_render(const WS_State *st, WS_SpeedOut sp, const WS_Overlay *ov, u32 ms)
 				p[2] = ws_mix(p[2], mb, bl);
 #elif WS_ORDER_RBG
 				/* RBG stores r,b,g; the old #else branch mixed r,g,b
-				 * in the wrong slots, so the idle→motion crossfade
+				 * in the wrong slots, so the idle->motion crossfade
 				 * rotated colours on this strip. */
 				p[0] = ws_mix(p[0], mr, bl);
 				p[1] = ws_mix(p[1], mb, bl);
@@ -390,17 +391,13 @@ void ws_render(const WS_State *st, WS_SpeedOut sp, const WS_Overlay *ov, u32 ms)
 }
 
 /**************************************************************************
-Function: Expand one source byte into the three SPI bytes that carry it.
-          One WS2811 bit -> three SPI bits at 2.625MHz (0.381us each):
-             0 -> 100  = 0.381us high, 0.762us low  (spec 0.40/0.85)
-             1 -> 110  = 0.762us high, 0.381us low  (spec 0.80/0.45)
-          MSB first, so source bit7 becomes the most significant SPI group:
-          8 source bits -> 24 SPI bits -> exactly 3 bytes.
-
-          Kept out of ws_pack() so the host suite can assert the bit
-          pattern. A wrong pattern still emits *pulses*, it just makes the
-          strip show garbage -- which sends you hunting for a level-shifter
-          or a bad joint instead of a bad shift.
+Function: Legacy 3-SPI-bit-per-WS-bit expansion, kept for the host suite.
+          The F407 hardware no longer uses this: at 2.625MHz its T1L is
+          0.381us, below the WS2811 data-sheet minimum of 0.58us.  The
+          hardware layer now calls ws_pack_byte4() below.
+             0 -> 100  = 0.381us high, 0.762us low
+             1 -> 110  = 0.762us high, 0.381us low  <-- T1L too short
+          MSB first: 8 source bits -> 24 SPI bits -> exactly 3 bytes.
 **************************************************************************/
 void ws_pack_byte(u8 src, u8 out[3])
 {
@@ -414,6 +411,29 @@ void ws_pack_byte(u8 src, u8 out[3])
 	out[0] = (u8)(acc >> 16);
 	out[1] = (u8)(acc >> 8);
 	out[2] = (u8)(acc);
+}
+
+/**************************************************************************
+Function: 4-SPI-bit-per-WS-bit expansion, used by the F407 SPI2 master at
+          2.625MHz (APB1 42MHz / 16).  One SPI bit is 0.381us:
+             0 -> 1000  = 0.381us high, 1.143us low
+             1 -> 1100  = 0.762us high, 0.762us low
+          High times (what WS2811 actually discriminates) are 0.38/0.76us.
+          MSB first: 8 source bits -> 32 SPI bits -> exactly 4 bytes.
+**************************************************************************/
+void ws_pack_byte4(u8 src, u8 out[4])
+{
+	u32 acc = 0;
+	u8  bit;
+
+	for (bit = 0; bit < 8; bit++) {
+		u32 code = ((src >> (7 - bit)) & 1u) ? 0xCu : 0x8u;  /* 1100 : 1000 */
+		acc = (acc << 4) | code;
+	}
+	out[0] = (u8)(acc >> 24);
+	out[1] = (u8)(acc >> 16);
+	out[2] = (u8)(acc >> 8);
+	out[3] = (u8)(acc);
 }
 
 /* ==== WS_DEMO_LOGIC_BEGIN ==== */
@@ -555,175 +575,140 @@ u8 ws_demo_frame(float *v, WS_Overlay *ov, u32 ms)
 #include "delay.h"
 #include "adc.h"
 
-/* Each pixel is 3 channels x 8 bits = 24 WS2811 bits; every WS2811 bit
- * expands to 3 SPI bits, so one pixel costs 24*3/8 = 9 SPI BYTES.
+/* The F407 does not generate WS2811 timing any more.  It publishes the
+ * chassis state to the C542 LED controller over USART3:
  *
- * DO NOT write (WS_PIXELS * 24 * 3) here. That is the SPI BIT count
- * (5760 for 80 pixels), not the byte count. Sizing the buffer and the DMA
- * transfer to it makes every frame 8x too long -- 17.5ms instead of
- * 2.19ms -- and appends 5040 bytes of junk to the end of the bitstream. */
-#define WS_SPI_BYTES    (WS_PIXELS * 9)          /* 720 bytes */
-
-/* Trailing zero SPI bytes. One 0x00 byte is 8 low bit-times = 3.05us of
- * CONTINUOUS low on MOSI, so N bytes give 3.05*N us of low level -- and
- * that low period is what actually latches the strip (WS2811 wants
- * >50us). 20 bytes = 61us leaves only 11us of margin, so use 100 bytes
- * = 305us; it costs 100 bytes and 305us out of a 40ms frame.
+ *   PC10 / USART3_TX (AF7) -> C542 PA10 (USART1_RX, Arduino D2)
+ *   PC11 / USART3_RX (AF7) <- C542 PA9  (USART1_TX, Arduino D8)
+ *   GND                    -- GND
  *
- * IMPORTANT: these bytes are NOT "20 WS2811 zero bits". They are never
- * grouped into WS bit triples, they are raw low SPI bits. Analysing them
- * as WS bit patterns (100 100 100 ...) and concluding "that is a pulse
- * train, not a low level" is the wrong frame -- see the arithmetic
- * above. Do not "fix" this loop by deleting it. */
-#define WS_RESET_BYTES  100
+ * 115200 8N1, one 13-byte STATE frame every 40 ms (~325 B/s).  The wire
+ * format lives in ws_link.h so both sides share one definition.
+ *
+ * PB10/PB11 are NOT usable for USART3: bsp_siic.c/I2C.c drive them as the
+ * IMU's software I2C.  PC10/PC11 are free in this firmware (PC6-PC9 are the
+ * TIM8 motor PWM, PC12 is the lidar's UART5).  If the board does not bring
+ * PC10/PC11 out, PD8/PD9 (also AF7) are the alternative. */
 
-/* Compile-time guard so the 8x mistake can never come back unnoticed.
- * The byte count is exactly 1/8 of the naive bit count; if someone
- * "simplifies" WS_SPI_BYTES back to the bit expression, this fires. */
-#if WS_SPI_BYTES == (WS_PIXELS * 24 * 3)
-#error "WS_SPI_BYTES is the SPI BIT count, not the BYTE count (should be WS_PIXELS * 9)"
-#endif
+static u8 s_link_seq;
 
-static u8  s_tx[WS_SPI_BYTES + WS_RESET_BYTES];
-static volatile u8 s_busy = 0;
-
-/**************************************************************************
-Function: Pack the whole frame into s_tx.
-          The 256-entry LUT is built by CALLING ws_pack_byte, so the bit
-          pattern has exactly one definition and the host test covers it.
-**************************************************************************/
-static void ws_pack(void)
+static void ws_link_init(void)
 {
-	static u8 lut[256][3];
-	static u8 lut_ready = 0;
-	u16 i, o = 0;
+	GPIO_InitTypeDef  g;
+	USART_InitTypeDef u;
 
-	if (!lut_ready) {
-		u16 v;
-		for (v = 0; v < 256; v++) ws_pack_byte((u8)v, lut[v]);
-		lut_ready = 1;
-	}
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOC, ENABLE);
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART3, ENABLE);
 
-	/* Global brightness ceiling, applied here at the last mile so every
-	 * effect obeys it without each renderer having to know about the cap.
-	 * WS_BRIGHT_MAX is an 8-bit ceiling: 255 = full, 0 = dark.
-	 * THIS IS THE ONLY PLACE THE MACRO TAKES EFFECT -- if you drop these
-	 * lines the macro is dead and every power-saving claim in the design
-	 * doc becomes false. */
-	for (i = 0; i < WS_PIXELS * 3; i++) {
-		u8 v = (u8)(((u32)ws_frame[i] * WS_BRIGHT_MAX) / 255u);
-		s_tx[o++] = lut[v][0];
-		s_tx[o++] = lut[v][1];
-		s_tx[o++] = lut[v][2];
-	}
-	for (i = 0; i < WS_RESET_BYTES; i++) s_tx[o++] = 0x00;
-}
+	GPIO_PinAFConfig(GPIOC, GPIO_PinSource10, GPIO_AF_USART3);
+	GPIO_PinAFConfig(GPIOC, GPIO_PinSource11, GPIO_AF_USART3);
 
-static void ws_spi_init(void)
-{
-	GPIO_InitTypeDef g;
-	SPI_InitTypeDef  s;
-	DMA_InitTypeDef  d;
-	NVIC_InitTypeDef n;
-
-	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOA | RCC_AHB1Periph_DMA2, ENABLE);
-	RCC_APB2PeriphClockCmd(RCC_APB2Periph_SPI1, ENABLE);
-
-	/* PA7 = SPI1_MOSI, AF5 */
-	GPIO_PinAFConfig(GPIOA, GPIO_PinSource7, GPIO_AF_SPI1);
-	g.GPIO_Pin   = GPIO_Pin_7;
+	g.GPIO_Pin   = GPIO_Pin_10 | GPIO_Pin_11;
 	g.GPIO_Mode  = GPIO_Mode_AF;
 	g.GPIO_OType = GPIO_OType_PP;
-	/* Was GPIO_Speed_100MHz on the old 60 LED/m strip. The new 120 LED/m
-	 * strip's DIN rings at fast edges and misreads the frame (on the C542
-	 * bench this looked like a 5% white being very bright/flickering);
-	 * 25MHz slew fixed it there. Keep this slow unless a series resistor
-	 * proves a faster edge is safe. */
 	g.GPIO_Speed = GPIO_Speed_25MHz;
-	g.GPIO_PuPd  = GPIO_PuPd_UP;      /* keeps DIN defined while idle */
-	GPIO_Init(GPIOA, &g);
+	g.GPIO_PuPd  = GPIO_PuPd_UP;
+	GPIO_Init(GPIOC, &g);
 
-	/* 84MHz APB2 / 32 = 2.625MHz, MSB first, mode 0 */
-	SPI_I2S_DeInit(SPI1);
-	s.SPI_Direction         = SPI_Direction_1Line_Tx;
-	s.SPI_Mode              = SPI_Mode_Master;
-	s.SPI_DataSize          = SPI_DataSize_8b;
-	s.SPI_CPOL              = SPI_CPOL_Low;
-	s.SPI_CPHA              = SPI_CPHA_1Edge;
-	s.SPI_NSS               = SPI_NSS_Soft;
-	s.SPI_BaudRatePrescaler = SPI_BaudRatePrescaler_32;
-	s.SPI_FirstBit          = SPI_FirstBit_MSB;
-	s.SPI_CRCPolynomial     = 7;
-	SPI_Init(SPI1, &s);
-	SPI_Cmd(SPI1, ENABLE);
-
-	/* MANDATORY, and easy to miss: the SPI peripheral only asserts a DMA
-	 * request when TXDMAEN in SPI_CR2 is set. Configuring the DMA stream
-	 * and the interrupt is NOT enough -- without this single line the SPI
-	 * never asks for a transfer, so DMA2_Stream5 stays idle, MOSI never
-	 * moves, and the strip is completely dark while everything else looks
-	 * correctly configured. */
-	SPI_I2S_DMACmd(SPI1, SPI_I2S_DMAReq_Tx, ENABLE);
-
-	/* SPI1_TX lives on DMA2 Stream3 or Stream5, both Channel 3. Stream5 is
-	 * free: lidar.c holds DMA1_Stream0, and adc.c runs with
-	 * ADC_DMAAccessMode_Disabled so it holds nothing. */
-	DMA_DeInit(DMA2_Stream5);
-	d.DMA_Channel            = DMA_Channel_3;
-	d.DMA_PeripheralBaseAddr = (u32)&SPI1->DR;
-	d.DMA_Memory0BaseAddr    = (u32)s_tx;
-	d.DMA_DIR                = DMA_DIR_MemoryToPeripheral;
-	d.DMA_BufferSize         = sizeof(s_tx);
-	d.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
-	d.DMA_MemoryInc          = DMA_MemoryInc_Enable;
-	d.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte;
-	d.DMA_MemoryDataSize     = DMA_MemoryDataSize_Byte;
-	d.DMA_Mode               = DMA_Mode_Normal;
-	d.DMA_Priority           = DMA_Priority_High;
-	d.DMA_FIFOMode           = DMA_FIFOMode_Disable;
-	d.DMA_FIFOThreshold      = DMA_FIFOThreshold_HalfFull;
-	d.DMA_MemoryBurst        = DMA_MemoryBurst_Single;
-	d.DMA_PeripheralBurst    = DMA_PeripheralBurst_Single;
-	DMA_Init(DMA2_Stream5, &d);
-	DMA_ITConfig(DMA2_Stream5, DMA_IT_TC, ENABLE);
-
-	n.NVIC_IRQChannel                   = DMA2_Stream5_IRQn;
-	n.NVIC_IRQChannelPreemptionPriority = 6;
-	n.NVIC_IRQChannelSubPriority        = 0;
-	n.NVIC_IRQChannelCmd                = ENABLE;
-	NVIC_Init(&n);
+	u.USART_BaudRate            = 115200;
+	u.USART_WordLength          = USART_WordLength_8b;
+	u.USART_StopBits            = USART_StopBits_1;
+	u.USART_Parity              = USART_Parity_No;
+	u.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+	u.USART_Mode                = USART_Mode_Rx | USART_Mode_Tx;
+	USART_Init(USART3, &u);
+	USART_Cmd(USART3, ENABLE);
 }
 
-void DMA2_Stream5_IRQHandler(void)
+static u8 ws_crc8_update(u8 crc, u8 b)
 {
-	if (DMA_GetITStatus(DMA2_Stream5, DMA_IT_TCIF5)) {
-		DMA_ClearITPendingBit(DMA2_Stream5, DMA_IT_TCIF5);
-		DMA_Cmd(DMA2_Stream5, DISABLE);
-		while (SPI_I2S_GetFlagStatus(SPI1, SPI_I2S_FLAG_BSY) == SET) { }
-		SPI_Cmd(SPI1, DISABLE);
-		DMA_ClearFlag(DMA2_Stream5, DMA_FLAG_TCIF5);
-		s_busy = 0;
+	u8 i;
+
+	crc ^= b;
+	for (i = 0; i < 8u; i++)
+		crc = (crc & 0x80u) ? (u8)((crc << 1) ^ 0x07u) : (u8)(crc << 1);
+	return crc;
+}
+
+static void ws_link_put(u8 b)
+{
+	u32 spin = 0;
+
+	while ((USART_GetFlagStatus(USART3, USART_FLAG_TXE) == RESET) &&
+	       (spin++ < 100000u)) {
+		/* bounded: a disconnected controller must never wedge the task */
+	}
+	if (spin < 100000u) USART_SendData(USART3, b);
+}
+
+/* Drain whatever the controller sent (5 Hz STATUS frames).  They are not
+ * interpreted yet; reading them keeps ORE from ever latching. */
+static void ws_link_drain(void)
+{
+	while (USART_GetFlagStatus(USART3, USART_FLAG_RXNE) != RESET) {
+		(void)USART_ReceiveData(USART3);
+	}
+	if (USART_GetFlagStatus(USART3, USART_FLAG_ORE) != RESET) {
+		(void)USART_ReceiveData(USART3);
 	}
 }
 
-static void ws_show(void)
+/* Speed calibration into the controller's colour table.
+ *
+ * The C542's ws_speed_map() breakpoints were tuned for a 0.75 m/s full
+ * scale (the old 60 LED/m car), but this chassis tops out at ~0.50 m/s:
+ * measured 2026-11-25 over /wheel_odom, max 0.503, p99 0.486.  With the
+ * old mapping full throttle only ever reached hue 60 (orange), never red.
+ *
+ * Scaling the value sent makes every speed reach the warm colours earlier
+ * without reflashing the controller.  2.0 -> 0.10 m/s is green-cyan,
+ * 0.20 m/s is yellow-orange, 0.30 m/s is orange-red, 0.40+ is red.
+ * Set back to 1.0f if the controller's table is retuned later. */
+#define WS_LINK_SPEED_GAIN  2.0f
+
+static void ws_link_send(float v, const WS_Overlay *ov)
 {
-	if (s_busy) return;              /* drop the frame, never block */
-	ws_pack();
-	s_busy = 1;
-	DMA_Cmd(DMA2_Stream5, DISABLE);
-	DMA_ClearFlag(DMA2_Stream5, DMA_FLAG_TCIF5);
-	DMA_SetCurrDataCounter(DMA2_Stream5, sizeof(s_tx));
-	/* Order matters: enable the SPI first so TXE is already 1 when the
-	 * DMA stream starts, which makes the SPI issue its first TX request
-	 * right away.
-	 *
-	 * Do NOT add a manual SPI_I2S_SendData() to "prime" anything here.
-	 * In DMA mode a CPU write to DR is either dropped (when TXE is low)
-	 * or injects an extra byte -- and one extra byte shifts the entire
-	 * 960-bit frame by 8 bits, turning every pixel into garbage. */
-	SPI_Cmd(SPI1, ENABLE);
-	DMA_Cmd(DMA2_Stream5, ENABLE);
+	u8  out[6u + WS_LINK_STATE_LEN + 1u];
+	u8  crc = 0;
+	u8  f = 0;
+	u8  i;
+	s16 speed_cms;
+	u16 nav = ov->nav_permille;
+
+	if (ov->estop)   f |= WS_LINK_F_ESTOP;
+	if (ov->lowbat)  f |= WS_LINK_F_LOWBAT;
+	if (ov->brake)   f |= WS_LINK_F_BRAKE;
+	if (ov->reverse) f |= WS_LINK_F_REVERSE;
+	f |= (u8)(((u8)ov->ros_link & 3u) << WS_LINK_F_ROS_SHIFT);
+	if      (ov->turn > 0) f |= WS_LINK_F_TURN_L;
+	else if (ov->turn < 0) f |= WS_LINK_F_TURN_R;
+
+	/* Clamp before the int16 conversion; an out-of-range float would be
+	 * undefined behaviour.  The chassis never exceeds a few m/s. */
+	v *= WS_LINK_SPEED_GAIN;
+	if (v >  3.0f) v =  3.0f;
+	if (v < -3.0f) v = -3.0f;
+	speed_cms = (s16)(v * 100.0f + ((v >= 0.0f) ? 0.5f : -0.5f));
+
+	out[0]  = WS_LINK_SOF0;
+	out[1]  = WS_LINK_SOF1;
+	out[2]  = WS_LINK_VER;
+	out[3]  = WS_LINK_TYPE_STATE;
+	out[4]  = WS_LINK_STATE_LEN;
+	out[5]  = s_link_seq++;
+	out[6]  = f;
+	out[7]  = WS_BRIGHT_MAX;
+	out[8]  = (u8)((u16)speed_cms & 0xFFu);
+	out[9]  = (u8)((u16)speed_cms >> 8);
+	out[10] = (u8)(nav & 0xFFu);
+	out[11] = (u8)(nav >> 8);
+	out[12] = WS_LINK_MODE_NORMAL;
+
+	for (i = 2u; i < 6u + WS_LINK_STATE_LEN; i++) crc = ws_crc8_update(crc, out[i]);
+	out[6u + WS_LINK_STATE_LEN] = crc;
+
+	ws_link_drain();
+	for (i = 0; i < 6u + WS_LINK_STATE_LEN + 1u; i++) ws_link_put(out[i]);
 }
 
 static float ws_wheel_speed(void)
@@ -739,14 +724,24 @@ static void ws_collect_overlay(WS_Overlay *ov, u32 ms)
 {
 	static u32   brake_until = 0;
 	static float prev = 0.0f;
+	static u8    link_seen = 0;
 	float v     = ws_wheel_speed();
 	float decel = prev - v;
 	prev = v;
 
+	/* RosDown.rx_ready is a ONE-FRAME publish flag: the USART ISR sets it
+	 * and Balance_task clears it again at 100 Hz.  Sampling it from this
+	 * 25 Hz task caught it at random, so the ring alternated between
+	 * "waiting" (yellow) and "connected" (cyan) even with a healthy link.
+	 * The frame counter is monotonic, so use it as the "ever connected"
+	 * latch; the existing ROS_RX_TIMEOUT_MS watchdog still supplies the
+	 * real lost-link indication through ROS_FAULT_TIMEOUT. */
+	if (RosDown.frames != 0u) link_seen = 1;
+
 	ov->estop  = (Flag_Stop || Avoid_ON_Flag) ? 1 : 0;
 	ov->lowbat = (Voltage < WS_LOWBAT_V) ? 1 : 0;
 	ov->ros_link = (RosFault & ROS_FAULT_TIMEOUT) ? 2
-	             : (RosDown.rx_ready ? 1 : 0);
+	             : (link_seen ? 1 : 0);
 	ov->reverse  = 0;              /* no reverse channel on this chassis */
 	ov->nav_permille = 0xFFFF;     /* no odometry feed yet, see plan notes */
 	ov->turn = 0;
@@ -759,65 +754,31 @@ static void ws_collect_overlay(WS_Overlay *ov, u32 ms)
 
 void ws2811_task(void *pvParameters)
 {
-	WS_State    st;
-	WS_Overlay  ov;
-	WS_SpeedOut sp;
+	WS_Overlay ov;
 	u32 ms = 0;
-#if WS_CALIB_MODE
-	u8 calib = 0;
-#endif
 
 	(void)pvParameters;
-	ws_spi_init();
-	ws_state_init(&st);
+	ws_link_init();
 
 	for (;;) {
 		float v = ws_wheel_speed();
-#if WS_DEMO_ENABLE
-		u8 painted;
-#endif
 
 		memset(&ov, 0, sizeof(ov));
 		ov.nav_permille = 0xFFFF;
 		ws_collect_overlay(&ov, ms);
 
-		/* ==== WS_DEMO_HOOK_1_BEGIN ==== */
-#if WS_DEMO_ENABLE
-		/* click() is falling-edge latched and the tick is 40ms, longer
-		 * than these buttons bounce, so no extra debounce is needed. */
-		if (click()) ws_demo_advance();
-		painted = ws_demo_frame(&v, &ov, ms);
-#endif
-		/* ==== WS_DEMO_HOOK_1_END ==== */
-
-		ws_state_step(&st, v);
-		sp = ws_speed_map(v);
-
-#if WS_CALIB_MODE
-		ws_render_calib(calib);
-		calib = (u8)((calib + 1) % WS_PIXELS);
-#else
-		/* ==== WS_DEMO_HOOK_2_BEGIN ==== */
-#if WS_DEMO_ENABLE
-		if (!painted)
-#endif
-		/* ==== WS_DEMO_HOOK_2_END ==== */
-		ws_render(&st, sp, &ov, ms);
-#endif
-		ws_show();
+		/* Everything below the render split now happens on the C542:
+		 * ws_state_step(), ws_speed_map(), ws_render() and the SPI bit
+		 * packing all run there, fed by this frame. */
+		ws_link_send(v, &ov);
 
 		/* FIXED 40ms tick -- do not make this adaptive.
 		 *
-		 * An earlier revision dropped to 100ms when parked to "save
-		 * power". But ws_state_step() is hard-calibrated for a 40ms
-		 * step: WS_FADE_STEP, the 100ms enter dwell and the 500ms exit
-		 * dwell all assume it. At a 100ms tick the 500ms exit
-		 * hysteresis silently became ~1250ms, so the ring stayed in
-		 * motion mode for well over a second after stopping.
-		 *
-		 * The saving was imaginary anyway: the MCU sits in vTaskDelay
-		 * either way, and the strip's current is set by WS_BRIGHT_MAX,
-		 * not by the refresh rate. */
+		 * The controller's ws_state_step() is hard-calibrated for a
+		 * 40ms step: WS_FADE_STEP, the 100ms enter dwell and the 500ms
+		 * exit dwell all assume it.  At a 100ms tick the 500ms exit
+		 * hysteresis silently becomes ~1250ms, so the ring stays in
+		 * motion mode for over a second after stopping. */
 		vTaskDelay(WS_STEP_MS);
 		ms += WS_STEP_MS;
 	}

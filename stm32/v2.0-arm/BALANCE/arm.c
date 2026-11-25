@@ -302,6 +302,9 @@ void arm_task(void *pvParameters)
                                   * host starts sending its 0xAA keepalive.  */
     u16 arm_age     = 999;       /* ticks since the last fresh 0xAC (hold detect) */
     u8  hold_stops  = 0;         /* MOVE_STOP ticks sent in this ArmHold      */
+    u8  keep_gripper = 0;        /* latched from the re-home frame: that
+                                  * INIT_POSE leaves field 0 (gripper) alone.
+                                  * 0 at boot, so a power-on reset is unchanged */
     u8  i;
 
     /* the signature is FreeRTOS's; this task reads no argument */
@@ -427,13 +430,20 @@ void arm_task(void *pvParameters)
                  * usually already near the reset pose, and a handful of
                  * counts spread over a fixed 2 s makes the servo step one
                  * count at a time - the visible "not silky" reset. A read
-                 * failure assumes close but forces >= 1 s (conservative). */
+                 * failure assumes close but forces >= 1 s (conservative).
+                 *
+                 * keep_gripper starts the walk at field 1 instead of field
+                 * 0: a host-requested re-home can leave the gripper where
+                 * it is (holding a payload), while the other four joints and
+                 * the base still run the normal reset. A power-on reset
+                 * never sets it, so boot behaviour is unchanged. */
                 if(j == 0)
                 {
                     u8 i;
+                    u8 i0 = keep_gripper ? (u8)(ARM_GRIPPER_FIELD + 1) : 0u;
                     u16 dmax = 0, tmove;
                     u8 rd_fail = 0;
-                    for(i = 0; i < (ARM_JOINTS - 1); i++)
+                    for(i = i0; i < (ARM_JOINTS - 1); i++)
                     {
                         s16 cur = (s16)ARM_RESET_POSE[i];
                         s16 d;
@@ -446,30 +456,54 @@ void arm_task(void *pvParameters)
                     if(rd_fail != 0 && tmove < 1000u) tmove = 1000u;
                     if(tmove < 300u) tmove = 300u;
                     if(tmove > 2000u) tmove = 2000u;
-                    for(i = 0; i < (ARM_JOINTS - 1); i++)
+                    for(i = i0; i < (ARM_JOINTS - 1); i++)
                         lx_move_wait(ARM_JOINT_ID[i], ARM_RESET_POSE[i], tmove);
                     lx_move_start_all();
                     j = 1;
                 }
                 else
                 {
-                    /* The preset above has just commanded the five joints to
-                     * ARM_RESET_POSE, so that is where they are - and it has
-                     * to become the shadow the runtime block compares against.
-                     * The frame that REQUESTED this homing carries the pose
-                     * from BEFORE it and is still sitting in ArmPos; left
-                     * alone, the first READY tick finds ArmPos != last_p
-                     * (they differ by the readback/command undershoot even in
-                     * steady state, so this is not a corner case), presets,
-                     * and drives all five joints back to the pre-homing pose
-                     * in 500 ms. The homing undoes itself and looks like it
-                     * never ran - the field report is exactly that. */
-                    for(i = 0; i < (ARM_JOINTS - 1); i++)
+                    /* The preset above has just commanded the joints it
+                     * walked to ARM_RESET_POSE, so that is where they are -
+                     * and it has to become the shadow the runtime block
+                     * compares against. The frame that REQUESTED this homing
+                     * carries the pose from BEFORE it and is still sitting in
+                     * ArmPos; left alone, the first READY tick finds
+                     * ArmPos != last_p (they differ by the readback/command
+                     * undershoot even in steady state, so this is not a
+                     * corner case), presets, and drives the joints back to
+                     * the pre-homing pose in 500 ms. The homing undoes itself
+                     * and looks like it never ran - the field report is
+                     * exactly that. */
                     {
-                        ArmPos[i] = last_p[i] = (s16)ARM_RESET_POSE[i];
-                        sp[i] = tgt[i] = (float)ARM_RESET_POSE[i];
-                        rate[i] = 0.0f;
-                        quiet[i] = 255u;
+                        u8 i0 = keep_gripper ? (u8)(ARM_GRIPPER_FIELD + 1) : 0u;
+                        for(i = i0; i < (ARM_JOINTS - 1); i++)
+                        {
+                            ArmPos[i] = last_p[i] = (s16)ARM_RESET_POSE[i];
+                            sp[i] = tgt[i] = (float)ARM_RESET_POSE[i];
+                            rate[i] = 0.0f;
+                            quiet[i] = 255u;
+                        }
+                    }
+                    if(keep_gripper)
+                    {
+                        /* The gripper was never commanded, so the servo is
+                         * still holding its pre-rehome position. Seed the
+                         * shadows with that position, not with ARM_RESET_POSE:
+                         * the first READY tick then finds nothing to preset
+                         * and the gripper cannot jump back to the factory
+                         * pose (or finish a pre-rehome move) the moment the
+                         * control loop resumes. A read failure keeps the last
+                         * commanded target, which is at worst a tiny hold. */
+                        s16 g = last_p[ARM_GRIPPER_FIELD];
+                        if(lx_read_pos(ARM_JOINT_ID[ARM_GRIPPER_FIELD], &g) != 0)
+                            g = last_p[ARM_GRIPPER_FIELD];
+                        ArmPos[ARM_GRIPPER_FIELD] = g;
+                        last_p[ARM_GRIPPER_FIELD] = g;
+                        sp[ARM_GRIPPER_FIELD]     = (float)g;
+                        tgt[ARM_GRIPPER_FIELD]    = (float)g;
+                        rate[ARM_GRIPPER_FIELD]   = 0.0f;
+                        quiet[ARM_GRIPPER_FIELD]  = 255u;
                     }
                     /* A re-home over a live tracker keeps the accumulated
                      * angle. INIT_HOME's anchor block is already skipped by
@@ -891,6 +925,12 @@ void arm_task(void *pvParameters)
 
             if(rehome && ArmCanRehome)
             {
+                /* Latched from the SAME frame as the edge - the host chooses
+                 * per re-home whether the gripper walks to ARM_RESET_POSE
+                 * (bit1 clear, the default) or stays where it is (bit1 set),
+                 * e.g. while it is holding something. */
+                keep_gripper = (u8)((ArmFlags & ROS_ARM_FLAG_KEEP_GRIPPER) != 0);
+
                 /* A re-home runs the SAME stage machine as a power-on: enter
                  * INIT_POSE, which walks the five position joints to
                  * ARM_RESET_POSE and then hands over to INIT_HOME for the

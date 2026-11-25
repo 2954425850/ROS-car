@@ -57,6 +57,7 @@ typedef __I uint8_t vuc8;
 #include "usartx.h"
 #include "adc.h"
 #include "motor.h"
+#include "motor_ext.h"
 #include "encoder.h"
 #include "show.h"								   
 #include "key.h"

@@ -20,6 +20,12 @@
 #define EN     PDin(3)  
 
 /* Servo output channels on the RC/servo header.
+ *
+ * ROS 2026-10-16: these six pins (PC6 PC7 PC8 PC9 PB14 PB15) are the
+ * external motor driver's PWM and direction signals now - the wiring is
+ * in motor_ext.h. The names and Servo_Set() stay for the servo path, but
+ * while MOTOR_EXT_ENABLE is 1 Servo_Set() does nothing and
+ * Servo_PWM_Init() / Servo_PWM12_Init() must not be called.
  *   ch1..ch4 -> PC6 PC7 PC8 PC9   TIM8  CH1..CH4
  *   ch5..ch6 -> PB14 PB15         TIM12 CH1..CH2
  * The timer runs at 1MHz, so the compare value IS the pulse width in us. */

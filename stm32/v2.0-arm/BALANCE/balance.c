@@ -188,17 +188,58 @@ void Balance_task(void *pvParameters)
 			 * ros_send_frame() is called at the full 100Hz and divides itself
 			 * down to the 50Hz uplink rate. */
 			ros_apply_command();
-			ros_apply_servo();
+			/* ROS 2026-10-16: unwired. The 0xAB servo frame used to move the six
+			 * servo ports, and those pins are the external motor board's PWM and
+			 * direction signals now, so a servo command would fight the drive. The
+			 * decoder and the frame are still in usartx.c if a gimbal comes back;
+			 * they simply have no pins to drive. */
+			/* ros_apply_servo(); */
 			ros_send_frame();
 			//If there is no abnormity in the battery voltage, and the enable switch is in the ON position,
 			//and the software failure flag is 0
 			//如果电池电压不存在异常，而且使能开关在ON档位，而且软件失能标志位为0
 			//KD_Lidar_Fun();
-			if(Turn_Off(Voltage)==0) 
+			if(MOTOREXT_BENCH_TEST || Turn_Off(Voltage)==0) 
 			{ 			
            //Speed closed-loop control to calculate the PWM value of each motor, 
 				 //PWM represents the actual wheel speed					 
 				 //速度闭环控制计算各电机PWM值，PWM代表车轮实际转速
+#if MOTOR_EXT_ENABLE
+				 /* ROS 2026-10-23 step 2: external driver, closed loop.
+				  *
+				  * The six reserved servo ports drive the external board (see
+				  * motor_ext.h) and the two encoders are wired again, so the
+				  * speed PI owns the output as it did on the on-board driver.
+				  * It runs in m/s and returns +-16800 counts; the driver
+				  * scales that onto its +-95% duty and keeps its ramp.
+				  *
+				  * MOTOR_C is the right wheel and MOTOR_A the left one:
+				  * FourWheel_Car gives A/B the Vx - Vz term and C/D the
+				  * Vx + Vz term. If the car steers the wrong way round, swap
+				  * the two arguments here.
+				  *
+				  * The loop assumes a positive encoder reading means the wheel
+				  * rolls forward. MOTOREXT_*_FORWARD_IS_POS does NOT fix that
+				  * - it only flips the drive polarity, and using it on an
+				  * inverted encoder turns the loop into positive feedback.
+				  * If a wheel runs away or pulls backwards, check the encoder
+				  * sign on the OLED (show.c prints target and measured speed
+				  * side by side) before touching the gains.
+				  *
+				  * Gains: the 70:1 gearbox turns the wheel 30/70 as fast per
+				  * unit of duty as the old 30:1 motor, so both loop gains are
+				  * scaled by 70/30 in system.c to keep the crossover. */
+#if MOTOREXT_BENCH_TEST
+				 /* Bench: fixed slow forward on both wheels. No host, no gate -
+				  * if the wheels turn here, the drive chain is wired and running.
+				  * Wheels off the ground, and MOTOREXT_BENCH_TEST back to 0 when
+				  * the bench work is done. */
+				 MotorExt_SetTargets(MOTOREXT_BENCH_V, MOTOREXT_BENCH_V);
+#else
+				 MotorExt_SetPwm(Incremental_PI_C(MOTOR_C.Encoder, MOTOR_C.Target),
+				                 Incremental_PI_A(MOTOR_A.Encoder, MOTOR_A.Target));
+#endif
+#else
 				 MOTOR_A.Motor_Pwm=Incremental_PI_A(MOTOR_A.Encoder, MOTOR_A.Target);
 				 MOTOR_B.Motor_Pwm=Incremental_PI_B(MOTOR_B.Encoder, MOTOR_B.Target);
 				 MOTOR_C.Motor_Pwm=Incremental_PI_C(MOTOR_C.Encoder, MOTOR_C.Target);
@@ -215,10 +256,28 @@ void Balance_task(void *pvParameters)
 						case FourWheel_Car: Set_Pwm(-MOTOR_A.Motor_Pwm, -MOTOR_B.Motor_Pwm,  MOTOR_C.Motor_Pwm, MOTOR_D.Motor_Pwm, 0    ); break; //FourWheel car           //四驱车 
 						case Tank_Car:      Set_Pwm(-MOTOR_A.Motor_Pwm,  MOTOR_B.Motor_Pwm,  MOTOR_C.Motor_Pwm, MOTOR_D.Motor_Pwm, 0    ); break; //Tank Car                //履带车
 				 }
+#endif
 			}
 			//If Turn_Off(Voltage) returns to 1, the car is not allowed to move, and the PWM value is set to 0
 			//如果Turn_Off(Voltage)返回值为1，不允许控制小车进行运动，PWM值设置为0
-			else	Set_Pwm(0,0,0,0,0); 
+			else
+			{
+#if MOTOR_EXT_ENABLE
+				/* No enable, low battery or a software stop: brake.
+				 * Braking holds the wheels instead of letting the car roll, and it
+				 * drops the ramp state, so the next command starts from zero.
+				 * The PI is cleared too: its accumulator is the output, and a
+				 * stale value would step straight back to the last duty.
+				 *
+				 * A lost host link is NOT this branch: ros_apply_command() zeroes
+				 * the targets instead, so the loop does an active zero-speed hold.
+				 * Only the three conditions above hard-brake. */
+				Incremental_PI_Reset();
+				MotorExt_Brake();
+#else
+				Set_Pwm(0,0,0,0,0);
+#endif
+			}
 		 }  
 }
 
@@ -248,7 +307,15 @@ void Set_Pwm(int motor_a,int motor_b,int motor_c,int motor_d,int servo)
 	
 	//Servo control
 	//舵机控制
+#if !MOTOR_EXT_ENABLE
 	Servo_PWM =servo;
+#else
+	/* ROS 2026-10-16: Servo_PWM is TIM8->CCR4 = PC9, the external driver's
+	 * left wheel PWM (J5). Nothing calls Set_Pwm() from the control task
+	 * while MOTOR_EXT_ENABLE is on, but guarding the write means a later
+	 * caller cannot silently wipe out the left wheel's duty. */
+	(void)servo;
+#endif
 }
 
 /**************************************************************************
@@ -350,45 +417,47 @@ pwm代表增量输出
 在我们的速度控制闭环系统里面，只使用PI控制
 pwm+=Kp[e（k）-e(k-1)]+Ki*e(k)
 **************************************************************************/
-int Incremental_PI_A (float Encoder,float Target)
-{ 	
-	 static float Bias,Pwm,Last_bias;
+/* Speed-loop state, one accumulator per motor. File scope because the
+ * output IS the accumulator: freezing it inside a function-local static
+ * leaves the loop ready to resume at the duty it held before a stop. */
+static float s_pwm_a,s_pwm_b,s_pwm_c,s_pwm_d;
+static float s_last_bias_a,s_last_bias_b,s_last_bias_c,s_last_bias_d;
+
+static int pi_step(float *Pwm,float *Last_bias,float Encoder,float Target)
+{
+	 float Bias;
+
 	 Bias=Target-Encoder; //Calculate the deviation //计算偏差
-	 Pwm+=Velocity_KP*(Bias-Last_bias)+Velocity_KI*Bias; 
-	 if(Pwm>16800)Pwm=16800;
-	 if(Pwm<-16800)Pwm=-16800;
-	 Last_bias=Bias; //Save the last deviation //保存上一次偏差 
-	 return Pwm;    
+	 *Pwm+=Velocity_KP*(Bias-*Last_bias)+Velocity_KI*Bias;
+	 if(*Pwm>16800.0f)*Pwm=16800.0f;
+	 if(*Pwm<-16800.0f)*Pwm=-16800.0f;
+	 *Last_bias=Bias; //Save the last deviation //保存上一次偏差
+	 return (int)*Pwm;
+}
+
+/* Drop every speed loop. Called from the brake branch of the control
+ * task, so re-enabling the car does not start from the last output. */
+void Incremental_PI_Reset(void)
+{
+	 s_pwm_a=s_pwm_b=s_pwm_c=s_pwm_d=0.0f;
+	 s_last_bias_a=s_last_bias_b=s_last_bias_c=s_last_bias_d=0.0f;
+}
+
+int Incremental_PI_A (float Encoder,float Target)
+{
+	 return pi_step(&s_pwm_a,&s_last_bias_a,Encoder,Target);
 }
 int Incremental_PI_B (float Encoder,float Target)
-{  
-	 static float Bias,Pwm,Last_bias;
-	 Bias=Target-Encoder; //Calculate the deviation //计算偏差
-	 Pwm+=Velocity_KP*(Bias-Last_bias)+Velocity_KI*Bias;  
-	 if(Pwm>16800)Pwm=16800;
-	 if(Pwm<-16800)Pwm=-16800;
-	 Last_bias=Bias; //Save the last deviation //保存上一次偏差 
-	 return Pwm;
+{
+	 return pi_step(&s_pwm_b,&s_last_bias_b,Encoder,Target);
 }
 int Incremental_PI_C (float Encoder,float Target)
-{  
-	 static float Bias,Pwm,Last_bias;
-	 Bias=Target-Encoder; //Calculate the deviation //计算偏差
-	 Pwm+=Velocity_KP*(Bias-Last_bias)+Velocity_KI*Bias; 
-	 if(Pwm>16800)Pwm=16800;
-	 if(Pwm<-16800)Pwm=-16800;
-	 Last_bias=Bias; //Save the last deviation //保存上一次偏差 
-	 return Pwm; 
+{
+	 return pi_step(&s_pwm_c,&s_last_bias_c,Encoder,Target);
 }
 int Incremental_PI_D (float Encoder,float Target)
-{  
-	 static float Bias,Pwm,Last_bias;
-	 Bias=Target-Encoder; //Calculate the deviation //计算偏差
-	 Pwm+=Velocity_KP*(Bias-Last_bias)+Velocity_KI*Bias;  
-	 if(Pwm>16800)Pwm=16800;
-	 if(Pwm<-16800)Pwm=-16800;
-	 Last_bias=Bias; //Save the last deviation //保存上一次偏差 
-	 return Pwm; 
+{
+	 return pi_step(&s_pwm_d,&s_last_bias_d,Encoder,Target);
 }
 /**************************************************************************
 Function: Processes the command sent by APP through usart 2
@@ -498,6 +567,10 @@ void Get_Velocity_Form_Encoder(void)
 		MOTOR_B.Encoder= Encoder_B_pr*CONTROL_FREQUENCY*Wheel_perimeter/Encoder_precision;  
 		MOTOR_C.Encoder= Encoder_C_pr*CONTROL_FREQUENCY*Wheel_perimeter/Encoder_precision; 
 		MOTOR_D.Encoder= Encoder_D_pr*CONTROL_FREQUENCY*Wheel_perimeter/Encoder_precision; 
+#if LEFT_ENCODER_IS_B
+		/* A's encoder is dead; B's stands in. See encoder.h. */
+		MOTOR_A.Encoder= MOTOR_B.Encoder;
+#endif
 }
 /**************************************************************************
 Function: Smoothing the three axis target velocity

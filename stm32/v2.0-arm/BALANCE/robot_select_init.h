@@ -64,11 +64,13 @@ typedef struct
 #define   MD36N_71    71
 #define   MD60N_18    18
 #define   MD60N_47    47
+#define   HALL_70     70          /* ROS 2026-10-23: new drive motor */
 
 //Number_of_encoder_lines
 //±àÂëÆ÷¾«¶È
 #define		Photoelectric_500 500
 #define	  Hall_13           13
+#define   Hall_16           16    /* ROS 2026-10-23: same motor, 16 PPR */
 
 //Mecanum wheel tire diameter series
 //ÂóÂÖÂÖÌ¥Ö±¾¶

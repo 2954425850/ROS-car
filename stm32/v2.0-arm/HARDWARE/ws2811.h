@@ -7,6 +7,13 @@
 /* 0 = whole effect engine compiled out at the call site, code kept intact */
 #define WS2811_ENABLE       1
 
+/* ---------------- output path ----------------
+ * 2026-11-25: the F407 no longer drives the strip.  It sends semantic STATE
+ * frames over USART3 (PC10 = TX, PC11 = RX, AF7, 115200 8N1) to the C542
+ * LED controller, which owns the WS2811 timing and renders locally.
+ * Protocol: ws_link.h.  Do NOT use PB10/PB11 for USART3 -- those are the
+ * IMU's software I2C. */
+
 /* ---------------- geometry ---------------- */
 /* New strip: 2 m, 120 LED/m, 3 LEDs per WS2811 IC -> 80 addressed pixels.
  * (Old strip was 2m, 60 LED/m -> 40 pixels.) */
@@ -26,10 +33,9 @@
  * third with pure green, the last third with pure blue -- so you can read
  * the real order straight off the strip.
  *
- *   RBG : both the old 60 LED/m strip (measured 2026-09-18) and the new
- *         120 LED/m 2 m strip (measured 2026-11-25 on the C542 bench, all
- *         16 demo stages) are RBG. Emitting GRB made every colour come out
- *         cyclically rotated.
+ *   RBG : this chassis's 2m strip, measured 2026-09-18. Emitting GRB made
+ *         every colour come out cyclically rotated: red showed as blue,
+ *         green as orange, deep blue as green.
  *   GRB : the most common WS2811 order
  *   RGB : the other common order
  */
@@ -38,9 +44,6 @@
 #define WS_ORDER_RGB        0
 
 /* ---------------- brightness / power ---------------- */
-/* Keep 80 (31 %) on the car. The new strip has 2x the LEDs of the old one,
- * so 31 % is roughly 1.2 A @12 V. 255 (100 %) is ~3.8 A full white; only
- * use it if the chassis 12 V rail, fuse and wiring are sized for it. */
 #define WS_BRIGHT_MAX       80      /* 0..255, global ceiling            */
 
 /* ---------------- speed scale ---------------- */
@@ -60,9 +63,12 @@ typedef struct { u16 hue; u8 bright; } WS_SpeedOut;
 void ws_hsv2rgb(u16 h, u8 s, u8 v, u8 *r, u8 *g, u8 *b);
 WS_SpeedOut ws_speed_map(float mps);
 
-/* One source byte -> the three SPI bytes carrying it (see ws2811.c).
- * Lives in the logic region so the host suite can assert the bit pattern. */
+/* Legacy 3-bit form (host suite only; its T1L is too short for the strip). */
 void ws_pack_byte(u8 src, u8 out[3]);
+
+/* 4-SPI-bit-per-WS-bit form used by the F407 SPI2 master at 2.625MHz:
+ * 0 -> 1000, 1 -> 1100.  T0H=0.381us, T1H=0.762us. */
+void ws_pack_byte4(u8 src, u8 out[4]);
 
 typedef struct {
 	float filt;      /* 100ms low-passed |v|                    */
@@ -105,7 +111,10 @@ void ws_render(const WS_State *st, WS_SpeedOut sp, const WS_Overlay *ov, u32 ms)
 /* ---------------- PE0 preview / demo mode ---------------- */
 /* 0 = demo code compiled out at its hooks, block kept intact.
  * Set to 0 to kill the feature without touching anything else. */
-#define WS_DEMO_ENABLE      1
+/* 0 on the car: the C542 controller owns the bench preview (its B1 button).
+ * Keeping it 0 here removes the F407's local demo/OLED page and its click()
+ * dependency; the STATE frames carry the real chassis state only. */
+#define WS_DEMO_ENABLE      0
 #define WS_DEMO_STAGES      16      /* 1..16, plus 0 = off */
 
 #if WS_DEMO_ENABLE
