@@ -380,13 +380,13 @@ def choose_frontier_goal(grid, pose, frontiers, *, clearance=0.6,
     best_score = None
     for f in frontiers:
         dist = math.hypot(f.centroid[0] - px, f.centroid[1] - py)
-        if dist < 1e-6:
-            continue
         goal = None
         # 不能直接选前沿边缘：unknown 的膨胀会把边缘点压到 master 253，
         # Smac 直接 no valid path。从前沿质心朝机器人退 0.6~1.2 m，
         # 取第一个 unknown/障碍都 >= 0.6 m 且直线可达的 free 格。
         for back in (0.6, 0.8, 1.0, 1.2):
+            if dist < 1e-6:
+                break          # 质心与机器人重合，跳过 approach，走兜底
             t = back / dist
             if t >= 1.0:
                 break
@@ -402,6 +402,24 @@ def choose_frontier_goal(grid, pose, frontiers, *, clearance=0.6,
                 continue
             goal = (gx, gy)
             break
+        if goal is None:
+            # 紧凑场地/角落：approach point 找不到时退回簇内自由格。
+            # 边缘点可能被 planner 拒一次，Navigator 会黑名单换下一个。
+            for min_clear in (clearance, max(0.3, clearance * 0.6)):
+                goal_d = None
+                for i in f.cells:
+                    ix, iy = i % grid.width, i // grid.width
+                    wx, wy = grid.cell_to_world(ix, iy)
+                    d = math.hypot(wx - px, wy - py)
+                    if goal_d is not None and d >= goal_d:
+                        continue
+                    if not clearance_ok(grid, wx, wy, min_clear):
+                        continue
+                    if not line_free(grid, start, (wx, wy)):
+                        continue
+                    goal, goal_d = (wx, wy), d
+                if goal is not None:
+                    break
         if goal is None:
             continue
         gain = min(f.size, gain_cap)

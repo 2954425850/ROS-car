@@ -238,6 +238,16 @@ def test_choose_frontier_goal_keeps_unknown_clearance():
     assert unknown_distance(g, goal[0], goal[1], 0.8) >= 0.5
 
 
+def test_choose_frontier_goal_falls_back_in_tight_map():
+    g = make_grid(w=40, h=40, res=0.1)
+    set_rect(g, 0, 0, 40, 40, -1)
+    set_rect(g, 10, 14, 30, 26, 0)      # 1.2 m 宽走廊，unknown 在两侧
+    fs = find_frontiers(g, (2.0, 2.0))
+    assert fs
+    goal = choose_frontier_goal(g, (2.0, 2.0), fs)
+    assert goal is not None
+
+
 from fusion_plan import Navigator
 
 
