@@ -79,6 +79,7 @@ from tools.identity import register_identity_tools, restrict_to_owner
 from tools.track import register_track_tools
 from tools.grasp import register_grasp_tools
 from tools.arm import register_arm_tools
+from tools.line_follow import register_line_follow_tools
 from vision.locate import Locator, VlmBoxer
 from identity.manager import IdentityManager
 from vision.k230_state import K230State
@@ -383,6 +384,17 @@ class ConversationManager:
             logger.error(f"机械臂客户端：起不来 —— {e}")
             self._arm = None
         register_arm_tools(self._registry, self._arm)
+        # 黑线循迹语音入口（line_follow → /line_follow/enable SetBool）。
+        # 同 grasp/arm：起不来只降级，工具照注册、调用时说明原因。
+        # 循迹节点是常驻待机的（line-follow.service），这里只建一个服务客户端。
+        try:
+            from car.line_follow_client import LineFollowClient
+            self._line_follow = LineFollowClient()
+            self._line_follow.start()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"循迹客户端：起不来 —— {e}")
+            self._line_follow = None
+        register_line_follow_tools(self._registry, self._line_follow)
         if self._identity is not None and config.get("identity.restrict_to_owner", False):
             n = restrict_to_owner(self._registry, self._identity, {"car", "follow"})
             logger.info(f"身份：{n} 个车/跟随工具只听主人 {sorted(self._identity.owners)}")
@@ -489,6 +501,11 @@ class ConversationManager:
                 self._arm.close()
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"机械臂客户端：关闭出错 —— {e}")
+        if getattr(self, '_line_follow', None) is not None:
+            try:
+                self._line_follow.close()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"循迹客户端：关闭出错 —— {e}")
         self._mcp.close()  # 关 portal + 终止 MCP server 子进程，防僵尸
         self._tool_executor.shutdown(wait=False)
         self._mic.close()

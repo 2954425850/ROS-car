@@ -12,11 +12,12 @@
 赛道不一样也不用改算法；到现场只需要标一次阈值（默认启动时自动 Otsu）。
 
 安全：
-  · 默认只识别、不发速度；加 --drive 才动。
-  · 发 cmd_vel_nav（cmd_mux 最低优先级）：PS2 一动立刻接管；
-    检测到别的控制源接管 / 丢线超过 --hold-s / Ctrl-C → 停止发布，
-    cmd_mux 0.5 s 无消息自动归零（驱动端还有 0.5 s 超时兜底）。
-  · 真跑期间临时打开 /l150pro_driver 的偏航闭环，退出时恢复原值——
+  · 默认只识别、不发速度；--drive 直接开跑；--serve 常驻待机，
+    等 /line_follow/enable（std_srvs/SetBool）再动（语音入口用这个）。
+  · 发 cmd_vel_nav（cmd_mux 最低优先级）：PS2/语音/App 一动立刻接管，
+    本脚本自动暂停（可再次 enable 接回来，不退出进程）；
+    丢线超过 --hold-s 停发，cmd_mux 0.5 s 无消息自动归零。
+  · 每次 enable 临时打开 /l150pro_driver 的偏航闭环，停/退出时恢复原值——
     不改语音/PS2/App 看到的设置。
 
 本车默认参数（2026-11-24 实车调过）：相机倒装 → 默认 --rotate；
@@ -25,7 +26,13 @@
 用法（Pi 上）：
     python3 line_follow.py --overlay              # 只识别，存 /tmp/linecam/overlay.jpg
     source /opt/ros/jazzy/setup.bash
-    python3 line_follow.py --drive                # 真跑
+    python3 line_follow.py --drive                # 直接跑（Ctrl-C 停）
+    python3 line_follow.py --serve                # 常驻待机，等语音/服务叫
+
+接口：
+    /line_follow/enable   std_srvs/SetBool   true=开始  false=停止
+    /line_follow/status   std_msgs/Bool      当前是否在跑（1 Hz + 变化时）
+    ros2 service call /line_follow/enable std_srvs/srv/SetBool "{data: true}"
 
 现场标定：
     1) 车摆到直道上、线在车正下方，跑 --overlay，看近行 u 是不是接近 --center-u；
@@ -80,7 +87,10 @@ def parse_args():
                    help='转向反号（相机左右与车相反、或底盘 +wz 实际右转时用）')
     p.add_argument('--hold-s', type=float, default=0.5,
                    help='丢线后按上一拍继续走的时间，之后停发')
-    p.add_argument('--drive', action='store_true', help='真的发 cmd_vel_nav')
+    p.add_argument('--drive', action='store_true',
+                   help='直接开跑（带 /line_follow/enable 服务；Ctrl-C 停）')
+    p.add_argument('--serve', action='store_true',
+                   help='常驻待机，等 /line_follow/enable (SetBool) 再走（语音入口用）')
     p.add_argument('--overlay', action='store_true',
                    help='存标记图 /tmp/linecam/overlay.jpg')
     p.add_argument('--overlay-every', type=int, default=3,
@@ -295,24 +305,31 @@ def main():
     # 丢掉起手几帧（有的头前几帧是灰的）
     for _ in range(10):
         grab(cap, a)
-    th = a.thresh if a.thresh > 0 else calibrate(cap, a)
+    need_ros = a.drive or a.serve
+    th = a.thresh
+    if th <= 0 and not need_ros:
+        th = calibrate(cap, a)      # dry-run 在这里标；真跑在每次 enable 时标
 
-    node = pub = Twist = None
+    node = pub = pub_status = Twist = None
     other_source = {'hit': False, 'name': ''}
     yaw_meas = {'v': None}
-    yaw_prev = None
-    if a.drive:
+    st = {'requested': bool(a.drive), 'enabled': False,
+          'yaw_prev': None, 'yaw_owned': False}
+
+    if need_ros:
         import rclpy
         from rclpy.signals import SignalHandlerOptions
         from rclpy.node import Node
         from geometry_msgs.msg import Twist as _Twist
-        from std_msgs.msg import Float32MultiArray, String
+        from std_msgs.msg import Bool, Float32MultiArray, String
+        from std_srvs.srv import SetBool
         Twist = _Twist
         # 自己管 Ctrl-C：默认的 SIGINT 处理会先把 context 关掉，
         # 导致退出时既发不出零速、也恢复不了偏航闭环参数。
         rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
         node = Node('line_follow')
         pub = node.create_publisher(Twist, TOPIC, 10)
+        pub_status = node.create_publisher(Bool, '/line_follow/status', 10)
 
         def on_active(msg):
             if msg.data and msg.data != 'nav':
@@ -323,20 +340,36 @@ def main():
             if len(msg.data) >= 2 and msg.data[1] == msg.data[1]:   # 跳过 NaN
                 yaw_meas['v'] = float(msg.data[1])
 
+        def on_enable(req, resp):
+            want = bool(req.data)
+            resp.success = True
+            if want == st['enabled']:
+                resp.message = '已经在循迹' if want else '循迹本来就没开'
+            else:
+                resp.message = ('马上开始（车要在线上才会走）' if want else '正在停止')
+            st['requested'] = want
+            return resp
+
         node.create_subscription(String, 'cmd_mux/active', on_active, 10)
         node.create_subscription(Float32MultiArray, 'yaw_loop', on_yaw, 10)
-
-        yaw_prev = yaw_loop_get(node)
-        if yaw_prev is None:
-            print('⚠️  读不到 /l150pro_driver 的 yaw_loop_enable，按原样跑（可能转不够）')
-        elif yaw_loop_set(node, True):
-            print('偏航闭环：本次临时打开（原为%s，退出时恢复）'
-                  % ('开' if yaw_prev else '关'))
-        else:
-            print('⚠️  偏航闭环打开失败（驱动没起？），按原样跑')
-        print('真跑：发 %s；PS2/语音/App 一旦接管就退出' % TOPIC)
+        node.create_service(SetBool, '/line_follow/enable', on_enable)
+        print('服务：/line_follow/enable（SetBool）  状态：/line_follow/status')
+        print('发 %s；PS2/语音/App 一旦接管就暂停（可再 enable 接回来）' % TOPIC)
     else:
-        print('只识别、不发速度（加 --drive 才动）')
+        print('只识别、不发速度（--drive 直接跑；--serve 等 /line_follow/enable）')
+
+    def publish_status():
+        if pub_status is not None:
+            m = Bool()
+            m.data = bool(st['enabled'])
+            pub_status.publish(m)
+
+    def publish_zero():
+        if pub is not None:
+            m = Twist()
+            for _ in range(3):
+                pub.publish(m)
+                time.sleep(0.02)
 
     print('近行 y=%d，远行 y=%d，center_u=%.0f，速度 %.2f m/s'
           % (a.near_row, a.far_row, a.center_u, a.speed))
@@ -346,6 +379,7 @@ def main():
     last_wz = 0.0
     last_u = None
     last_print = 0.0
+    last_status = 0.0
     n = 0
     t_start = time.monotonic()
     try:
@@ -353,6 +387,7 @@ def main():
             f = grab(cap, a)
             if f is None:
                 print('读帧失败，重开相机…')
+                publish_zero()
                 cap.release()
                 time.sleep(1.0)
                 cap = open_cam(a)
@@ -360,8 +395,56 @@ def main():
             if node is not None:
                 rclpy.spin_once(node, timeout_sec=0)
                 if other_source['hit']:
-                    print('检测到 %r 接管，退出（车子交给它）' % other_source['name'])
-                    break
+                    if st['enabled']:
+                        print('检测到 %r 接管，循迹暂停（再说"开始循迹"可以接回来）'
+                              % other_source['name'])
+                        st['requested'] = False
+                    other_source['hit'] = False
+
+            # ---- 开/停切换：服务的请求在这里落实（回调只记标志，避免在
+            #      回调里再 spin 同一节点去调偏航参数，会死锁）----
+            if st['requested'] != st['enabled']:
+                if st['requested']:
+                    if a.thresh <= 0:
+                        th = calibrate(cap, a)          # 车这时应该摆在线上
+                    if node is not None:
+                        prev = yaw_loop_get(node)   # 每次启用现读，别用上次缓存
+                        if prev is not None:
+                            st['yaw_prev'] = prev
+                        if st['yaw_prev'] is None:
+                            print('⚠️  读不到 /l150pro_driver 的 yaw_loop_enable，按不开跑')
+                        elif yaw_loop_set(node, True):
+                            st['yaw_owned'] = True
+                            print('偏航闭环：临时打开（原为%s）'
+                                  % ('开' if st['yaw_prev'] else '关'))
+                        else:
+                            print('⚠️  偏航闭环打开失败（驱动没起？），按不开跑')
+                    st['enabled'] = True
+                    last_seen = 0.0
+                    last_u = None
+                    print('循迹：开始')
+                else:
+                    st['enabled'] = False
+                    publish_zero()
+                    if st['yaw_owned'] and node is not None:
+                        if yaw_loop_set(node, st['yaw_prev']):
+                            print('偏航闭环：已恢复为%s'
+                                  % ('开' if st['yaw_prev'] else '关'))
+                            st['yaw_owned'] = False
+                        else:
+                            print('⚠️  偏航闭环恢复失败（退出时再试）')
+                    print('循迹：停止')
+                publish_status()
+                last_status = time.monotonic()
+
+            active = st['enabled'] if need_ros else True
+            if not active:
+                now = time.monotonic()
+                if now - last_status >= 1.0:
+                    publish_status()
+                    last_status = now
+                n += 1
+                continue
 
             gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
             roi = gray[max(0, a.far_row - 60):]
@@ -424,18 +507,22 @@ def main():
             # 先发零速；rclpy 的 SIGINT 默认处理已用 SignalHandlerOptions.NO 关掉，
             # 这里 context 仍然有效。
             try:
-                m = Twist()
-                for _ in range(3):
-                    pub.publish(m)
-                    time.sleep(0.02)
+                publish_zero()
             except Exception as e:
                 print('退出时发零速失败（mux 会自己归零）：%s' % e)
-            if yaw_prev is not None:
+            if st['yaw_owned'] and st['yaw_prev'] is not None:
                 try:
-                    yaw_loop_set(node, yaw_prev)
-                    print('偏航闭环：已恢复为%s' % ('开' if yaw_prev else '关'))
+                    yaw_loop_set(node, st['yaw_prev'])
+                    print('偏航闭环：已恢复为%s'
+                          % ('开' if st['yaw_prev'] else '关'))
                 except Exception as e:
                     print('⚠️  偏航闭环恢复失败：%s' % e)
+            try:
+                m = Bool()
+                m.data = False
+                pub_status.publish(m)
+            except Exception:
+                pass
             try:
                 node.destroy_node()
                 rclpy.try_shutdown()

@@ -1,0 +1,23 @@
+[Unit]
+Description=黑线循迹（待机；/line_follow/enable 控制）
+# 不依赖网络（本地相机 + 本机 ROS）。底盘驱动是系统单元（ps2-teleop），
+# 它没起时循迹节点照样待机，真正 enable 时才去读偏航参数（读不到就按不开跑）。
+
+[Service]
+Type=simple
+# systemd 不加载 ROS 环境，必须 source 后再跑（和 voice-chatbot 的 run.sh 同理）。
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && exec python3 -u /home/cy/ROS-car/pi/scripts/line_follow.py --serve'
+# 语音/PS2 接管时脚本自己暂停；这里只管进程挂了重拉。
+Restart=on-failure
+RestartSec=5
+# 停服务时要让脚本走 finally：发零速 + 把偏航闭环恢复原值。
+# systemd 默认 SIGTERM 会直接杀掉 Python，finally 不执行。
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
