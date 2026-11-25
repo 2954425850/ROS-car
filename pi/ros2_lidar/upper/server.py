@@ -550,8 +550,10 @@ def detect_mode():
         except OSError:
             return False
 
-    slam = alive("slam_toolbox")
-    nav = alive("nav2_controller")
+    # 用可执行文件路径而不是裸包名：`pgrep -f slam_toolbox` 会被任何
+    # 命令行里带这个词的 shell（排障命令、tail、grep）误命中。
+    slam = alive("/lib/slam_toolbox/")
+    nav = alive("/lib/nav2_controller/")
     if slam and nav:
         return "fusion"
     if slam:
@@ -567,8 +569,11 @@ def _mode_loop(state, stop):
         st = state.snapshot()["status"]
         if not st.get("owned"):
             mode = detect_mode()
-            if st.get("mode") != mode:
-                state.set_status(mode=mode)
+            # detect_mode() 期间页面可能刚好启动了 fusion；以最新的 owned
+            # 为准，否则会把 start() 刚设好的 mode 覆盖成外部探测值。
+            if not state.snapshot()["status"].get("owned"):
+                if st.get("mode") != mode:
+                    state.set_status(mode=mode)
         stop.wait(2.0)
 
 

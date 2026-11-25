@@ -1863,12 +1863,12 @@ def test_detect_mode_three_states(monkeypatch):
             returncode = 0 if cmd[2] in alive else 1
         return R()
 
-    alive = {"slam_toolbox", "nav2_controller"}
+    alive = {"/lib/slam_toolbox/", "/lib/nav2_controller/"}
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert srv_mod.detect_mode() == "fusion"
-    alive = {"slam_toolbox"}
+    alive = {"/lib/slam_toolbox/"}
     assert srv_mod.detect_mode() == "mapping"
-    alive = {"nav2_controller"}
+    alive = {"/lib/nav2_controller/"}
     assert srv_mod.detect_mode() == "navigating"
     alive = set()
     assert srv_mod.detect_mode() == "idle"
@@ -1983,8 +1983,10 @@ def detect_mode():
         except OSError:
             return False
 
-    slam = alive("slam_toolbox")
-    nav = alive("nav2_controller")
+    # 用可执行文件路径而不是裸包名：`pgrep -f slam_toolbox` 会被任何
+    # 命令行里带这个词的 shell（排障命令、tail、grep）误命中。
+    slam = alive("/lib/slam_toolbox/")
+    nav = alive("/lib/nav2_controller/")
     if slam and nav:
         return "fusion"
     if slam:
@@ -1992,6 +1994,19 @@ def detect_mode():
     if nav:
         return "navigating"
     return "idle"
+```
+
+同时修 `_mode_loop` 的竞态：`detect_mode()` 可能花几百毫秒，期间页面
+刚好启动 fusion，`owned` 已变 True；不能在探测返回后再用旧快照覆盖 mode。
+
+```python
+        st = state.snapshot()["status"]
+        if not st.get("owned"):
+            mode = detect_mode()
+            if not state.snapshot()["status"].get("owned"):
+                if st.get("mode") != mode:
+                    state.set_status(mode=mode)
+        stop.wait(2.0)
 ```
 
 - [ ] **Step 4: `ModeController` 支持 fusion**

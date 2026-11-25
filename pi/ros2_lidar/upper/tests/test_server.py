@@ -229,7 +229,7 @@ def test_detect_mode_three_states(monkeypatch):
     import subprocess
     import server as srv_mod
 
-    alive = {"slam_toolbox", "nav2_controller"}
+    alive = {"/lib/slam_toolbox/", "/lib/nav2_controller/"}
 
     def fake_run(cmd, **kw):
         class R:
@@ -238,9 +238,9 @@ def test_detect_mode_three_states(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert srv_mod.detect_mode() == "fusion"
-    alive = {"slam_toolbox"}
+    alive = {"/lib/slam_toolbox/"}
     assert srv_mod.detect_mode() == "mapping"
-    alive = {"nav2_controller"}
+    alive = {"/lib/nav2_controller/"}
     assert srv_mod.detect_mode() == "navigating"
     alive = set()
     assert srv_mod.detect_mode() == "idle"
