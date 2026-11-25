@@ -1,7 +1,9 @@
 import subprocess
+from pathlib import Path
 
 from carhealth.busy import BusyState
-from carhealth.recovery import Recovery, RecoveryConfig
+from carhealth.recovery import (ACTION_ARGS, RECOVER_CMD, Recovery,
+                                RecoveryConfig, RecoveryRequest)
 from carhealth.types import ComponentState, Diagnosis, Verdict
 
 IDLE = BusyState(False, False, False, False)
@@ -109,6 +111,37 @@ def test_execute_runs_privileged_script_and_obeys_cooldown():
     again = r.decide(states={}, diag=diag("host", "host.wifi_powersave"),
                      busy=IDLE, network_changed=False, now=120.0)
     assert again.deferred is True
+
+
+def test_restart_stack_runs_restart_ros_stack_subcommand():
+    """11-18 现场：restart_stack 被 `replace("_","-")` 拼成 restart-stack，
+    特权脚本回 "unknown action"（rc=2），整栈重启其实一次都没跑过。"""
+    runner = Runner()
+    r = Recovery(cfg(), runner=runner)
+    req = r.decide(states={"chassis": st("chassis", Verdict.BLOCKED, "ros_discovery")},
+                   diag={}, busy=IDLE, network_changed=True, now=100.0)
+    assert req.action == "restart_stack"
+    res = r.execute(req, 100.0)
+    assert runner.cmds == [["sudo", "-n", RECOVER_CMD, "restart-ros-stack"]]
+    assert res["rc"] == 0
+
+
+def test_every_action_maps_to_a_subcommand_the_privileged_script_accepts():
+    """ACTION_ARGS 与 tools/carhealth-recover 的 case 分支不许漂移。"""
+    script = (Path(__file__).resolve().parents[1] / "tools" /
+              "carhealth-recover").read_text(encoding="utf-8")
+    for action, arg in ACTION_ARGS.items():
+        assert f"    {arg})" in script, f"{action} -> {arg} 不在特权脚本里"
+
+
+def test_unknown_action_does_not_invoke_privileged_script():
+    """没登记的动作必须失败关闭，不能把拼出来的字符串交给 sudo 脚本。"""
+    runner = Runner()
+    r = Recovery(cfg(), runner=runner)
+    res = r.execute(RecoveryRequest("mystery_action", "x"), 100.0)
+    assert runner.cmds == []
+    assert res["rc"] != 0
+    assert "unknown action" in res["output"]
 
 
 def test_observe_success_and_failure_escalation():

@@ -23,6 +23,16 @@ from .types import Verdict
 
 RECOVER_CMD = "/usr/local/sbin/carhealth-recover"
 
+# action → 特权脚本子命令。必须显式枚举，不能靠 `replace("_", "-")` 推：
+# `restart_stack` 推出来是 `restart-stack`，脚本只认 `restart-ros-stack`，
+# 2026-11-18 就这样跑了一次 rc=2 "unknown action"，整栈重启从未真正执行。
+ACTION_ARGS = {
+    "wifi_powersave_off": "wifi-powersave-off",
+    "ros_daemon_stop": "ros-daemon-stop",
+    "restart_stack": "restart-ros-stack",
+    "restart_voice": "restart-voice",
+}
+
 ROS_ROOT_CAUSES = ("ros_discovery", "ros_data_path")
 
 
@@ -143,15 +153,19 @@ class Recovery:
     def execute(self, req: RecoveryRequest, now: float) -> dict:
         self._last[req.action] = now
         self._times.append(now)
-        arg = req.action.replace("_", "-")
-        cmd = ["sudo", "-n", self._cmd, arg]
-        try:
-            r = self._runner(cmd, capture_output=True, text=True, timeout=120)
-            rc = r.returncode
-            output = (r.stdout or "") + (r.stderr or "")
-        except Exception as e:                              # noqa: BLE001
-            rc = -1
-            output = repr(e)
+        arg = ACTION_ARGS.get(req.action)
+        if arg is None:
+            # 失败关闭：没登记的动作绝不交给 sudo 脚本去猜。
+            rc, output = -1, f"unknown action: {req.action}"
+        else:
+            cmd = ["sudo", "-n", self._cmd, arg]
+            try:
+                r = self._runner(cmd, capture_output=True, text=True, timeout=120)
+                rc = r.returncode
+                output = (r.stdout or "") + (r.stderr or "")
+            except Exception as e:                          # noqa: BLE001
+                rc = -1
+                output = repr(e)
         self._verify = {
             "action": req.action,
             "targets": req.targets,
