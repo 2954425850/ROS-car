@@ -108,8 +108,11 @@ L1 只覆盖探索目标和人工点击；L2 KeepoutFilter 仍未做（见 §7�
 - 现象：开阔区雷达射程末端（约 12 m）出现红点，多次后在地图上变成一堵弧墙。
 - 原因：RPLIDAR A1M8 对“无回波”返回**有限** ~12 m，slam_toolbox 把它当成真障碍；
   `max_laser_range: 12.0` 正好等于这个值，所以没有拒绝。
-- 修复：`scan_self_filter.py` 把 >= 11.5 m 的有限值改成 `inf`，输出 `range_max=11.5`；
-  `slam_params.yaml` / `slam_params_fusion.yaml` 的 `max_laser_range` 12.0 → 11.5。
+- 修复：`scan_self_filter.py` 把 >= 9.0 m 的有限值改成 `inf`，输出 `range_max=9.0`；
+  `slam_params.yaml` / `slam_params_fusion.yaml` 的 `max_laser_range` 12.0 → 9.0。
+- 2026-11-25 追加实测：有限“无回波”值最低到 **9.68 m**，且驱动 intensity 恒为 **47**
+  （没有质量信号可用）；第一次用 11.5 m 阈值仍会漏掉 9.7~11.5 m 的末端点，故降到 9.0 m。
+  代价：>9 m 的真实远墙要靠近后才会进图。
 - 影响：仓库副本（融合、仓库版建图/导航）；`/home/cy/ros2_lidar` 旧副本未改。
 - 旧地图里的假墙不会消失，需要重建。
 

@@ -30,8 +30,8 @@ Hardware quirks kept from the old file (both confirmed on the bench):
     advertises /scan, and publishes zero frames forever while burning ~95% of
     a core busy-waiting. The stock file also declares no LaunchArguments, so
     it cannot be included-and-overridden -- the node is declared here instead.
-  * max_laser_range: 11.5 (A1M8 spec 12 m; the driver returns a finite max
-    value for "no echo", so scan_self_filter clamps >= 11.5 m to inf).
+  * max_laser_range: 9.0 (A1M8 spec 12 m, but this driver returns finite
+    "no echo" values down to ~9.7 m; scan_self_filter clips >= 9.0 m).
 """
 import glob
 import os

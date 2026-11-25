@@ -8,9 +8,9 @@ as an obstacle: collision_monitor stops the robot forever and the costmaps add a
 fake obstacle in front.
 
 Points whose base-frame position is inside the footprint (+2 cm) are set to inf.
-Finite ranges at/above 11.5 m are also set to inf: the A1M8 returns a finite
-~12 m value for "no echo", and slam_toolbox would otherwise grow a false wall
-at the range limit. Everything else is passed through unchanged.
+Finite ranges at/above max_valid_range (default 9.0 m) are also set to inf:
+the A1M8 on this car returns finite "no echo" values down to ~9.7 m, and
+slam_toolbox would otherwise grow a false wall at the range limit. Everything else is passed through unchanged.
 
     publishes /scan_filtered
 """
@@ -34,6 +34,8 @@ class ScanSelfFilter(Node):
         super().__init__('scan_self_filter')
         self.pub = self.create_publisher(LaserScan, 'scan_filtered', 10)
         self.create_subscription(LaserScan, 'scan', self.cb, qos_profile_sensor_data)
+        self.declare_parameter('max_valid_range', DEFAULT_MAX_VALID_RANGE)
+        self.max_valid = float(self.get_parameter('max_valid_range').value)
         self.last_removed = -1
         self.last_far = -1
         self.last_log_t = 0.0
@@ -41,8 +43,8 @@ class ScanSelfFilter(Node):
     def cb(self, msg):
         raw = list(msg.ranges)
         n_far = sum(1 for r in raw
-                    if math.isfinite(r) and r >= DEFAULT_MAX_VALID_RANGE)
-        out = limit_max_range(raw, DEFAULT_MAX_VALID_RANGE)
+                    if math.isfinite(r) and r >= self.max_valid)
+        out = limit_max_range(raw, self.max_valid)
         n = 0
         for i, r in enumerate(out):
             if not math.isfinite(r) or r < msg.range_min or r > msg.range_max:
@@ -56,7 +58,7 @@ class ScanSelfFilter(Node):
         msg.ranges = out
         # Keep the advertised max in sync with the clamp; the scan visualizer
         # (upper) and collision_monitor both use it.
-        msg.range_max = min(float(msg.range_max), DEFAULT_MAX_VALID_RANGE)
+        msg.range_max = min(float(msg.range_max), self.max_valid)
         self.pub.publish(msg)
         now = time.monotonic()
         if ((n != self.last_removed or n_far != self.last_far)

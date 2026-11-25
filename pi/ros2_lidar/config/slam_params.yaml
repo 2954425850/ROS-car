@@ -34,9 +34,10 @@ slam_toolbox:
     restamp_tf: false
     min_laser_range: 0.0 #for rastering images
     # --- EDIT (stock: 20.0) ---
-    # RPLIDAR A1M8 spec is 12 m. The driver returns a finite ~12 m value
-    # for "no echo"; scan_self_filter clamps >= 11.5 m to inf. Keep sync.
-    max_laser_range: 11.5 #for rastering images
+    # A1M8 spec is 12 m, but on this car the driver returns finite "no echo"
+    # values down to ~9.7 m and its intensity is a constant 47 (no quality
+    # signal). scan_self_filter clips >= 9.0 m to inf. Keep sync.
+    max_laser_range: 9.0 #for rastering images
     minimum_time_interval: 0.5
     transform_timeout: 0.2
     tf_buffer_duration: 30.0
