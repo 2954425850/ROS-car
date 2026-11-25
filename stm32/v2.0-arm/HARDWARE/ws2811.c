@@ -190,7 +190,9 @@ void ws_render_rgb_probe(void)
 #define WS_LOWBAT_CAP       51      /* ~20% of 255, power saving        */
 #define WS_LOST_PERIOD_MS   800     /* purple blink period              */
 #define WS_ORBIT_PERIOD_MS  3000
-#define WS_ORBIT_TAIL       3       /* pixels in the comet tail         */
+/* Old 40-pixel strip used a 3-pixel tail. Keep the same PHYSICAL length
+ * on the 80-pixel strip: 80 * 3 / 40 = 6. */
+#define WS_ORBIT_TAIL       ((WS_PIXELS * 3 + 39) / 40)
 
 u8 ws_breath(u32 ms, u16 period_ms, u8 lo, u8 hi)
 {
@@ -264,7 +266,8 @@ void ws_render_idle(const WS_Overlay *ov, u32 ms)
  * two directions are indistinguishable, so the left and right indicators
  * looked identical on the bench. 1500ms makes the direction obvious. */
 #define WS_TURN_PERIOD_MS   1500
-#define WS_TURN_SIDE        10      /* pixels lit on the active arc     */
+/* Old 40-pixel strip lit 10 pixels (1/4 of the strip). Keep the fraction. */
+#define WS_TURN_SIDE        (WS_PIXELS / 4)
 #define WS_TURN_HUE         40      /* amber                            */
 #define WS_BRAKE_PERIOD_MS  150
 #define WS_BRAKE_DIM        90      /* the dark phase of the flash      */
@@ -366,6 +369,13 @@ void ws_render(const WS_State *st, WS_SpeedOut sp, const WS_Overlay *ov, u32 ms)
 				p[0] = ws_mix(p[0], mg, bl);
 				p[1] = ws_mix(p[1], mr, bl);
 				p[2] = ws_mix(p[2], mb, bl);
+#elif WS_ORDER_RBG
+				/* RBG stores r,b,g; the old #else branch mixed r,g,b
+				 * in the wrong slots, so the idle→motion crossfade
+				 * rotated colours on this strip. */
+				p[0] = ws_mix(p[0], mr, bl);
+				p[1] = ws_mix(p[1], mb, bl);
+				p[2] = ws_mix(p[2], mg, bl);
 #else
 				p[0] = ws_mix(p[0], mr, bl);
 				p[1] = ws_mix(p[1], mg, bl);
@@ -549,10 +559,10 @@ u8 ws_demo_frame(float *v, WS_Overlay *ov, u32 ms)
  * expands to 3 SPI bits, so one pixel costs 24*3/8 = 9 SPI BYTES.
  *
  * DO NOT write (WS_PIXELS * 24 * 3) here. That is the SPI BIT count
- * (2880), not the byte count. Sizing the buffer and the DMA transfer to
- * it makes every frame 8x too long -- 8.78ms instead of 1.10ms -- and
- * appends 2520 bytes of junk to the end of the bitstream. */
-#define WS_SPI_BYTES    (WS_PIXELS * 9)          /* 360 bytes */
+ * (5760 for 80 pixels), not the byte count. Sizing the buffer and the DMA
+ * transfer to it makes every frame 8x too long -- 17.5ms instead of
+ * 2.19ms -- and appends 5040 bytes of junk to the end of the bitstream. */
+#define WS_SPI_BYTES    (WS_PIXELS * 9)          /* 720 bytes */
 
 /* Trailing zero SPI bytes. One 0x00 byte is 8 low bit-times = 3.05us of
  * CONTINUOUS low on MOSI, so N bytes give 3.05*N us of low level -- and
@@ -624,7 +634,12 @@ static void ws_spi_init(void)
 	g.GPIO_Pin   = GPIO_Pin_7;
 	g.GPIO_Mode  = GPIO_Mode_AF;
 	g.GPIO_OType = GPIO_OType_PP;
-	g.GPIO_Speed = GPIO_Speed_100MHz;
+	/* Was GPIO_Speed_100MHz on the old 60 LED/m strip. The new 120 LED/m
+	 * strip's DIN rings at fast edges and misreads the frame (on the C542
+	 * bench this looked like a 5% white being very bright/flickering);
+	 * 25MHz slew fixed it there. Keep this slow unless a series resistor
+	 * proves a faster edge is safe. */
+	g.GPIO_Speed = GPIO_Speed_25MHz;
 	g.GPIO_PuPd  = GPIO_PuPd_UP;      /* keeps DIN defined while idle */
 	GPIO_Init(GPIOA, &g);
 

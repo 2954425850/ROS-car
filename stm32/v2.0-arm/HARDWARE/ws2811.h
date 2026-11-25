@@ -8,12 +8,14 @@
 #define WS2811_ENABLE       1
 
 /* ---------------- geometry ---------------- */
-#define WS_PIXELS           40      /* 2m * 60 LED/m / 3 LEDs-per-chip   */
+/* New strip: 2 m, 120 LED/m, 3 LEDs per WS2811 IC -> 80 addressed pixels.
+ * (Old strip was 2m, 60 LED/m -> 40 pixels.) */
+#define WS_PIXELS           80      /* 2m * 120 LED/m / 3 LEDs-per-chip  */
 
 /* ---------------- wiring / calibration ---------------- */
 /* +1 or -1: increasing pixel index runs clockwise or counter-clockwise   */
 #define WS_DIR              1
-/* 0..39: physical index of the pixel facing straight ahead (nose)       */
+/* 0..79: physical index of the pixel facing straight ahead (nose)       */
 #define WS_PHASE            0
 /* 1 = boot into calibration mode: one white pixel walks the ring        */
 #define WS_CALIB_MODE       0
@@ -24,9 +26,10 @@
  * third with pure green, the last third with pure blue -- so you can read
  * the real order straight off the strip.
  *
- *   RBG : this chassis's 2m strip, measured 2026-09-18. Emitting GRB made
- *         every colour come out cyclically rotated: red showed as blue,
- *         green as orange, deep blue as green.
+ *   RBG : both the old 60 LED/m strip (measured 2026-09-18) and the new
+ *         120 LED/m 2 m strip (measured 2026-11-25 on the C542 bench, all
+ *         16 demo stages) are RBG. Emitting GRB made every colour come out
+ *         cyclically rotated.
  *   GRB : the most common WS2811 order
  *   RGB : the other common order
  */
@@ -35,6 +38,9 @@
 #define WS_ORDER_RGB        0
 
 /* ---------------- brightness / power ---------------- */
+/* Keep 80 (31 %) on the car. The new strip has 2x the LEDs of the old one,
+ * so 31 % is roughly 1.2 A @12 V. 255 (100 %) is ~3.8 A full white; only
+ * use it if the chassis 12 V rail, fuse and wiring are sized for it. */
 #define WS_BRIGHT_MAX       80      /* 0..255, global ceiling            */
 
 /* ---------------- speed scale ---------------- */
