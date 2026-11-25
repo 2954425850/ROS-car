@@ -142,6 +142,15 @@ def test_budget_exhausts_by_legs_and_distance():
     assert b2.exceeded()
 
 
+def test_choose_intermediate_snaps_start_out_of_unknown_footprint():
+    g = make_grid(w=80, h=40, res=0.1)
+    set_rect(g, 20, 0, 80, 40, -1)      # 右侧 unknown
+    set_rect(g, 9, 9, 12, 12, -1)       # 自车 footprint 是 unknown
+    goal = choose_intermediate(g, (1.0, 1.0), (5.0, 1.0))
+    assert goal is not None
+    assert 1.0 < goal[0] < 2.0
+
+
 def test_choose_intermediate_honours_blacklist():
     g = _unknown_half_grid()
     # 把机器人前方 3 m 内的 free 区整片拉黑

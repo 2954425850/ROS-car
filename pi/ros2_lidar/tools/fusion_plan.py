@@ -101,6 +101,28 @@ def obstacle_distance(grid, x, y, max_radius=0.8):
     return best
 
 
+def nearest_free_point(grid, point, max_radius=0.5):
+    """把点吸附到最近的 free 格；自车所在格常被 scan_self_filter 留成 unknown。"""
+    cx, cy = grid.world_to_cell(point[0], point[1])
+    if grid.is_free(cx, cy):
+        return (float(point[0]), float(point[1]))
+    r = int(math.ceil(max_radius / grid.resolution))
+    best = None
+    best_d = None
+    for iy in range(cy - r, cy + r + 1):
+        for ix in range(cx - r, cx + r + 1):
+            if not grid.is_free(ix, iy):
+                continue
+            wx, wy = grid.cell_to_world(ix, iy)
+            d = math.hypot(wx - point[0], wy - point[1])
+            if d > max_radius:
+                continue
+            if best_d is None or d < best_d:
+                best_d = d
+                best = (wx, wy)
+    return best
+
+
 def _orient(a, b, c):
     return ((b[0] - a[0]) * (c[1] - a[1]) -
             (b[1] - a[1]) * (c[0] - a[0]))
@@ -206,6 +228,9 @@ def choose_intermediate(grid, pose, final, boundary=None, blacklist=(),
     if gdist < 1e-6:
         return None
     cos_cone = math.cos(math.radians(cone_deg))
+    start = nearest_free_point(grid, (px, py), 0.5)
+    if start is None:
+        return None
     cx, cy = grid.world_to_cell(px, py)
     n = int(math.ceil(max_leg / (grid.resolution * step_cells)))
     best = None
@@ -230,7 +255,7 @@ def choose_intermediate(grid, pose, final, boundary=None, blacklist=(),
                 continue
             if not clearance_ok(grid, wx, wy, clearance):
                 continue
-            if not line_free(grid, (px, py), (wx, wy)):
+            if not line_free(grid, start, (wx, wy)):
                 continue
             score = math.hypot(gx - wx, gy - wy)
             if best_score is None or score < best_score - 1e-9:

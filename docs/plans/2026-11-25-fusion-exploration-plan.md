@@ -581,6 +581,10 @@ def decide_target(grid, pose, final, boundary=None, budget=None,
 cd pi/ros2_lidar && python -m pytest tests/test_fusion_plan.py -v
 ```
 
+> **实车修正（2026-11-25）**：`choose_intermediate` 的 `line_free` 起点要先用
+> `nearest_free_point` 吸附到最近 free 格（0.5 m 内）。自车 footprint 常被
+> `scan_self_filter` 留成 unknown，不吸附的话所有中间点都会被判不可达。
+
 Expected: 全部 PASS。若 `test_decide_target_no_free_cell_near_unknown_rejected`
 失败，检查测试网格：机器人 (2,2) 在 cell (20,20)，周围 2×2 格 free，
 到任何 free 格都 < `min_leg=0.9`，应返回 None。
