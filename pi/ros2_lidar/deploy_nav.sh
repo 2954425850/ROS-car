@@ -30,15 +30,19 @@ print('bt xml ok')
 PY
 
 if [ "${1:-}" = "--install-units" ]; then
-  echo "== install nav.service / slam.service"
+  echo "== install nav.service / slam.service / scan-gate.service"
   sudo cp "$REPO/pi/systemd/system/nav.service" \
-          "$REPO/pi/systemd/system/slam.service" /etc/systemd/system/
+          "$REPO/pi/systemd/system/slam.service" \
+          "$REPO/pi/systemd/system/scan-gate.service" /etc/systemd/system/
   sudo systemctl daemon-reload
+  # 只 enable，不 start：若当前有 launch 拉起的门控在跑，start 会出现两个发布者。
+  sudo systemctl enable scan-gate
   echo "installed (not started)"
 fi
 
 echo
 echo "next:"
+echo "  sudo systemctl start scan-gate    # 首次安装后；之后随开机自启"
 echo "  ros2 launch /home/cy/ros2_lidar/launch/nav.launch.py"
 echo "  # or: sudo systemctl start nav"
 echo "  python3 ~/ros2_lidar/tools/nav_accept.py --rounds 20"

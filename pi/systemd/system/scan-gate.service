@@ -1,0 +1,22 @@
+[Unit]
+Description=nepu direction-aware scan gate (collision_monitor input)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cy
+Environment=HOME=/home/cy
+Environment=PYTHONUNBUFFERED=1
+# 与 nav/fusion launch 同一 DDS 传输，避免只靠默认 SHM 发现不到对方。
+Environment=FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+WorkingDirectory=/home/cy/ros2_lidar
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && exec /usr/bin/python3 -u /home/cy/ros2_lidar/tools/scan_motion_gate.py'
+# 裸 Python 进程以前挂掉后 collision_monitor 只会静默 source_timeout 停车，
+# 看起来和“被墙挡住”一样；这里由 systemd 拉起并留下 restart 计数。
+Restart=always
+RestartSec=2
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

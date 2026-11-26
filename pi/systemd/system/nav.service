@@ -1,7 +1,7 @@
 [Unit]
 Description=nepu navigation (AMCL + nav2, no in-place rotation)
-After=network-online.target ps2-teleop.service
-Wants=network-online.target
+After=network-online.target ps2-teleop.service scan-gate.service
+Wants=network-online.target scan-gate.service
 # Navigation and mapping both publish map->odom; never run them together.
 Conflicts=slam.service
 

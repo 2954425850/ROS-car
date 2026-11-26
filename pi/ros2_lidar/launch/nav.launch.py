@@ -16,7 +16,8 @@
   * scan_self_filter.py -> /scan_filtered —— 机械臂在雷达 0deg 方向有固定回波，
     不滤掉会被当成障碍，collision_monitor 永久停车。
   * scan_motion_gate.py -> /scan_motion_guard 只给 collision_monitor 用，
-    只保留当前运动方向会扫到的点；身后/侧边近点不再触发停车。
+    只保留当前运动方向会扫到的点；身后/侧边近点不再触发停车。它由
+    scan-gate.service 常驻拉起（不再放 launch 里），nav.service Wants 它。
 
 2026-11-18 方案新增：
   * no_pivot_guard：禁止原地转（|w| <= |v|/R_min）。
@@ -77,12 +78,6 @@ def generate_launch_description():
 
     scan_filter = ExecuteProcess(
         cmd=['python3', os.path.join(HERE, 'tools', 'scan_self_filter.py')],
-        output='screen')
-
-    # collision_monitor 只看“前进方向扫过的车体”，身后/侧边贴得很近的点
-    # 不再让它停车（scan_filtered 保持原样给代价图和定位用）。
-    motion_gate = ExecuteProcess(
-        cmd=['python3', os.path.join(HERE, 'tools', 'scan_motion_gate.py')],
         output='screen')
 
     pivot_guard = ExecuteProcess(
@@ -155,7 +150,6 @@ def generate_launch_description():
         reset,
         TimerAction(period=3.0, actions=[lidar]),
         TimerAction(period=5.0, actions=[scan_filter]),
-        TimerAction(period=5.5, actions=[motion_gate]),
         TimerAction(period=6.0, actions=[pivot_guard]),
         TimerAction(period=6.0, actions=[pose_persist]),
         TimerAction(period=6.0, actions=[auto_localize]),

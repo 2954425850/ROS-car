@@ -18,7 +18,7 @@ def test_every_check_has_known_level_and_probe_name():
         "power", "host",
         "unit:ps2-teleop", "unit:tof-a010", "unit:k230-resultd",
         "unit:k230-bridge", "unit:k230-framed", "unit:rosbridge",
-        "unit:arm-grasp",
+        "unit:arm-grasp", "unit:scan-gate",
         "udev:l150pro", "udev:a010", "udev:js0",
         "file:resultd-status", "file:framed-status", "file:latest-idr",
         "file:voice-heartbeat",

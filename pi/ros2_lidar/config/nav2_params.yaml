@@ -156,7 +156,9 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_footprint
       resolution: 0.05
-      track_unknown_space: true
+      # 导航模式是 AMCL + 预先建好的图：图外/未知格当自由格（nav2 默认）。
+      # 融合模式仍用 nav2_params_fusion.yaml 的 true，保留未知区分步探索。
+      track_unknown_space: false
       plugins:
       - static_layer
       - obstacle_layer

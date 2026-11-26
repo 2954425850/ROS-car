@@ -59,6 +59,13 @@ def build_specs() -> tuple[ComponentSpec, ...]:
                   reason="1 分钟负载 ≥6（实测出现过 17.8，会放大抖动）"),
         )),
 
+        ComponentSpec("scan_gate", "导航扫描门控", (
+            Check("unit:scan-gate", "eq", True, field="active",
+                  level=Verdict.ABSENT,
+                  reason="scan-gate 不在运行：collision_monitor 会因 "
+                         "/scan_motion_guard 超时停车（看起来像被墙挡住）"),
+        ), blocked_by=("power",)),
+
         ComponentSpec("battery", "电池", (
             Check("topic:/health/driver", "lt", 3.0, field="age_s", level=Verdict.STALE,
                   reason="/health/driver 超过 3s 没有数据"),

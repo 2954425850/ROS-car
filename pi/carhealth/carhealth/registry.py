@@ -28,7 +28,7 @@ from .probes.usb_events import UsbEventsProbe
 from .probes.wifi import WifiProbe
 
 UNITS = ("ps2-teleop", "tof-a010", "k230-resultd", "k230-bridge",
-         "k230-framed", "rosbridge", "arm-grasp")
+         "k230-framed", "rosbridge", "arm-grasp", "scan-gate")
 
 # 只订阅低频摘要。驱动把 25/50Hz 话题汇总成 1Hz /health/driver；
 # 守护总量约 13 条/秒，CPU ~1-2%（2026-11-18 Pi 实测）。
