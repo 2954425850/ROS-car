@@ -4,6 +4,7 @@
 OccupancyGrid 约定：-1 未知，0..49 可通行，>=50 障碍
 （与 tools/save_map_snapshot.py 的阈值一致）。
 """
+import heapq
 import math
 from dataclasses import dataclass
 
@@ -76,8 +77,10 @@ def clearance_ok(grid, x, y, radius=0.35):
     if radius <= 0:
         return True
     steps = max(2, int(math.ceil(radius / (grid.resolution * 0.5))))
-    for k in range(8):
-        a = k * math.pi / 4.0
+    # 24 条射线：8 条在 0.6 m 处相邻射线间隔 0.47 m，墙端/噪点会从
+    # 两条射线之间漏过去，选出的点看着有 0.6 m 余量、实际贴墙。
+    for k in range(24):
+        a = k * math.pi / 12.0
         c, s = math.cos(a), math.sin(a)
         for i in range(1, steps + 1):
             r = radius * i / steps
@@ -214,59 +217,267 @@ class Decision:
     kind: str
     goal: tuple = None
     reason: str = ""
+    # 沿路线从本腿终点到最终目标的剩余里程。staged 绕墙时欧氏距离会
+    # 先变大，用它判断“有没有在往前推”才不会误判 no_progress。
+    remaining: float = 0.0
+
+
+_EIGHT = ((1, 0), (-1, 0), (0, 1), (0, -1),
+          (1, 1), (1, -1), (-1, 1), (-1, -1))
+
+
+def _blacklisted(point, blacklist):
+    return any(math.hypot(point[0] - bx, point[1] - by) <= br
+               for bx, by, br in blacklist)
+
+
+def _chamfer_distance(grid, is_source):
+    """每格到最近 source 的距离（单位：格），8 邻域两步 chamfer。"""
+    w, h = grid.width, grid.height
+    big = float(w + h + 1)
+    dist = [big] * (w * h)
+    data = grid.data
+    for i in range(w * h):
+        if is_source(data[i]):
+            dist[i] = 0.0
+    diag = math.sqrt(2.0)
+    for y in range(h):
+        base = y * w
+        for x in range(w):
+            i = base + x
+            if dist[i] == 0.0:
+                continue
+            best = dist[i]
+            if x > 0 and dist[i - 1] + 1.0 < best:
+                best = dist[i - 1] + 1.0
+            if y > 0:
+                if dist[i - w] + 1.0 < best:
+                    best = dist[i - w] + 1.0
+                if x > 0 and dist[i - w - 1] + diag < best:
+                    best = dist[i - w - 1] + diag
+                if x + 1 < w and dist[i - w + 1] + diag < best:
+                    best = dist[i - w + 1] + diag
+            dist[i] = best
+    for y in range(h - 1, -1, -1):
+        base = y * w
+        for x in range(w - 1, -1, -1):
+            i = base + x
+            if dist[i] == 0.0:
+                continue
+            best = dist[i]
+            if x + 1 < w and dist[i + 1] + 1.0 < best:
+                best = dist[i + 1] + 1.0
+            if y + 1 < h:
+                if dist[i + w] + 1.0 < best:
+                    best = dist[i + w] + 1.0
+                if x + 1 < w and dist[i + w + 1] + diag < best:
+                    best = dist[i + w + 1] + diag
+                if x > 0 and dist[i + w - 1] + diag < best:
+                    best = dist[i + w - 1] + diag
+            dist[i] = best
+    return dist
+
+
+def plan_route(grid, start, goal, blacklist=(), *, hard_clearance=0.22,
+               clear_soft=1.0, clear_weight=3.0, unknown_penalty=4.0,
+               escape_radius=0.6):
+    """在 free+unknown 上做 A*，返回 start→goal 的格中心折线。
+
+    unknown 可通行但代价高：路线可以指向未知区，同时在有已知走廊时不会
+    为了抄近路压墙。只用来决定“往哪走”，中间点仍必须是带余量的 free 格。
+    goal 落在障碍/界外/黑名单里时返回 None。
+    """
+    w, h = grid.width, grid.height
+    res = grid.resolution
+    sx, sy = grid.world_to_cell(start[0], start[1])
+    gx, gy = grid.world_to_cell(goal[0], goal[1])
+    if not (0 <= sx < w and 0 <= sy < h and 0 <= gx < w and 0 <= gy < h):
+        return None
+    data = grid.data
+    start_i = sy * w + sx
+    goal_i = gy * w + gx
+    if data[start_i] >= OCC_MIN or data[goal_i] >= OCC_MIN:
+        return None
+    if _blacklisted(goal, blacklist):
+        return None
+
+    obs = _chamfer_distance(grid, lambda v: v >= OCC_MIN)
+    escape_r = max(1, int(math.ceil(escape_radius / res)))
+    cost = [0.0] * (w * h)
+    passable = bytearray(w * h)
+    for iy in range(h):
+        base = iy * w
+        for ix in range(w):
+            i = base + ix
+            v = data[i]
+            if v >= OCC_MIN:
+                continue
+            d_m = obs[i] * res
+            # 自车贴墙时（self filter 也可能把贴墙格留成 unknown）留出
+            # 逃逸空间，否则第一步就无路可走。
+            near_start = (abs(ix - sx) <= escape_r and
+                          abs(iy - sy) <= escape_r)
+            # 未知格不做硬性贴墙限制：目标是用户点在 unknown 里的，
+            # 常紧贴墙外侧；路线可以穿过 unknown 探过去。
+            if v >= 0 and d_m < hard_clearance and not near_start:
+                continue
+            pen = 0.0
+            if d_m < clear_soft:
+                ratio = (clear_soft - d_m) / clear_soft
+                pen = clear_weight * ratio * ratio
+            cost[i] = 1.0 + pen + (unknown_penalty if v < 0 else 0.0)
+            passable[i] = 1
+
+    # 黑名单格当作不可通行；只豁免起点自身，避免腿失败后原地死锁。
+    for bx, by, br in blacklist:
+        ix0, iy0 = grid.world_to_cell(bx - br, by - br)
+        ix1, iy1 = grid.world_to_cell(bx + br, by + br)
+        for iy in range(max(0, iy0), min(h - 1, iy1) + 1):
+            base = iy * w
+            for ix in range(max(0, ix0), min(w - 1, ix1) + 1):
+                i = base + ix
+                if i == start_i:
+                    continue
+                wx, wy = grid.cell_to_world(ix, iy)
+                if math.hypot(wx - bx, wy - by) <= br:
+                    passable[i] = 0
+
+    gx_m, gy_m = goal[0], goal[1]
+    diag = math.sqrt(2.0)
+    best = [float("inf")] * (w * h)
+    best[start_i] = 0.0
+    parent = [-1] * (w * h)
+    openq = [(math.hypot(start[0] - gx_m, start[1] - gy_m), 0.0, start_i)]
+    visited = bytearray(w * h)
+    found = False
+    while openq:
+        _, gc, i = heapq.heappop(openq)
+        if visited[i]:
+            continue
+        visited[i] = 1
+        if i == goal_i:
+            found = True
+            break
+        ix, iy = i % w, i // w
+        for dx, dy in _EIGHT:
+            nx, ny = ix + dx, iy + dy
+            if not (0 <= nx < w and 0 <= ny < h):
+                continue
+            j = ny * w + nx
+            if not passable[j] or visited[j]:
+                continue
+            if dx and dy:
+                if not passable[i + dx] or not passable[i + dy * w]:
+                    continue
+            step = (diag if dx and dy else 1.0) * res
+            ng = gc + step * cost[j]
+            if ng < best[j] - 1e-12:
+                best[j] = ng
+                parent[j] = i
+                hx, hy = grid.cell_to_world(nx, ny)
+                heapq.heappush(openq, (ng + math.hypot(hx - gx_m, hy - gy_m),
+                                       ng, j))
+    if not found:
+        return None
+    route = []
+    i = goal_i
+    while i != -1:
+        ix, iy = i % w, i // w
+        route.append(grid.cell_to_world(ix, iy))
+        if i == start_i:
+            break
+        i = parent[i]
+    route.reverse()
+    return route
+
+
+def _pick_waypoint(grid, pose, route, boundary, blacklist, *, min_leg,
+                   max_leg, clearance, unknown_clearance):
+    """沿路线取 leg 终点：free、离墙/未知区有余量、不越 unknown。
+
+    返回 (waypoint, 剩余里程)；剩余里程沿 A* 路线从 waypoint 到目标。
+    """
+    pose_to_start = math.hypot(route[0][0] - pose[0],
+                               route[0][1] - pose[1])
+    total = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                for a, b in zip(route, route[1:]))
+    acc = 0.0
+    prefix = []
+    prev = route[0]
+    for point in route[1:]:
+        acc += math.hypot(point[0] - prev[0], point[1] - prev[1])
+        prev = point
+        if acc + pose_to_start > max_leg + 1e-9:
+            break
+        if grid.classify(point[0], point[1]) != "free":
+            break            # 不能先穿过 unknown 去取后面的点
+        if acc + pose_to_start < min_leg - 1e-9:
+            continue
+        prefix.append((acc, point))
+    tiers = [unknown_clearance]
+    if 0.35 < unknown_clearance:
+        tiers.append(0.35)
+    if unknown_clearance > 0.0:
+        tiers.append(0.0)
+    for margin in tiers:
+        best = None
+        for point_acc, point in prefix:
+            if boundary is not None and boundary.crosses(point):
+                continue
+            if _blacklisted(point, blacklist):
+                continue
+            if not clearance_ok(grid, point[0], point[1], clearance):
+                continue
+            if margin > 0 and unknown_distance(
+                    grid, point[0], point[1], 0.8) < margin:
+                continue
+            best = ((float(point[0]), float(point[1])), total - point_acc)
+        if best is not None:
+            return best
+    return None, None
+
+
+def _choose_intermediate(grid, pose, final, boundary=None, blacklist=(),
+                         *, min_leg=0.9, max_leg=3.0, clearance=0.6,
+                         unknown_clearance=0.5, unknown_penalty=4.0):
+    """给 unknown 目标选中间腿：先规划一条 free+unknown 的 A* 路线，
+    再取路线前段（≤ max_leg）最后一个满足墙体/未知区余量的 free 格。
+
+    旧实现只在 60° 锥内找欧氏距离最近的点：会贴墙、会为抄近路拐大弯，
+    且贴在 unknown 边界上的点会让 Smac 因 footprint 压 unknown 而失败。
+    返回 (waypoint, 剩余路线里程) 或 (None, None)。
+    """
+    px, py = float(pose[0]), float(pose[1])
+    gx, gy = float(final[0]), float(final[1])
+    if math.hypot(gx - px, gy - py) < 1e-6:
+        return None, None
+    start = nearest_free_point(grid, (px, py), 0.5)
+    if start is None:
+        return None, None
+    route = plan_route(grid, start, (gx, gy), blacklist,
+                       unknown_penalty=unknown_penalty)
+    if route is None:
+        return None, None
+    return _pick_waypoint(grid, (px, py), route, boundary, blacklist,
+                          min_leg=min_leg, max_leg=max_leg,
+                          clearance=clearance,
+                          unknown_clearance=unknown_clearance)
 
 
 def choose_intermediate(grid, pose, final, boundary=None, blacklist=(),
                         *, min_leg=0.9, max_leg=3.0, clearance=0.6,
-                        cone_deg=60.0, step_cells=1):
-    # step_cells=1：自由边缘可能落在任意格子，粗采样会错过最靠前的那一格，
-    # 导致中间点偏到侧面。3 m 内约 3.7k 个候选，单次规划 <0.2 s，可接受。
-    px, py = float(pose[0]), float(pose[1])
-    gx, gy = float(final[0]), float(final[1])
-    dx, dy = gx - px, gy - py
-    gdist = math.hypot(dx, dy)
-    if gdist < 1e-6:
-        return None
-    cos_cone = math.cos(math.radians(cone_deg))
-    start = nearest_free_point(grid, (px, py), 0.5)
-    if start is None:
-        return None
-    cx, cy = grid.world_to_cell(px, py)
-    n = int(math.ceil(max_leg / (grid.resolution * step_cells)))
-    best = None
-    best_score = None
-    for ky in range(-n, n + 1):
-        iy = cy + ky * step_cells
-        for kx in range(-n, n + 1):
-            ix = cx + kx * step_cells
-            if not grid.is_free(ix, iy):
-                continue
-            wx, wy = grid.cell_to_world(ix, iy)
-            vx, vy = wx - px, wy - py
-            d = math.hypot(vx, vy)
-            if d < min_leg or d > max_leg:
-                continue
-            if (vx * dx + vy * dy) / (d * gdist) < cos_cone:
-                continue
-            if boundary is not None and boundary.crosses((wx, wy)):
-                continue
-            if any(math.hypot(wx - bx, wy - by) <= br
-                   for bx, by, br in blacklist):
-                continue
-            if not clearance_ok(grid, wx, wy, clearance):
-                continue
-            if not line_free(grid, start, (wx, wy)):
-                continue
-            score = math.hypot(gx - wx, gy - wy)
-            if best_score is None or score < best_score - 1e-9:
-                best_score = score
-                best = (wx, wy)
-    return best
+                        unknown_clearance=0.5, unknown_penalty=4.0):
+    goal, _ = _choose_intermediate(
+        grid, pose, final, boundary, blacklist, min_leg=min_leg,
+        max_leg=max_leg, clearance=clearance,
+        unknown_clearance=unknown_clearance,
+        unknown_penalty=unknown_penalty)
+    return goal
 
 
 def decide_target(grid, pose, final, boundary=None, budget=None,
                   blacklist=(), *, min_leg=0.9, max_leg=3.0,
-                  clearance=0.6):
+                  clearance=0.6, unknown_clearance=0.5):
     if final is None:
         return Decision("reject", None, "no_target")
     if boundary is not None and boundary.crosses(final):
@@ -279,13 +490,16 @@ def decide_target(grid, pose, final, boundary=None, budget=None,
     if budget is not None and budget.exceeded():
         return Decision("reject", None, "budget_exceeded")
     if status == "free":
-        return Decision("direct", (float(final[0]), float(final[1])), "")
-    goal = choose_intermediate(
+        return Decision("direct", (float(final[0]), float(final[1])), "",
+                        math.hypot(final[0] - pose[0],
+                                   final[1] - pose[1]))
+    goal, remaining = _choose_intermediate(
         grid, pose, final, boundary, blacklist,
-        min_leg=min_leg, max_leg=max_leg, clearance=clearance)
+        min_leg=min_leg, max_leg=max_leg, clearance=clearance,
+        unknown_clearance=unknown_clearance)
     if goal is None:
         return Decision("reject", None, "no_reachable_frontier")
-    return Decision("staged", goal, "")
+    return Decision("staged", goal, "", remaining)
 
 
 @dataclass
@@ -435,11 +649,12 @@ class Navigator:
     """不碰 ROS 的状态机；外部在目标/腿结束/定时调用。"""
 
     def __init__(self, *, min_leg=0.9, max_leg=3.0, clearance=0.6,
-                 max_legs=20, stall_limit=3, blacklist_radius=0.5,
-                 frontier_clearance=0.6):
+                 unknown_clearance=0.5, max_legs=20, stall_limit=3,
+                 blacklist_radius=0.5, frontier_clearance=0.6):
         self.min_leg = min_leg
         self.max_leg = max_leg
         self.clearance = clearance
+        self.unknown_clearance = unknown_clearance
         self.max_legs = max_legs
         self.stall_limit = stall_limit
         self.blacklist_radius = blacklist_radius
@@ -458,7 +673,7 @@ class Navigator:
         self.blacklist = []
         self.stalls = 0
         self.failures = 0
-        self.last_dist = None
+        self.remaining = None
         self.frontier_count = 0
         self.legs_done = 0
 
@@ -470,6 +685,8 @@ class Navigator:
             "leg": self.leg,
             "leg_kind": self.leg_kind,
             "reason": self.reason,
+            "remaining": (None if self.remaining is None
+                          else round(self.remaining, 2)),
             "legs": self.legs_done,
             "frontiers": self.frontier_count,
         }
@@ -493,10 +710,9 @@ class Navigator:
         self.leg_start = None
         self.stalls = 0
         self.failures = 0
+        self.remaining = None
         self.blacklist.clear()
         self.legs_done = 0
-        self.last_dist = math.hypot(self.final[0] - pose[0],
-                                    self.final[1] - pose[1])
         self._plan(grid, pose, boundary)
 
     def cancel(self):
@@ -530,13 +746,33 @@ class Navigator:
             grid, pose, self.final, boundary, self.budget,
             blacklist=self.blacklist,
             min_leg=self.min_leg, max_leg=self.max_leg,
-            clearance=self.clearance)
+            clearance=self.clearance,
+            unknown_clearance=self.unknown_clearance)
         if dec.kind == "reject":
             self.state = "blocked"
             self.reason = dec.reason
             self.leg = None
             self.leg_kind = None
             return
+        # 用“沿路线的剩余里程”判进度：绕墙时欧氏距离会先变大，
+        # 按欧氏判会把正常绕行误判成 no_progress。
+        # 剩余里程明显变长（>0.5 m）说明新地图把原路线作废了（刚看到
+        # 墙/门），这是探索信息增加，不是卡住，计数清零。
+        if dec.kind == "staged" and self.remaining is not None:
+            delta = self.remaining - dec.remaining
+            if delta < -0.5:
+                self.stalls = 0
+            elif delta < 0.2:
+                self.stalls += 1
+            else:
+                self.stalls = 0
+            if self.stalls >= self.stall_limit:
+                self.state = "blocked"
+                self.reason = "no_progress"
+                self.leg = None
+                self.leg_kind = None
+                return
+        self.remaining = dec.remaining
         self._set_leg(dec.goal, dec.kind)
 
     def _plan_explore(self, grid, pose, boundary):
@@ -595,13 +831,6 @@ class Navigator:
                 if self.explore:
                     self._plan_explore(grid, pose, boundary)
                 return
-            if self.last_dist is not None and d > self.last_dist - 0.2:
-                self.stalls += 1
-            self.last_dist = d
-            if self.stalls >= self.stall_limit:
-                self.state = "blocked"
-                self.reason = "no_progress"
-                return
         self._plan(grid, pose, boundary)
 
     def on_leg_failed(self, grid, pose, boundary=None):
@@ -619,11 +848,13 @@ class Navigator:
                 self._plan_explore(grid, pose, boundary)
                 return
         elif self.final is not None and self.failures < 2:
-            goal = choose_intermediate(
+            goal, remaining = _choose_intermediate(
                 grid, pose, self.final, boundary, self.blacklist,
                 min_leg=self.min_leg, max_leg=self.max_leg,
-                clearance=self.clearance)
+                clearance=self.clearance,
+                unknown_clearance=self.unknown_clearance)
             if goal is not None:
+                self.remaining = remaining
                 self._set_leg(goal, "staged")
                 self.reason = "retry_staged"
                 return

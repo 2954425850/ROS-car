@@ -152,13 +152,26 @@ def test_choose_intermediate_snaps_start_out_of_unknown_footprint():
 
 
 def test_choose_intermediate_respects_inflation_clearance():
-    g = make_grid(w=80, h=40, res=0.1)
-    set_rect(g, 20, 0, 80, 40, -1)
-    # 障碍物紧贴自由区边缘（x=2.05, y=1.55）；旧 clearance=0.35 会选到
-    # (1.95,1.05) 这种离障碍 0.5 m 的点，在 master 上是 253（内切区）。
-    g.data[15 * 80 + 20] = 100
-    goal = choose_intermediate(g, (1.0, 1.0), (5.0, 1.0))
+    g = make_grid(w=100, h=40, res=0.1)
+    set_rect(g, 40, 0, 100, 40, -1)
+    # 障碍物紧贴自由区边缘（x=4.05, y=1.55）；旧 clearance=0.35 会选到
+    # 贴边点，在 master 上是 253（内切区）。
+    g.data[15 * 100 + 40] = 100
+    goal = choose_intermediate(g, (1.0, 1.0), (8.0, 1.0))
     assert goal is not None
+    assert clearance_ok(g, goal[0], goal[1], 0.6)
+    assert unknown_distance(g, goal[0], goal[1], 0.8) >= 0.45
+
+
+def test_choose_intermediate_target_next_to_wall_in_unknown():
+    # 用户点在 unknown 里、紧挨着已知墙外侧：goal 格本身贴墙不能算不可达，
+    # 路线要能穿过 unknown 指过去，中间点仍落在带余量的 free 格里。
+    g = make_grid(w=100, h=40, res=0.1)
+    set_rect(g, 40, 0, 100, 40, -1)
+    g.data[10 * 100 + 40] = 100        # unknown 中、紧挨目标的墙格
+    goal = choose_intermediate(g, (1.0, 1.0), (4.15, 1.05))
+    assert goal is not None
+    assert goal_status(g, goal[0], goal[1]) == "free"
     assert clearance_ok(g, goal[0], goal[1], 0.6)
 
 
@@ -173,6 +186,54 @@ def test_choose_intermediate_honours_blacklist():
 
 from fusion_plan import (Frontier, find_frontiers, choose_frontier_goal,
                          unknown_distance)
+
+
+def _deep_free_grid():
+    # free x<4.0，右侧 unknown；比 min_leg 深，能同时满足推进和余量
+    g = make_grid(w=100, h=40, res=0.1)
+    set_rect(g, 40, 0, 100, 40, -1)
+    return g
+
+
+def test_choose_intermediate_keeps_unknown_margin():
+    # 旧实现会选到贴 unknown 边缘的 free 格；Smac 的 footprint 压到
+    # unknown（track_unknown_space）就 no valid path。中间点要留出余量。
+    g = _deep_free_grid()
+    goal = choose_intermediate(g, (1.0, 1.0), (8.0, 1.0))
+    assert goal is not None
+    assert unknown_distance(g, goal[0], goal[1], 0.8) >= 0.45
+    assert goal[0] > 2.0                # 同时确实往前推进了
+
+
+def test_choose_intermediate_straight_when_corridor_clear():
+    # 前方直通时不能无缘无故拐到侧面
+    g = _deep_free_grid()
+    goal = choose_intermediate(g, (1.0, 1.0), (8.0, 2.0))
+    assert goal is not None
+    want = math.atan2(2.0 - 1.0, 8.0 - 1.0)
+    got = math.atan2(goal[1] - 1.0, goal[0] - 1.0)
+    assert abs(got - want) < math.radians(15.0)
+
+
+def test_choose_intermediate_routes_around_wall_outside_old_cone():
+    # 墙从 y=0 一直挡到 y=3.5：旧实现的 60° 锥内没有一条能绕过墙的
+    # 直线，只能报 no_reachable_frontier；新实现应该沿 A* 路线先去墙顶。
+    g = make_grid(w=80, h=60, res=0.1)
+    set_rect(g, 40, 0, 80, 60, -1)      # x >= 4.0 未知，目标在未知里
+    set_rect(g, 25, 0, 27, 36, 100)     # x 2.5~2.7，y 0~3.5 的墙
+    goal = choose_intermediate(g, (1.0, 1.0), (5.0, 1.0))
+    assert goal is not None
+    assert goal[1] > 3.5                # 必须绕到墙顶以上
+    assert clearance_ok(g, goal[0], goal[1], 0.6)
+
+
+def test_choose_intermediate_falls_back_in_narrow_corridor():
+    # 0.8 m 宽走廊两侧都是 unknown：0.5 m 余量不可能，但不能因此不出腿
+    g = make_grid(w=80, h=60, res=0.1)
+    set_rect(g, 0, 0, 80, 60, -1)
+    set_rect(g, 0, 25, 60, 33, 0)       # y 2.5~3.3 的走廊，x 0~6.0 已建图
+    goal = choose_intermediate(g, (1.0, 2.9), (7.0, 2.9))
+    assert goal is not None
 
 
 def _room_with_frontier():
@@ -361,6 +422,34 @@ def test_navigator_cancel_clears_target():
     assert n.final is None
     assert n.leg is None
     assert n.state == "idle"
+
+
+def test_navigator_route_growth_is_not_no_progress():
+    # 刚看到墙/门时路线会变长，这是地图信息增加，不能判成卡住
+    g = _navigator_grid()
+    n = Navigator()
+    n.final = (5.0, 1.0)
+    n.remaining = 0.5
+    n.stalls = 2
+    n.replan(g, (1.0, 1.0))
+    assert n.state == "following"
+    assert n.stalls == 0
+
+
+def test_navigator_flat_remaining_still_trips_no_progress():
+    g = _navigator_grid()
+    n = Navigator()
+    n.final = (5.0, 1.0)
+    n.remaining = 10.0
+    n.replan(g, (1.0, 1.0))          # 得到本次的剩余里程
+    assert n.state == "following"
+    rem = n.remaining
+    n.leg = None                     # 模拟腿结束但原地绕圈
+    n.remaining = rem + 0.1
+    n.stalls = 2
+    n.replan(g, (1.0, 1.0))
+    assert n.state == "blocked"
+    assert n.reason == "no_progress"
 
 
 def test_navigator_budget_blocks_runaway():

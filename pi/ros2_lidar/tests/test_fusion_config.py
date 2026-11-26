@@ -24,6 +24,14 @@ def test_nav2_fusion_keeps_unknown_blocked():
     assert p["allow_unknown"] is False
 
 
+def test_nav2_fusion_uses_approach_heading_at_goal():
+    # yaw_goal_tolerance=3.15（不管朝向），但 Smac 仍会为目标 yaw 规划
+    # 末段机动；必须按实际接近方向收尾，否则短腿尾部会多出大转角。
+    d = load("nav2_params_fusion.yaml")
+    p = d["planner_server"]["ros__parameters"]["GridBased"]
+    assert p["use_final_approach_orientation"] is True
+
+
 def test_nav2_fusion_local_costmap_is_4m():
     d = load("nav2_params_fusion.yaml")
     p = d["local_costmap"]["local_costmap"]["ros__parameters"]

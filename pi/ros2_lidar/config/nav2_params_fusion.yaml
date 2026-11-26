@@ -204,7 +204,11 @@ planner_server:
       max_on_approach_iterations: 1000
       max_planning_time: 5.0
       lookup_table_size: 20.0
-      use_final_approach_orientation: false
+      # 融合模式 yaw_goal_tolerance=pi，不关心终点朝向。设 false 时 Smac
+      # 仍把 send_leg 填的“从当前位置指向目标的直线夹角”当终点朝向，
+      # 绕弯/走廊里进不去时要额外做一段掉头或倒车；设 true 用实际接近
+      # 方向收尾，腿末不再画蛇添足。
+      use_final_approach_orientation: true
       smoother:
         max_iterations: 1000
         w_smooth: 0.3
