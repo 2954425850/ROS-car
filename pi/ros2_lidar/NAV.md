@@ -129,16 +129,28 @@ footprint +2 cm 内的点（`Y_MAX=0.22`），所以车侧 22~28 cm（距车体 
 改 footprint 时要同步这里、两个 costmap 的 `footprint` 和
 `scan_self_filter.py`。
 
-**验证（30 秒判定实验，未做前不要宣称已修）**：
-1. 把车挪到能规划的已知空闲起点（本次实测：当前位姿向左 +y 约 0.4~0.6 m），
-   车后/侧边 10~15 cm 放箱子，目标选正前方 1 m 的空闲点。
-2. `ros2 param set /scan_motion_gate enabled false`（等价的旧行为：整帧透传），
-   发目标；`ros2 topic echo /collision_monitor_state` 应看到 `STOPPED`，
-   车不动。
-3. `ros2 param set /scan_motion_gate enabled true`，重发同一目标；应看到
-   `ACTIVE` 且车前进。
-4. 之后 `ros2 param set /scan_motion_gate enabled true` 保持。
-如果第 2 步没有复现停车，说明这条改动没有修到你抱怨的那个现象，应回退。
+**验证（2026-11-26 实车 A/B，已通过）**
+
+条件：车后正中约 10 cm 放箱子（`/scan_filtered` 在 stop 区 x≈-0.40 m 有 162
+个点，`range_min=0.15` 边缘可见）；车头前方清空；停掉 `no_pivot_guard`，直接在
+`/cmd_vel_guard` 发 0.15 m/s；上层/rosbridge/K230/ToF/arm-grasp 为降负载临时停止。
+临时发布节点必须 `export FASTDDS_BUILTIN_TRANSPORTS=UDPv4`，与 systemd 门控和
+collision_monitor 同一传输；否则假指令根本到不了门控（日志里不会出现 `kept`）。
+
+- `enabled=false`（旧行为）：collision_monitor 报
+  `Robot to stop due to stop_zone polygon`，**车不动**。
+- `enabled=true`：`gate: kept 0/555 points in sweep (v=0.15 w=0.00)`；随后
+  collision_monitor `Robot to continue normal operation`，cmd_mux
+  `速度控制权 → nav`；**车前进约 0.2 m**。
+
+结论：车后 10 cm 的箱子在旧行为下确实触发 collision_monitor 停车；门控把它从
+collision_monitor 的输入里去掉后，collision_monitor/cmd_mux 放行。第一次
+“true 不走”是测试节点没用 UDPv4（假指令没到门控）+ 高负载下一次 invalid source
+把 collision_monitor 停住，不是门控的问题。
+
+边界：这次 A/B 用直接速度指令隔离了 planner/起点，验证的是 collision_monitor +
+门控这一层；融合模式的 `Start occupied` 是另一个问题（见下一节）。侧向 2~5 cm
+带只做了纯几何测试，没有单独做侧边箱子的实车 A/B。
 
 验证日志：`journalctl -u scan-gate -n 20` 应看到
 `scan_motion_gate: ... pads 0.02/0.05 m, horizon 1.0 s`；运动时
