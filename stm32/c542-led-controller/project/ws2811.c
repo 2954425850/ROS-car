@@ -334,16 +334,17 @@ static void ws_ov_turn(s8 dir, u32 ms)
 	u32 head;
 	u8  i;
 
-	/* dir = +1 for Move_Z > 0 (left), -1 for right.  If the ring is glued
-	 * mirrored, swap the two head equations; WS_DIR/WS_PHASE already map
-	 * the logical index to the physical pixel. */
-	if (dir > 0) head = ph;
-	else         head = (WS_PIXELS - ph) % WS_PIXELS;
+	/* dir = +1 for Move_Z > 0 (left), -1 for right.  This chassis's ring is
+	 * indexed the other way round, so the equations are swapped relative
+	 * to the first version (measured 2026-11-26: without the swap left and
+	 * right were mirrored). */
+	if (dir > 0) head = (WS_PIXELS - ph) % WS_PIXELS;
+	else         head = ph;
 
 	for (i = 0; i < WS_TURN_SIDE; i++) {
 		/* The tail always trails BEHIND the head's direction of travel. */
-		u32 logical = (dir > 0) ? ((head + WS_PIXELS - i) % WS_PIXELS)
-		                        : ((head + i) % WS_PIXELS);
+		u32 logical = (dir > 0) ? ((head + i) % WS_PIXELS)
+		                        : ((head + WS_PIXELS - i) % WS_PIXELS);
 		u8  ar, ag, ab;
 		ws_hsv2rgb(WS_TURN_HUE, 255, 255, &ar, &ag, &ab);
 		ws_put(ws_map((u8)logical), ar, ag, ab);
