@@ -27,6 +27,7 @@ SLAM 与导航**不能同时跑**（都发 `map->odom`）。`nav.service` / `sla
 | `tools/lidar_reset.py`（前置） | STOP + RESET 雷达；避免重启后卡在 `getDeviceInfo` |
 | `rplidar_composition` | 雷达 7 Hz；`auto_standby=false`、by-id 串口 |
 | `tools/scan_self_filter.py` | `/scan` → `/scan_filtered`，滤掉车体 footprint 内的机械臂回波 |
+| `tools/scan_motion_gate.py` | `/scan_filtered` → `/scan_motion_guard`，只保留当前运动方向扫过的车体；喂 collision_monitor |
 | `robot_state_publisher` | `base_footprint -> base_link -> laser` |
 | nav2 `localization_launch.py` | `map_server` + `amcl`，composition 容器 |
 | `nav2_navigation_launch.py`（本地副本） | controller / planner / bt_navigator / behaviors / velocity_smoother / collision_monitor |
@@ -41,6 +42,10 @@ SLAM 与导航**不能同时跑**（都发 `map->odom`）。`nav.service` / `sla
 controller_server -> cmd_vel_raw -> velocity_smoother -> cmd_vel_smoothed
   -> no_pivot_guard -> cmd_vel_guard -> collision_monitor -> cmd_vel_nav
   -> cmd_mux（导航 10，最低） -> cmd_vel_mux -> 驱动
+
+/scan -> scan_self_filter -> /scan_filtered
+  -> scan_motion_gate -> /scan_motion_guard -> collision_monitor
+/scan_filtered 同时给 AMCL / slam_toolbox / 代价图（不经过方向门）
 ```
 
 `nav2_navigation_launch.py` 是官方文件的副本，把 `cmd_vel -> cmd_vel_nav`
@@ -58,7 +63,7 @@ controller_server -> cmd_vel_raw -> velocity_smoother -> cmd_vel_smoothed
 | 全局代价图 | static + obstacle + inflation | unknown 当障碍；膨胀 0.7/2.0 |
 | 行为 | backup / drive_on_heading / assisted_teleop / wait | **无 spin** |
 | 行为树 | `config/bt_nav_to_pose.xml` | 重规划 0.5 Hz；恢复 = 清代价图 → Wait 2 s → BackUp 0.15 m |
-| 硬安全 | collision_monitor | stop 区（车体外扩 15 cm）+ 1 m 减速区；scan 超时 0.5 s |
+| 硬安全 | collision_monitor | stop 区（车体外扩 15 cm）+ 1 m 减速区；scan 超时 0.5 s；**只吃运动方向过滤后的 scan**（见 2026-11-26） |
 
 **不优先贴边**：靠 Smac 的 `cost_penalty` 在“路短”和“离障碍远”之间权衡，
 RPP 严格跟随路径；**没有加禁行区/硬性横向距离**（按修订版）。
@@ -79,6 +84,46 @@ RPP 严格跟随路径；**没有加禁行区/硬性横向距离**（按修订�
 
 参数：`hit_dist=0.10`、`hit_thresh=0.50`、`min_scan_points=500`。
 
+
+## 2026-11-26 方向感知的近场保护
+
+**现象**：车想往前走，但身后 0~13 cm 或侧边 2~8 cm 有墙/家具时原地不动。
+`collision_monitor` 的 stop 区是 base_footprint 下的固定矩形
+`[[-0.45,-0.28],[0.45,0.28]]`，前后左右全包围；`scan_self_filter` 只清掉
+footprint +2 cm 内的点，所以车侧 2~8 cm、车后 0~13 cm 的点仍然落在 stop 区里，
+不管此刻是前进还是倒车都会停车。
+
+**改法**：新增 `tools/scan_motion_gate.py`，把 `/scan_filtered` 复制成
+`/scan_motion_guard` 再喂给 `collision_monitor`。门控按当前
+`/cmd_vel_guard` 做两件事，只保留“车体会碰到”的点，其余置 `inf`：
+
+- **当前航向走廊**（与速度无关）：前进时保留车体宽度 +2 cm 内、从车尾往
+  前无限长的条带；倒车镜像。这样低速时车头 stop 区也不会漏。
+- **未来 1 s 的等曲率扫掠**（直行 / 倒车 / 原地转都覆盖）：处理转弯时车角
+  会扫向侧边的情况。原地转 0.35 rad/s 时约看未来 20°。
+
+结果是：车后 0~13 cm、车侧 2~8 cm 的墙不再让**直行**的车停车；但如果
+控制量已经在往它那边转（只剩 ~3 cm 侧向余量）时仍会停。
+
+- 指令超时（>0.5 s）或 TF 失败：**不过滤**，整帧透传；门控节点挂掉则
+  `collision_monitor` 的 `source_timeout=0.5 s` 会停车（失效安全）。
+
+代价图、AMCL、slam_toolbox 仍然用完整的 `/scan_filtered`，所以侧边障碍物
+照样参与规划绕行；只是不再触发近场急停。
+
+参数（`scan_motion_gate.py`）：`half_length=0.30`、`half_width=0.20`、
+`pad=0.02`、`horizon=1.0 s`、`step=0.1 s`、`cmd_timeout=0.5 s`。
+改 footprint 时要同步这里、两个 costmap 的 `footprint` 和
+`scan_self_filter.py`。
+
+验证：启动后应看到 `scan_motion_gate: ... horizon 1.0 s`；运动时日志
+`gate: kept N/M points in sweep`，N/M 明显小于 1 说明方向过滤在起作用。
+可 `ros2 topic echo /scan_motion_guard` 对比 `/scan_filtered`。
+
+注意：`collision_monitor` 现在只订阅 `/scan_motion_guard`。必须用
+`nav.launch.py` / `fusion.launch.py` 启动（它们会拉起门控）；如果单独起
+nav2 而忘了门控，scan 源超时会让车一直停着。回退方法：把两个 yaml 里
+`collision_monitor.scan.topic` 改回 `scan_filtered`。
 
 ## 明早运行手册（Pi 上）
 

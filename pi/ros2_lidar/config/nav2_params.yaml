@@ -345,7 +345,9 @@ collision_monitor:
     - scan
     scan:
       type: scan
-      topic: scan_filtered
+      # 方向感知副本：scan_motion_gate 只保留当前运动方向扫过的车体，
+      # 身后/侧边的近点不再触发 stop_zone。代价图仍用 scan_filtered。
+      topic: scan_motion_guard
       min_height: 0.15
       max_height: 2.0
       enabled: true

@@ -50,6 +50,12 @@ def generate_launch_description():
         cmd=["python3", os.path.join(HERE, "tools", "scan_self_filter.py")],
         output="screen")
 
+    # 只把“当前运动方向扫过的车体”交给 collision_monitor；原地转时它会
+    # 按转向预测未来的扫掠角，身后/侧边无关点不再触发停车。
+    motion_gate = ExecuteProcess(
+        cmd=["python3", os.path.join(HERE, "tools", "scan_motion_gate.py")],
+        output="screen")
+
     # 融合/探索模式允许慢速原地转（死角和 U 型调头需要）；导航模式
     # nav.launch.py 仍用默认 allow_slow_pivot=false，5/5 验收规则不变。
     pivot_guard = ExecuteProcess(
@@ -96,6 +102,7 @@ def generate_launch_description():
         rsp,
         TimerAction(period=3.0, actions=[lidar]),
         TimerAction(period=5.0, actions=[scan_filter]),
+        TimerAction(period=5.5, actions=[motion_gate]),
         TimerAction(period=6.0, actions=[pivot_guard]),
         TimerAction(period=6.0, actions=[slam]),
         navigation,
