@@ -323,17 +323,30 @@ static u8 ws_mix(u8 a, u8 b, u8 t)
 }
 
 /* Directional flow drawn ON TOP of the motion base colour, so the speed
- * reading survives while the turn direction is added. */
+ * reading survives while the turn direction is added.
+ *
+ * Left and right MUST travel in opposite directions.  The old code always
+ * advanced "head" with time and only flipped which side the tail trailed
+ * on, so both turns looked like the same rotation. */
 static void ws_ov_turn(s8 dir, u32 ms)
 {
-	u32 head = (ms % WS_TURN_PERIOD_MS) * WS_PIXELS / WS_TURN_PERIOD_MS;
+	u32 ph = (ms % WS_TURN_PERIOD_MS) * WS_PIXELS / WS_TURN_PERIOD_MS;
+	u32 head;
 	u8  i;
 
+	/* dir = +1 for Move_Z > 0 (left), -1 for right.  If the ring is glued
+	 * mirrored, swap the two head equations; WS_DIR/WS_PHASE already map
+	 * the logical index to the physical pixel. */
+	if (dir > 0) head = ph;
+	else         head = (WS_PIXELS - ph) % WS_PIXELS;
+
 	for (i = 0; i < WS_TURN_SIDE; i++) {
-		u32 logical = (dir > 0) ? (head + i) : (head + WS_PIXELS - i);
+		/* The tail always trails BEHIND the head's direction of travel. */
+		u32 logical = (dir > 0) ? ((head + WS_PIXELS - i) % WS_PIXELS)
+		                        : ((head + i) % WS_PIXELS);
 		u8  ar, ag, ab;
 		ws_hsv2rgb(WS_TURN_HUE, 255, 255, &ar, &ag, &ab);
-		ws_put(ws_map((u8)(logical % WS_PIXELS)), ar, ag, ab);
+		ws_put(ws_map((u8)logical), ar, ag, ab);
 	}
 }
 
