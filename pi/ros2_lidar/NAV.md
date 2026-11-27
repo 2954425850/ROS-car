@@ -258,6 +258,28 @@ ros2 pkg prefix nav2_smac_planner    # 必须是 ~/nav2_ws/install/...
 3. 上述 SUCCEEDED 场景下发 `NavigateToPose`，`cmd_vel_guard` 非零 ≥1 s，
    `collision_monitor` 不出现 `STOPPED`。
 
+**2026-11-27 实测（`tools/start_clearance_probe.py`，nav_20261124，墙格
+(0.49, 1.15)，车头 +y）**：
+
+```
+side 0.10 m  center_cost=232 body_edge=253 -> SUCCEEDED error=0
+side 0.20 m  center_cost=190 body_edge=253 -> SUCCEEDED error=0
+side 0.30 m  center_cost=156 body_edge=232 -> SUCCEEDED error=0
+body 0.05 m inside wall  center_cost=253 body_edge=254 -> ABORTED error=205
+```
+
+说明：侧边在 253 环里（0.10/0.20 m）都放行；足迹真压 254 时因为起点和
+所有邻居都无效，A* 只迭代 1 次 → `StartOccupied`。行动测试（第 3 条）需要
+实车定位正常后由操作者执行。
+
+工具用法（只规划，不发 cmd_vel）：
+
+```
+source /opt/ros/jazzy/setup.bash
+source ~/nav2_ws/install/setup.bash
+python3 ~/ros2_lidar/tools/start_clearance_probe.py --clearances 0.10 0.20 0.30
+```
+
 ## 明早运行手册（Pi 上）
 
 1. 上电，确认场地清空、电池 ≥ 12.3 V。
