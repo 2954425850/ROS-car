@@ -66,6 +66,13 @@ def build_specs() -> tuple[ComponentSpec, ...]:
                          "/scan_motion_guard 超时停车（看起来像被墙挡住）"),
         ), blocked_by=("power",)),
 
+        ComponentSpec("nav2_overlay", "nav2 导航补丁", (
+            Check("cmd:nav2-overlay", "eq", True, field="is_overlay",
+                  level=Verdict.DEGRADED,
+                  reason="nav2_smac_planner 没解析到 ~/nav2_ws/install："
+                         "overlay 没编译，或服务没 source（起点贴墙仍会被拒）"),
+        ), blocked_by=("power",)),
+
         ComponentSpec("battery", "电池", (
             Check("topic:/health/driver", "lt", 3.0, field="age_s", level=Verdict.STALE,
                   reason="/health/driver 超过 3s 没有数据"),

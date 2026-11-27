@@ -10,7 +10,9 @@ Type=simple
 User=cy
 Environment=HOME=/home/cy
 WorkingDirectory=/home/cy/ros2_lidar
-ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && exec ros2 launch /home/cy/ros2_lidar/launch/nav.launch.py use_composition:=False'
+# 之后 source nav2 overlay（只含打过补丁的 nav2_smac_planner + RPP）。
+# 没 build 过时退回系统 nav2，服务仍能启动。
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash; if [ -f /home/cy/nav2_ws/install/setup.bash ]; then source /home/cy/nav2_ws/install/setup.bash; fi; exec ros2 launch /home/cy/ros2_lidar/launch/nav.launch.py use_composition:=False'
 Restart=on-failure
 RestartSec=5
 KillMode=control-group

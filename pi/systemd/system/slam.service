@@ -10,7 +10,9 @@ Type=simple
 User=cy
 Environment=HOME=/home/cy
 WorkingDirectory=/home/cy/ros2_lidar
-ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && exec ros2 launch /home/cy/ros2_lidar/launch/mapping.launch.py'
+# 与 nav.service 保持同一套 ROS 环境（含 nav2 overlay），避免两服务
+# 解析到不同版本的 nav2 插件。
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash; if [ -f /home/cy/nav2_ws/install/setup.bash ]; then source /home/cy/nav2_ws/install/setup.bash; fi; exec ros2 launch /home/cy/ros2_lidar/launch/mapping.launch.py'
 Restart=on-failure
 RestartSec=5
 KillMode=control-group

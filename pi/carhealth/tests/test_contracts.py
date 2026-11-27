@@ -23,6 +23,7 @@ def test_every_check_has_known_level_and_probe_name():
         "file:resultd-status", "file:framed-status", "file:latest-idr",
         "file:voice-heartbeat",
         "net:board", "net:rosbridge",
+        "cmd:nav2-overlay",
         "topic:/tof/status", "topic:/health/driver", "topic:/k230/result",
         "topic:/health/arm_grasp",
     }

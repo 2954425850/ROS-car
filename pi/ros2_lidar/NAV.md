@@ -200,21 +200,63 @@ collision_monitor 的输入里去掉后，collision_monitor/cmd_mux 放行。第
 在那之前，221 的未知格仍可能在“必要的长绕路”里被走；近场靠雷达平面 + 局部
 层，极端情况（雷达平面外、玻璃等）是已知残余风险（用户已接受）。
 
-**起点（待实验）**：未知格 221 < 253，起点不再因未知被拒。之前写“真离墙
-<20 cm 仍会拒绝”是拿 `GetCost(use_footprint=true)` 的 253/255 推的，没有核对
-Smac 起点检查；按用户对多边形 footprint 的判断，起点检查可能只认 254/255，
-那 10~20 cm 贴墙其实能起步。先做实验再决定是否保留“PS2 挪两步/放宽起点”：
+**起点（2026-11-27 已实测，补丁已落地）**：未知格 221 < 253，起点不会因未知
+被拒；真正拒的是**贴墙**。实测（`/global_costmap/costmap_raw`，原点出发垂直
+走向最近致命格）拿到 253 的真实含义：
+
+| 距墙中心 | cost | 含义 |
+|---|---|---|
+| 0.00~0.15 | 171→230 | 正常膨胀衰减 |
+| **0.20~0.35** | **253** | inscribed 环，墙外 0.20 m |
+| **0.40~0.45** | **254** | 墙本身（地图画了 2 格 = 0.10 m 厚） |
+| 0.50~0.65 | 253 | 另一侧同样的 0.20 m 环 |
+| 0.70+ | 230→0 | 衰减到自由 |
+
+即 **253 = 墙两侧各 0.20 m 的 inscribed 带**（与 `inscribed_radius=0.20` 精确
+对上），不是物理墙。Smac 原来只要**中心**落在 253 就直接判节点无效（
+`collision_checker.cpp` 里 `center_cost_ == INSCRIBED || == OCCUPIED`），
+所以车侧边（0.20 m）贴进这个带就 `Start occupied`——0.40 m 被拒、0.50 m
+成功，与表完全一致。
+
+**补丁（`pi/nav2_patch/`，只编两个包）**：
+
+- `nav2_smac_planner`：判据从 `>= 253` 收紧到 `>= 254`（`LETHAL`）。只有
+  footprint **真的压到致命格**才无效；253 的 0.20 m 保守带不再拦截。中心
+  在 253 时继续做足迹检查（原有 `footprint_cost >= 254` 分支），不是
+  `forceValid`。
+- `nav2_regulated_pure_pursuit_controller`：**只跳过当前位姿**那一次碰撞
+  否决（位姿是物理事实；代价图说压墙说明地图/定位错）。路径前方的投射
+  检查保留，所以“planner 放行、controller 却 Collision Ahead”的第三层
+  拒绝不会出现。
+- 副作用（有意接受）：**goal 也一起放宽**——goal 有效性走同一个
+  `isNodeValid`，现在只拒真压致命格的 goal。以前 goal 落在 253 带会
+  `Goal was in lethal cost`，现在会尝试接近。文档在此明示。
+- 代价：planner 可以把路径贴到墙边（0.20 m 带内）甚至让足迹擦过墙格。
+  近场兜底是 `collision_monitor`（stop_zone 0.90×0.56 m）+ scan gate；
+  侧向擦墙不属于“前进方向”，门控会把它过滤掉，这是 2026-11-26 方向门控
+  已接受的取舍。
+
+**构建与回退**：
 
 ```
-# 在已知墙旁约 10 cm 设一个 start，只规划不动车
-ros2 action send_goal /compute_path_to_pose \
-  nav2_msgs/action/ComputePathToPose \
-  "{start: {header: {frame_id: map}, pose: {position: {x: <x>, y: <y>, z: 0.0}, orientation: {w: 1.0}}}, \
-    goal: {header: {frame_id: map}, pose: {position: {x: <gx>, y: <gy>, z: 0.0}, orientation: {w: 1.0}}}, \
-    planner_id: GridBased, use_start: true}"
+bash ~/ROS-car/pi/nav2_patch/build_nav2_overlay.sh   # 约 3~8 分钟
+source /opt/ros/jazzy/setup.bash
+source ~/nav2_ws/install/setup.bash
+ros2 pkg prefix nav2_smac_planner    # 必须是 ~/nav2_ws/install/...
 ```
 
-SUCCEEDED → 起点放宽/挪两步可以删；ABORTED（`Start occupied`）→ 才需要处理。
+`nav.service` / `slam.service` / `upper/run.sh` 都已按上述顺序 source；
+`carhealthd` 的 `nav2_overlay` 组件会检查 `ros2 pkg prefix` 是否指向 overlay
+（没编/没 source 时 DEGRADED）。回退：删掉 `~/nav2_ws/install` 或把
+`nav2_ws/src/navigation2` `git checkout -- .` 后重编；服务会自动退回
+`/opt/ros/jazzy` 的 nav2。
+
+验收（只规划不动车 + 一段直线）：
+
+1. 起点距墙 0.10/0.20/0.30 m：planner **SUCCEEDED**；
+2. 起点距墙 0.40 m 且车体真的压墙格：**ABORTED**（`Start occupied`）；
+3. 上述 SUCCEEDED 场景下发 `NavigateToPose`，`cmd_vel_guard` 非零 ≥1 s，
+   `collision_monitor` 不出现 `STOPPED`。
 
 ## 明早运行手册（Pi 上）
 

@@ -1,0 +1,38 @@
+diff --git a/nav2_regulated_pure_pursuit_controller/src/collision_checker.cpp b/nav2_regulated_pure_pursuit_controller/src/collision_checker.cpp
+index ac654fca..1e54f8c7 100644
+--- a/nav2_regulated_pure_pursuit_controller/src/collision_checker.cpp
++++ b/nav2_regulated_pure_pursuit_controller/src/collision_checker.cpp
+@@ -53,13 +53,9 @@ bool CollisionChecker::isCollisionImminent(
+   // Note(stevemacenski): This may be a bit unusual, but the robot_pose is in
+   // odom frame and the carrot_pose is in robot base frame. Just how the data comes to us
+ 
+-  // check current point is OK
+-  if (inCollision(
+-      robot_pose.pose.position.x, robot_pose.pose.position.y,
+-      tf2::getYaw(robot_pose.pose.orientation)))
+-  {
+-    return true;
+-  }
++  // ROS-car overlay 2026-11-27: do NOT veto on the current pose. If the robot
++  // is physically here, the pose is a fact; a costmap claiming otherwise is a
++  // map/localization error. Only the projected poses ahead may veto a command.
+ 
+   // visualization messages
+   nav_msgs::msg::Path arc_pts_msg;
+diff --git a/nav2_smac_planner/src/collision_checker.cpp b/nav2_smac_planner/src/collision_checker.cpp
+index e3ee23a0..333e1373 100644
+--- a/nav2_smac_planner/src/collision_checker.cpp
++++ b/nav2_smac_planner/src/collision_checker.cpp
+@@ -131,7 +131,11 @@ bool GridCollisionChecker::inCollision(
+       return true;
+     }
+ 
+-    if (center_cost_ == INSCRIBED || center_cost_ == OCCUPIED) {
++    // ROS-car overlay 2026-11-27: only a real footprint overlap with a
++    // lethal cell invalidates a node. INSCRIBED (253) is the 0.20 m inflation
++    // ring around every lethal cell; refusing on it made any start pose whose
++    // body edge sat in the ring fail with "Start occupied".
++    if (center_cost_ == OCCUPIED) {
+       return true;
+     }
+ 

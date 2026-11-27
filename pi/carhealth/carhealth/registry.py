@@ -17,6 +17,7 @@ from .probes.config_drift import ConfigDriftProbe
 from .probes.dds import DdsProbe
 from .probes.file_status import FileStatusProbe
 from .probes.host import HostProbe
+from .probes.nav2_overlay import Nav2OverlayProbe
 from .probes.net import PingProbe, TcpProbe, resolve_board_host
 from .probes.net_latency import GatewayLatencyProbe
 from .probes.power import PowerProbe
@@ -87,6 +88,7 @@ def build_probes(ros: bool = True, board_host: str | None = None,
     probes["config_drift"] = ConfigDriftProbe(
         repo=repo or os.environ.get(
             "CARHEALTH_REPO", str(Path(__file__).resolve().parents[3])))
+    probes["cmd:nav2-overlay"] = Nav2OverlayProbe()
 
     for topic in TOPICS:
         probes["topic:" + topic] = TopicProbe("topic:" + topic, topic, store)
