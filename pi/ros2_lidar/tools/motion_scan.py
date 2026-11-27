@@ -116,6 +116,13 @@ def filter_ranges_union(ranges, angle_min, angle_increment, motions,
     The union is used for the short hold after a command sign flip: the old
     mask stays in force until the chassis has actually decelerated.
     Returns ``(new_ranges, kept, checked)``.
+
+    ``range_min`` is deliberately NOT used to skip points: a real object closer
+    than the sensor's advertised minimum (A1M8: 0.15 m) still returns a finite
+    range. Skipping those points left them in the gated scan forever, so
+    collision_monitor kept stopping on a box 0.12 m behind the car even when
+    driving forward (2026-11-27). Only non-finite / non-positive / beyond
+    ``range_max`` points are ignored.
     """
     motions = list(motions)
     cy = math.cos(laser_yaw)
@@ -124,7 +131,7 @@ def filter_ranges_union(ranges, angle_min, angle_increment, motions,
     kept = 0
     checked = 0
     for i, r in enumerate(ranges):
-        if not math.isfinite(r) or r < range_min or r > range_max:
+        if not math.isfinite(r) or r <= 0.0 or r > range_max:
             continue
         checked += 1
         a = angle_min + i * angle_increment

@@ -119,7 +119,9 @@ def test_filter_ranges_masks_unrelated_rays():
     assert math.isinf(out[1]) and math.isinf(out[2])
 
 
-def test_filter_ranges_leaves_invalid_samples_alone():
+def test_filter_ranges_only_skips_nonfinite_samples():
+    # 2026-11-27: 低于 range_min 的有限回波也是真障碍，必须按走廊处理。
+    # 之前把它原样留下，导致车后 0.12 m 的箱子永远过滤不掉。
     ranges = [float('inf'), float('nan'), 0.01, 0.5]
     out, kept, checked = filter_ranges(
         ranges, angle_min=0.0, angle_increment=math.pi / 2,
@@ -128,9 +130,9 @@ def test_filter_ranges_leaves_invalid_samples_alone():
         pad_long=PAD_L, pad_width=PAD_W,
         range_min=0.05, range_max=9.0)
     assert math.isinf(out[0]) and math.isnan(out[1])
-    assert out[2] == 0.01          # below range_min -> untouched
+    assert out[2] == 0.01          # below range_min but inside footprint -> kept
     assert math.isinf(out[3])      # -y ray is outside the forward sweep
-    assert checked == 1 and kept == 0
+    assert checked == 2 and kept == 1
 
 
 def test_union_keeps_old_or_new_motion():
@@ -173,3 +175,21 @@ def test_both_modes_treat_global_unknown_as_free():
         "ros__parameters"]
     assert nav["track_unknown_space"] is False
     assert fus["track_unknown_space"] is False
+
+
+def test_near_return_below_range_min_is_still_filtered():
+    # 2026-11-27 实车：车后箱子回波 0.117~0.149 m，小于 A1M8 的 range_min
+    # 0.150。旧逻辑直接 continue（不置 inf），箱子永远留在 scan_motion_guard，
+    # collision_monitor 的 stop_zone 在前进时也一直停车。
+    # 雷达在 base_link 后方 0.256 m：后方 0.12 m 的回波对应 base x=-0.376，
+    # 在前进走廊（尾端 -0.32）之外，必须被过滤。
+    out, kept, checked = filter_ranges_union(
+        [0.12, 0.12], angle_min=0.0, angle_increment=math.pi,
+        motions=[(arc_samples(0.2, 0.0), 1)],
+        half_length=HALF_L, half_width=HALF_W,
+        pad_long=PAD_L, pad_width=PAD_W,
+        laser_x=-0.256, laser_y=0.0,
+        range_min=0.15, range_max=9.0)
+    assert (kept, checked) == (1, 2)
+    assert math.isfinite(out[0])    # 侧/前：在足迹内，保留
+    assert math.isinf(out[1])       # 后方箱子：必须丢弃
