@@ -162,15 +162,36 @@ collision_monitor 的输入里去掉后，collision_monitor/cmd_mux 放行。第
 车一直停着。回退方法：`sudo systemctl disable --now scan-gate`，并把两个 yaml
 里 `collision_monitor.scan.topic` 改回 `scan_filtered`。
 
-## 导航模式的起点未知格
+## 未知格策略（2026-11-27 更新）
 
-导航模式是 AMCL + 预先建好的图：`nav2_params.yaml` 的 global costmap
-`track_unknown_space` 改为 **false**（nav2 默认），图外/未知格当自由格，
-避免起点足迹一碰到未知格就 `Start occupied`。**融合模式不改**：
-`nav2_params_fusion.yaml` 仍为 `true`，保留未知区分步探索。融合模式在
-“机器人足迹压到未知格”时仍会被 Smac 拒绝——那是另一个问题，优先用
-机械臂收纳姿态（不挡雷达 0°）消掉前方永久未知扇区；不要用“把足迹从地图里
-抹掉”的方案掩盖真实碰撞。
+| costmap | 未知格 | 说明 |
+|---|---|---|
+| nav global | **false** | AMCL + 预建图；图外/未知当自由，避免起点 `Start occupied` |
+| nav local | **false**（nav2 默认，yaml 未显式写） | 滚动窗口只有已观测障碍；未知当墙会把窗口填满 |
+| fusion global | **false**（2026-11-27 从 true 改） | 用户决定简化：起点不再因未知格被 Smac 拒绝 |
+| fusion local | **false**（nav2 默认） | 同上 |
+
+**局部为什么本来就是 false**：local costmap 是 3~4 m 的滚动窗口，obstacle 层
+只标记雷达当前看到的障碍；窗口里大部分区域本来就没有“障碍/自由”信息。如果
+`track_unknown_space=true`，这些未观测格会变成 255，规划/控制会把窗口当成一堵
+墙，车几乎无法动。局部图的职责是近场避障，所以 nav2 默认未知当自由。
+
+**融合 global 原来 true 的考量**：实时 SLAM 地图的未知格可能是没看见的墙，
+分步探索器（`fusion_plan`）用 `/map` 的 -1 选点，Smac 不穿未知。2026-11-27
+按用户决定改为 false：Smac 现在可以穿过未知格，但 `fusion_plan` 仍用 `/map`
+的 -1 做目标/路线选点；近场真实障碍仍由 local costmap（obstacle 层）和
+collision_monitor（雷达 stop/slow 区）兜底。`allow_unknown` 仍保持 false（设计
+D2：不靠 `allow_unknown: true` 穿墙）；global static layer 把未知变成 free 后，
+它对这个来源已经不起作用。
+
+**3D/低矮障碍的后续**：臂上相机 + 100×100 ToF（1 m~20 cm）接入 local costmap
+和 collision_monitor 的 observation source；相机 SLAM 融合补语义/远处障碍。
+在那之前，全局未知当自由意味着“全局路径可能穿过没看见的区域”，近场靠雷达
+平面 + 局部层；极端情况（雷达平面外、玻璃等）是已知残余风险（用户已接受）。
+
+**起点**：现在起点足迹压未知格不会再 `Start occupied`；如果足迹真的压在**已知
+障碍**的内切膨胀区（真离墙 <20 cm），仍会拒绝，那是真实碰撞，不是未知格问题。
+之前“先走两步扫过去”的办法仍然可用，但一般不再需要。
 
 ## 明早运行手册（Pi 上）
 

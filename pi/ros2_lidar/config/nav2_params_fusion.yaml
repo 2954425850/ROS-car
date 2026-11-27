@@ -156,7 +156,11 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_footprint
       resolution: 0.05
-      track_unknown_space: true
+      # 2026-11-27：按用户决定，融合模式也把未知格当自由（与导航模式一致），
+      # 避免起点足迹压到未知格时 Smac 直接 "Start occupied"。真实障碍由
+      # local costmap / collision_monitor 在近场兜底；后续臂上相机 + 100x100
+      # ToF（1 m~20 cm）融合补 3D/低矮障碍。fusion_plan 仍用 /map 的 -1 选点。
+      track_unknown_space: false
       plugins:
       - static_layer
       - inflation_layer

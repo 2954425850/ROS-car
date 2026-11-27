@@ -315,6 +315,13 @@ free 格作为 `G`（2026-11-25 实车修正）。
 | `allow_unknown` | false | **保持 false** | 未知区由分步器推进，不靠穿墙规划 |
 | 其余（Smac/RPP/collision_monitor/no_pivot） | — | 不变 | 安全层不动 |
 
+> **2026-11-27 更新（用户决定）**：融合 global costmap 的
+> `track_unknown_space` 从 `true` 改为 **`false`**（未知当自由），解决起点
+> 足迹压未知格时 Smac `Start occupied`。`allow_unknown` 仍保持 `false`；
+> `fusion_plan` 仍用 `/map` 的 -1 做选点。真实障碍交给 local costmap /
+> collision_monitor，后续由臂上相机 + 100×100 ToF（1 m~20 cm）融合补 3D/
+> 低矮障碍。详见 `pi/ros2_lidar/NAV.md` 的「未知格策略」。
+
 `inflation_radius` 先保持 0.7；门洞规划失败再按要求降到 0.5，不主动改。
 
 ### 8.3 待实测确认

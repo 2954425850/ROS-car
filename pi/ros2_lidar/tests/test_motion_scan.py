@@ -157,9 +157,10 @@ def test_both_nav_configs_point_collision_monitor_at_the_gate():
         assert src["topic"] == "scan_motion_guard", name
 
 
-def test_nav_mode_unknown_is_free_but_fusion_keeps_unknown_blocked():
-    # nav mode = AMCL + saved map: unknown cells outside the map are free.
-    # fusion mode must keep unknown blocked for stepwise exploration.
+def test_both_modes_treat_global_unknown_as_free():
+    # 2026-11-27: both nav and fusion global costmaps treat unknown as free.
+    # Fusion relies on the local costmap / collision_monitor for real near
+    # obstacles; camera + ToF fusion is the future 3D complement.
     yaml = pytest.importorskip("yaml")
 
     def load(name):
@@ -171,4 +172,4 @@ def test_nav_mode_unknown_is_free_but_fusion_keeps_unknown_blocked():
     fus = load("nav2_params_fusion.yaml")["global_costmap"]["global_costmap"][
         "ros__parameters"]
     assert nav["track_unknown_space"] is False
-    assert fus["track_unknown_space"] is True
+    assert fus["track_unknown_space"] is False
