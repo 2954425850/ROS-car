@@ -24,7 +24,7 @@ def test_both_global_costmaps_read_the_forwarded_map():
     for name in ("nav2_params.yaml", "nav2_params_fusion.yaml"):
         g = load(name)["global_costmap"]["global_costmap"]["ros__parameters"]
         static = g["static_layer"]
-        assert static["map_topic"] == "map_plan", name
+        assert static["map_topic"] == "/map_plan", name
         assert static["trinary_costmap"] is False, name
         # The forwarding replaces -1, so the boolean is moot; it stays false
         # from ab6fe95 and does not change known cells.

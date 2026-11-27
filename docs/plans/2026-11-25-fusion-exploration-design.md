@@ -317,7 +317,7 @@ free 格作为 `G`（2026-11-25 实车修正）。
 
 > **2026-11-27 更新（用户决定）**：融合/导航两个 **global** costmap 不再用
 > `track_unknown_space` 的 0/255 二选一，而是由 `tools/map_plan.py` 把 `/map`
-> 的 -1 改成 87 发布 `/map_plan`，static layer 设 `map_topic: map_plan` +
+> 的 -1 改成 87 发布 `/map_plan`，static layer 设 `map_topic: /map_plan` +
 > `trinary_costmap: false`（~221）。这样未知格 > `analytic_expansion_max_cost`
 > 200（解析扩展绕开）、< 253（A* 和起点检查可走），即“一般不走、必要时能走”。
 > local costmap 保持 0；`fusion_plan` 仍用原始 `/map` 的 -1 选点；相机 + ToF

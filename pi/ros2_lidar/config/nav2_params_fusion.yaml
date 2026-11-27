@@ -169,7 +169,7 @@ global_costmap:
         map_subscribe_transient_local: true
         # 2026-11-27：unknown 由 map_plan 转发成 87，非三值模式换算 ~221。
         # 高于 analytic_expansion_max_cost(200)，低于 253，做到"一般不走、必要时能走"。
-        map_topic: map_plan
+        map_topic: /map_plan
         trinary_costmap: false
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer

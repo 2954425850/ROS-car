@@ -175,7 +175,8 @@ collision_monitor 的输入里去掉后，collision_monitor/cmd_mux 放行。第
 标记雷达当前看到的障碍；未知当墙会把窗口填满，所以 local 保持 0。真正需要
 “未知有代价”的是两个 **global**：用 `tools/map_plan.py` 订阅 `/map`，把 -1 改成
 87，发布 `/map_plan`（transient_local）；global static layer 设
-`map_topic: map_plan` + `trinary_costmap: false`，按 `87/100*254 ≈ 221` 换算。
+`map_topic: /map_plan`（绝对名；相对名会解析到 `/global_costmap/map_plan`）+
+`trinary_costmap: false`，按 `87/100*254 ≈ 221` 换算。
 87 这个值让未知格：
 
 - **> `analytic_expansion_max_cost=200`**：Reeds-Shepp 解析扩展（最多 3 m）会绕开
