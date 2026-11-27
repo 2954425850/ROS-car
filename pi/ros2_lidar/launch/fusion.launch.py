@@ -50,6 +50,12 @@ def generate_launch_description():
         cmd=["python3", os.path.join(HERE, "tools", "scan_self_filter.py")],
         output="screen")
 
+    # /map 的 -1 转成 87 给 global static layer（~221）；fusion_plan/AMCL/
+    # local/collision_monitor 仍用原始 /map。
+    map_plan = ExecuteProcess(
+        cmd=["python3", os.path.join(HERE, "tools", "map_plan.py")],
+        output="screen")
+
     # 方向门控由常驻 scan-gate.service 拉起，不在本 launch 里；nav.service
     # 和 fusion 都订阅它发布的 /scan_motion_guard。
 
@@ -99,6 +105,7 @@ def generate_launch_description():
         rsp,
         TimerAction(period=3.0, actions=[lidar]),
         TimerAction(period=5.0, actions=[scan_filter]),
+        TimerAction(period=5.5, actions=[map_plan]),
         TimerAction(period=6.0, actions=[pivot_guard]),
         TimerAction(period=6.0, actions=[slam]),
         navigation,

@@ -166,32 +166,54 @@ collision_monitor 的输入里去掉后，collision_monitor/cmd_mux 放行。第
 
 | costmap | 未知格 | 说明 |
 |---|---|---|
-| nav global | **false** | AMCL + 预建图；图外/未知当自由，避免起点 `Start occupied` |
-| nav local | **false**（nav2 默认，yaml 未显式写） | 滚动窗口只有已观测障碍；未知当墙会把窗口填满 |
-| fusion global | **false**（2026-11-27 从 true 改） | 用户决定简化：起点不再因未知格被 Smac 拒绝 |
-| fusion local | **false**（nav2 默认） | 同上 |
+| nav global | **map_plan 非三值，~221** | 未知不再 255/0；`/map` 的 -1 由转发节点写成 87 |
+| nav local | **false（0）**（nav2 默认） | 滚动窗口只有已观测障碍；未知当墙会把窗口填满 |
+| fusion global | **map_plan 非三值，~221** | 同上；`track_unknown_space` 保持 false（ab6fe95） |
+| fusion local | **false（0）**（nav2 默认） | 同上 |
 
-**局部为什么本来就是 false**：local costmap 是 3~4 m 的滚动窗口，obstacle 层
-只标记雷达当前看到的障碍；窗口里大部分区域本来就没有“障碍/自由”信息。如果
-`track_unknown_space=true`，这些未观测格会变成 255，规划/控制会把窗口当成一堵
-墙，车几乎无法动。局部图的职责是近场避障，所以 nav2 默认未知当自由。
+**为什么用转发而不是改局部**：local costmap 是 3~4 m 滚动窗口，obstacle 层只
+标记雷达当前看到的障碍；未知当墙会把窗口填满，所以 local 保持 0。真正需要
+“未知有代价”的是两个 **global**：用 `tools/map_plan.py` 订阅 `/map`，把 -1 改成
+87，发布 `/map_plan`（transient_local）；global static layer 设
+`map_topic: map_plan` + `trinary_costmap: false`，按 `87/100*254 ≈ 221` 换算。
+87 这个值让未知格：
 
-**融合 global 原来 true 的考量**：实时 SLAM 地图的未知格可能是没看见的墙，
-分步探索器（`fusion_plan`）用 `/map` 的 -1 选点，Smac 不穿未知。2026-11-27
-按用户决定改为 false：Smac 现在可以穿过未知格，但 `fusion_plan` 仍用 `/map`
-的 -1 做目标/路线选点；近场真实障碍仍由 local costmap（obstacle 层）和
-collision_monitor（雷达 stop/slow 区）兜底。`allow_unknown` 仍保持 false（设计
-D2：不靠 `allow_unknown: true` 穿墙）；global static layer 把未知变成 free 后，
-它对这个来源已经不起作用。
+- **> `analytic_expansion_max_cost=200`**：Reeds-Shepp 解析扩展（最多 3 m）会绕开
+  未知格，不会无惩罚地直接穿过去；
+- **< 253**：A* 主搜索和起点足迹检查仍然允许通过，必要时能走。
+
+`track_unknown_space` 保持 false（ab6fe95），因为转发后地图里已经没有 -1；它
+对已知格没有影响。`allow_unknown` 仍 false（设计 D2）。
+
+**不改的部分**：`slam_toolbox` / AMCL / `map_server` / `fusion_plan` 继续读原始
+`/map`（含 -1），前沿选点不变；local costmap、collision_monitor、scan gate 都
+不碰。`fusion_plan` 仍按 -1 选点，只是 Smac 现在会在“必要时”走 221 的未知格。
+
+**为什么不是 200/250**：200 会让解析扩展无惩罚穿未知（更爱走未知）；250 和 220
+在 Smac 行走代价（≈距离 × (1 + cost_penalty × cost/252)）上只差 2.7× vs 3.0×，
+220 足够“一般不走、必要时能走”，且比 250 留出更多起步余量。没有改
+`cost_penalty` / `use_quadratic_cost_penalty`（会同时让车更远离墙）。
 
 **3D/低矮障碍的后续**：臂上相机 + 100×100 ToF（1 m~20 cm）接入 local costmap
 和 collision_monitor 的 observation source；相机 SLAM 融合补语义/远处障碍。
-在那之前，全局未知当自由意味着“全局路径可能穿过没看见的区域”，近场靠雷达
-平面 + 局部层；极端情况（雷达平面外、玻璃等）是已知残余风险（用户已接受）。
+在那之前，221 的未知格仍可能在“必要的长绕路”里被走；近场靠雷达平面 + 局部
+层，极端情况（雷达平面外、玻璃等）是已知残余风险（用户已接受）。
 
-**起点**：现在起点足迹压未知格不会再 `Start occupied`；如果足迹真的压在**已知
-障碍**的内切膨胀区（真离墙 <20 cm），仍会拒绝，那是真实碰撞，不是未知格问题。
-之前“先走两步扫过去”的办法仍然可用，但一般不再需要。
+**起点（待实验）**：未知格 221 < 253，起点不再因未知被拒。之前写“真离墙
+<20 cm 仍会拒绝”是拿 `GetCost(use_footprint=true)` 的 253/255 推的，没有核对
+Smac 起点检查；按用户对多边形 footprint 的判断，起点检查可能只认 254/255，
+那 10~20 cm 贴墙其实能起步。先做实验再决定是否保留“PS2 挪两步/放宽起点”：
+
+```
+# 在已知墙旁约 10 cm 设一个 start，只规划不动车
+ros2 action send_goal /compute_path_to_pose \
+  nav2_msgs/action/ComputePathToPose \
+  "{start: {header: {frame_id: map}, pose: {position: {x: <x>, y: <y>, z: 0.0}, orientation: {w: 1.0}}}, \
+    goal: {header: {frame_id: map}, pose: {position: {x: <gx>, y: <gy>, z: 0.0}, orientation: {w: 1.0}}}, \
+    planner_id: GridBased, use_start: true}"
+```
+
+SUCCEEDED → 起点放宽/挪两步可以删；ABORTED（`Start occupied`）→ 才需要处理。
 
 ## 明早运行手册（Pi 上）
 

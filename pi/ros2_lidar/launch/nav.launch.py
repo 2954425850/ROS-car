@@ -80,6 +80,12 @@ def generate_launch_description():
         cmd=['python3', os.path.join(HERE, 'tools', 'scan_self_filter.py')],
         output='screen')
 
+    # /map 的 -1 转成 87，给两个 global costmap 的 static layer（非三值模式
+    # 换算成 ~221）；slam/AMCL/local/collision_monitor 仍用原始 /map。
+    map_plan = ExecuteProcess(
+        cmd=['python3', os.path.join(HERE, 'tools', 'map_plan.py')],
+        output='screen')
+
     pivot_guard = ExecuteProcess(
         cmd=['python3', os.path.join(HERE, 'tools', 'no_pivot_guard.py')],
         output='screen')
@@ -148,6 +154,7 @@ def generate_launch_description():
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
 
         reset,
+        TimerAction(period=1.0, actions=[map_plan]),
         TimerAction(period=3.0, actions=[lidar]),
         TimerAction(period=5.0, actions=[scan_filter]),
         TimerAction(period=6.0, actions=[pivot_guard]),
