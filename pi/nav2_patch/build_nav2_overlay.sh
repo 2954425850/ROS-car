@@ -58,11 +58,11 @@ fi
 source /opt/ros/jazzy/setup.bash
 cd "$WS"
 
-echo "==> colcon build（nav2_smac_planner + RPP，Release）"
+echo "==> colcon build（nav2_smac_planner + RPP，Release，不编测试）"
 colcon build \
   --packages-select nav2_smac_planner nav2_regulated_pure_pursuit_controller \
   --parallel-workers "$(nproc)" \
-  --cmake-args -DCMAKE_BUILD_TYPE=Release
+  --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 
 test -f "$WS/install/setup.bash"
 echo
