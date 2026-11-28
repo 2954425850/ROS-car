@@ -314,7 +314,8 @@ def test_node_cfg_is_wired_to_chassis():
     assert c['DEADZONE'] == 0.15                         # 臂的逐轴死区，别被上面那条覆盖
     # ★ 2026-10-22：PS2 改用自有律，最小半径 1.0 m（云端是 0.6，已不用于 PS2）。
     #   V_MIN / LAT_EPS 只留给 chassis.py 里的云端移植版做对拍。
-    assert (c['R_MIN'], c['V_MIN'], c['LAT_EPS']) == (1.0, 0.12, 0.02)
+    # ⚠ 临时演示（2026-11-28）：R_MIN 1.0 → 0.5，演示完连同节点一起改回 1.0。
+    assert (c['R_MIN'], c['V_MIN'], c['LAT_EPS']) == (0.5, 0.12, 0.02)
     assert (c['VX_MAX'], c['WZ_MAX']) == (0.50, 1.50)
     assert (c['GEAR_MIN'], c['GEAR_MAX'], c['GEAR_STEP'],
             c['GEAR_DEFAULT']) == (0.15, 0.50, 0.05, 0.15)
